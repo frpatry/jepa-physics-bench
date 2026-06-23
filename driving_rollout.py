@@ -1,15 +1,16 @@
 """
-Conduite — PREDICTION DE COLLISION par ROLLOUT latent (option B).
+Conduite — PREDICTION DE COLLISION par ROLLOUT latent (option B), sur V-JEPA FIDELE.
 
-MEME architecture JEPA spatio-temporelle CONJOINTE que d'habitude (SIGReg, sans EMA) :
-on monte juste la resolution et on ajoute le masquage TEMPOREL pour imaginer le futur.
+MEME archi V-JEPA que partout (vjepa.py : encodeur-contexte sur visibles, prédicteur
+ATTENTIONNEL, SIGReg sans EMA) : on monte juste la résolution et on mélange masquage
+spatial (tubelets) + masquage TEMPOREL (frames > t) pour apprendre à IMAGINER la suite.
 
-  - SSL JEPA : masquage de tokens, melange masquage spatial aleatoire + masquage TEMPOREL
-    (toutes les frames > t) -> le predicteur apprend a IMAGINER la suite.
-  - Risque (B) : on masque les frames > t, le predicteur imagine les latents futurs, une tete
-    collision les classe. K futurs ECHANTILLONNES (bruit gaussien, legitime car SIGReg garde
-    les latents isotropes) -> risque = P moyenne de collision. Monte AVANT l'impact -> freinage.
-  - Heatmap 12x12 : gradient du risque vers les patches visibles (= ou est le danger).
+  - SSL V-JEPA : tubelets spatiaux + masquage temporel -> le prédicteur attentionnel
+    apprend à imaginer les latents futurs aux positions cibles.
+  - Risque (B) : on masque les frames > t, le prédicteur imagine les latents futurs, une
+    tête collision lit [contexte observé causal ; futur imaginé]. K futurs ECHANTILLONNES
+    (bruit gaussien, légitime car SIGReg garde les latents isotropes) -> risque = P moyenne.
+  - Heatmap 12x12 : gradient du risque vers les patches visibles (= où est le danger).
 
   python driving_rollout.py --n_nexar 800 --H 96 --patch 8 --T 16 --k_viz 3
   (si OOM : baisser --bs)
@@ -17,7 +18,7 @@ on monte juste la resolution et on ajoute le masquage TEMPOREL pour imaginer le 
 import argparse
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import cv2, imageio
-from lejepa_video import Enc, patchify, sigreg
+from vjepa import patchify, VJEPA, tube_masks, temporal_mask, _idx, _gather
 from driving_transfer import load_nexar
 
 def get_args():
@@ -25,7 +26,7 @@ def get_args():
     p.add_argument("--T", type=int, default=16); p.add_argument("--H", type=int, default=96)
     p.add_argument("--patch", type=int, default=8); p.add_argument("--d_model", type=int, default=256)
     p.add_argument("--n_layer", type=int, default=4); p.add_argument("--n_head", type=int, default=4)
-    p.add_argument("--reg_w", type=float, default=1.0)
+    p.add_argument("--pred_layers", type=int, default=2); p.add_argument("--reg_w", type=float, default=1.0)
     p.add_argument("--ssl_steps", type=int, default=2500); p.add_argument("--head_steps", type=int, default=1200)
     p.add_argument("--bs", type=int, default=8); p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--mask_ratio", type=float, default=0.5)
@@ -45,40 +46,37 @@ def main():
     frame_of = torch.arange(ntok, device=dev) // npf          # frame index de chaque token
     print(f"device={dev}  {len(Xp)} clips  H={a.H} patch={a.patch} -> grille {nP}x{nP}, {ntok} tokens/clip", flush=True)
 
-    # ---- 1) SSL JEPA conjoint (spatial aleatoire + temporel) ----
+    # ---- 1) SSL V-JEPA conjoint (tubelets spatiaux + masquage temporel) ----
     torch.manual_seed(0)
-    enc = Enc(obs, d, ntok, a.n_layer, a.n_head).to(dev)
-    pred = nn.Sequential(nn.Linear(d, d), nn.GELU(), nn.Linear(d, d)).to(dev)
-    opt = torch.optim.AdamW(list(enc.parameters()) + list(pred.parameters()), a.lr)
+    m = VJEPA(obs, d, ntok, a.n_layer, a.n_head, a.reg_w, a.pred_layers).to(dev)
+    opt = torch.optim.AdamW(m.parameters(), a.lr); rng = np.random.default_rng(0)
     for st in range(a.ssl_steps):
         bi = tr[np.random.randint(0, len(tr), a.bs)]; o = Xt[bi].to(dev)
         if np.random.rand() < 0.5:
-            m = torch.rand(a.bs, ntok, device=dev) < a.mask_ratio            # masquage spatial
+            masks = [tube_masks(a.bs, a.T, nP, a.mask_ratio, 1, rng)[0].to(dev)]   # tubelets spatiaux
         else:
             t0 = np.random.randint(2, a.T - 1)
-            m = (frame_of > t0).unsqueeze(0).expand(a.bs, -1).clone()         # masquage TEMPOREL
-        z = enc(o, None); p = pred(enc(o, m))
-        loss = (F.smooth_l1_loss(p[m], z[m]) if m.any() else (p - z).pow(2).mean()) + a.reg_w * sigreg(z.reshape(-1, d))
-        opt.zero_grad(); loss.backward(); opt.step()
+            masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]                         # imaginer le futur
+        loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
         if st % 400 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
-    for prm in list(enc.parameters()) + list(pred.parameters()): prm.requires_grad = False
+    for prm in m.parameters(): prm.requires_grad = False
 
-    # ---- 2) repr causale : contexte OBSERVE (0..t) + futur IMAGINE (>t) ----
-    def ctx_fut(o, t0):                                       # encodeur ne voit QUE 0..t0
-        m = (frame_of > t0).unsqueeze(0).expand(o.size(0), -1)
-        h = enc(o, m)
-        ctx = h[:, frame_of <= t0].mean(1)                    # evidence observee (causale)
-        fut = pred(h)[:, frame_of > t0]                       # futur imagine (B,nfut,d)
-        return ctx, fut
+    # ---- 2) repr causale : contexte OBSERVE (0..t, pool) + futur IMAGINE (>t) ----
+    def ctx_fut(o, t0):                                       # encodeur ne voit QUE 0..t0 (visibles), predit > t0
+        msk = temporal_mask(o.size(0), a.T, nP, t0, dev)
+        return m.predict_targets(o, msk)                      # ctx:(B,d)  fut:(B,nfut,d)
 
     # residu du predicteur (echelle du bruit pour echantillonner K futurs)
     with torch.no_grad():
         o = Xt[tr[np.random.randint(0, len(tr), min(16, len(tr)))]].to(dev)
-        t0h = a.T // 2; z = enc(o, None); _, fu = ctx_fut(o, t0h)
-        sigma = (z[:, frame_of > t0h] - fu).std().item()
+        t0h = a.T // 2
+        allidx = torch.arange(ntok, device=dev).expand(o.size(0), -1)
+        zfull = m.enc(o, allidx); tgt = _idx(temporal_mask(o.size(0), a.T, nP, t0h, dev))
+        _, fu = ctx_fut(o, t0h)
+        sigma = (_gather(zfull, tgt) - fu).std().item()
     print(f"  residu predicteur sigma={sigma:.3f}", flush=True)
 
-    # ---- 3) tete collision sur le futur imagine ----
+    # ---- 3) tete collision sur [contexte ; futur imagine] ----
     head = nn.Sequential(nn.Linear(2 * d, 128), nn.GELU(), nn.Linear(128, 2)).to(dev)
     oph = torch.optim.Adam(head.parameters(), 1e-3)
     for st in range(a.head_steps):
@@ -116,7 +114,6 @@ def main():
     def saliency(i, t0, fv):
         o = Xt[i:i+1].to(dev).detach().requires_grad_(True)
         ctx, fut = ctx_fut(o, t0); gf = torch.cat([ctx, fut.mean(1)], -1); logit = head(gf)[0, 1]
-        enc.zero_grad(); pred.zero_grad(); head.zero_grad()
         if o.grad is not None: o.grad.zero_()
         logit.backward()
         s = o.grad.abs().sum(-1)[0][frame_of == fv].reshape(nP, nP).detach().cpu().numpy()
