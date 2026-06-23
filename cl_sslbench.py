@@ -73,6 +73,8 @@ def get_args():
                    help="BRUIT VISUEL : grain ajoute aux PIXELS (corruption de l'image, pas de la trajectoire). Different du vent (qui perturbe le mouvement).")
     p.add_argument("--readout", choices=["pool", "time"], default="pool",
                    help="pool=moyenne temporelle (ancien, ecrase le temps) ; time=fidele au temps (par instant, predit les instants masques, sonde sur toute la trajectoire) comme V-JEPA")
+    p.add_argument("--dump", action="store_true",
+                   help="Entraine 1 modele et sort la matrice de confusion g_vrai x g_predit (modele vs verite). Utilise --regs[0], --n_trains[0].")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -281,6 +283,37 @@ def oracle_ceiling(a, dev):
         print(f"  n={ntr}: lin(traj)={lin_full:.2f}  lin(moyenne)={lin_mean:.2f}  "
               f"MLP(traj)={mlp_full:.2f}", flush=True)
 
+# --------------------------- dump (predit vs vrai) --------------------------
+def dump_predictions(a, dev):
+    """Entraine UN modele, puis sort la MATRICE DE CONFUSION g_vrai x g_predit
+    sur le jeu de test = est-ce que ce que le modele a trouve colle au vrai g ?"""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    gvals = torch.linspace(5.0, 15.0, a.n_gbins)
+    te_o, te_y = gen_physics(1500, a, torch.Generator().manual_seed(99999))
+    ntr = a.n_trains[0]
+    tr_o, tr_y = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    torch.manual_seed(a.seed)
+    model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    X = feats(model, tr_o, dev); y = tr_y.to(dev)
+    clf = nn.Linear(X.size(1), a.n_gbins).to(dev); opt = torch.optim.Adam(clf.parameters(), 1e-2)
+    for _ in range(a.probe_steps):
+        opt.zero_grad(); F.cross_entropy(clf(X), y).backward(); opt.step()
+    with torch.no_grad():
+        pred = clf(feats(model, te_o, dev)).argmax(-1).cpu()
+    cm = torch.zeros(a.n_gbins, a.n_gbins, dtype=torch.long)
+    for t, p in zip(te_y.tolist(), pred.tolist()): cm[t][p] += 1
+    acc = (pred == te_y).float().mean().item()
+    print(f"\n=== DUMP confusion (reg={reg}, n={ntr}, acc={acc:.2f}) ===", flush=True)
+    print("g_vrai\\g_pred | " + " ".join(f"{v:4.0f}" for v in gvals), flush=True)
+    for i in range(a.n_gbins):
+        print(f"   {gvals[i]:5.0f}    | " + " ".join(f"{int(cm[i][j]):4d}" for j in range(a.n_gbins)), flush=True)
+    os.makedirs(a.out, exist_ok=True)
+    json.dump({"gvals": gvals.tolist(), "confusion": cm.tolist(), "acc": acc,
+               "meta": {"vision": a.vision, "vnoise": a.vnoise, "bounce": a.bounce,
+                        "wind": a.wind, "readout": a.readout, "reg": reg}},
+              open(os.path.join(a.out, "dump.json"), "w"), indent=2)
+    print(f"[json] -> {a.out}/dump.json", flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -288,6 +321,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.dump:                                                # matrice de confusion predit vs vrai
+        dump_predictions(a, dev); return
     if a.oracle:                                              # plafond supervisé, puis stop
         oracle_ceiling(a, dev); return
     os.makedirs(a.out, exist_ok=True)
