@@ -83,6 +83,8 @@ def get_args():
                    help="PREVISION : cache la 2e moitie, prevoit macro (point de chute, sommet) vs micro (trajectoire) depuis la 1re moitie. Le vrai test H-JEPA. Utiliser --readout time.")
     p.add_argument("--actor", action="store_true",
                    help="ACTOR : le world model imagine ou la balle finit, une raquette s'y place. Taux d'interception vs baselines naives. Utiliser avec --wind pour que ce soit non-trivial.")
+    p.add_argument("--closedloop", action="store_true",
+                   help="BOUCLE FERMEE : precision du point de chute selon la duree d'observation (4..14 frames). Teste si re-observer/reviser pendant le vol aide (Mode 2).")
     p.add_argument("--vx", type=float, default=1.0,
                    help="multiplicateur de la VITESSE horizontale. >1 = la balle file loin -> 'rester sur place' echoue, le world model devient necessaire.")
     p.add_argument("--tol", type=float, default=0.3,
@@ -506,6 +508,46 @@ def actor_probe(a, dev):
                     "actor": round(float(actor_x[k]), 2), "naive": round(float(lin_x[k]), 2)})
     print("ACTOR_DUMP " + json.dumps(out), flush=True)
 
+# --------------------------- boucle fermee (re-observer pendant le vol) ------
+def closedloop_probe(a, dev):
+    """L'actor RE-INTERROGE le world model au fil du vol : precision du point de chute
+    selon la duree d'observation (4..14 frames vues). Teste si reviser aide (Mode 2)."""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    ntr = a.n_trains[0]; T = a.T; d = a.d_model; tol = a.tol
+    tr_o, _ = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))
+    torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    te_o, _ = gen_physics(1500, a, torch.Generator().manual_seed(99999))
+    tex, tey, _ = _motion(1500, a, torch.Generator().manual_seed(99999))
+    tr_land, _ = _landing(trx, tryy); true_x, _ = _landing(tex, tey)
+    def encut(o, cut):                                        # voit frames 0..cut-1, cache le reste
+        outs = []
+        with torch.no_grad():
+            for i in range(0, o.size(0), 256):
+                ob = o[i:i+256].to(dev)
+                m = torch.zeros(ob.size(0), T, dtype=torch.bool, device=dev); m[:, cut:] = True
+                outs.append(model.enc(ob, m).mean(1))
+        return torch.cat(outs)
+    cuts = [4, 6, 8, 10, 12, 14]; preds = {}
+    print(f"\n=== BOUCLE FERMEE : precision vs duree d'observation (reg={reg}, vx={a.vx}, wind={a.wind}, tol={tol}) ===", flush=True)
+    print(f"{'vu':>7} | actor: err  interception | rester: err  interception", flush=True)
+    for cut in cuts:
+        Ctr, Cte = encut(tr_o, cut), encut(te_o, cut)
+        yr = tr_land.to(dev); m = nn.Linear(d, 1).to(dev); opt = torch.optim.Adam(m.parameters(), 1e-2)
+        for _ in range(500):
+            opt.zero_grad(); F.mse_loss(m(Ctr).squeeze(), yr).backward(); opt.step()
+        with torch.no_grad(): ax = m(Cte).squeeze().cpu()
+        preds[cut] = ax; sx = tex[:, cut-1]
+        ea = (ax - true_x).abs(); es = (sx - true_x).abs()
+        print(f"{cut:>2}/{T} f | {ea.mean():.2f}   {(ea < tol).float().mean():.0%}          | "
+              f"{es.mean():.2f}   {(es < tol).float().mean():.0%}", flush=True)
+    out = []
+    for k in range(3):
+        out.append({"traj": [[round(float(x), 2), round(float(y), 2)] for x, y in zip(tex[k], tey[k])],
+                    "true": round(float(true_x[k]), 2), "cuts": cuts,
+                    "preds": [round(float(preds[c][k]), 2) for c in cuts]})
+    print("CLOSEDLOOP_DUMP " + json.dumps(out), flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -513,6 +555,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.closedloop:                                          # re-observer pendant le vol (Mode 2)
+        closedloop_probe(a, dev); return
     if a.actor:                                               # imaginer -> agir (interception)
         actor_probe(a, dev); return
     if a.forecast:                                            # prevision macro vs micro (H-JEPA)
