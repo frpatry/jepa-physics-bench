@@ -83,6 +83,10 @@ def get_args():
                    help="PREVISION : cache la 2e moitie, prevoit macro (point de chute, sommet) vs micro (trajectoire) depuis la 1re moitie. Le vrai test H-JEPA. Utiliser --readout time.")
     p.add_argument("--actor", action="store_true",
                    help="ACTOR : le world model imagine ou la balle finit, une raquette s'y place. Taux d'interception vs baselines naives. Utiliser avec --wind pour que ce soit non-trivial.")
+    p.add_argument("--vx", type=float, default=1.0,
+                   help="multiplicateur de la VITESSE horizontale. >1 = la balle file loin -> 'rester sur place' echoue, le world model devient necessaire.")
+    p.add_argument("--tol", type=float, default=0.3,
+                   help="tolerance d'interception (rayon). Plus petit = plus precis (ex. 0.15).")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -102,7 +106,7 @@ def _motion(n, a, gen):
     nz = a.nuisance                                          # echelle des parasites (1.0 = original)
     x0 = (torch.rand(n, generator=gen) * 2 - 1) * nz
     y0 = torch.rand(n, generator=gen) * nz
-    vx0 = (torch.rand(n, generator=gen) * 2 - 1) * nz
+    vx0 = (torch.rand(n, generator=gen) * 2 - 1) * nz * getattr(a, "vx", 1.0)   # vitesse horiz.
     vy0 = 2.0 + (torch.rand(n, generator=gen) * 2 - 1) * nz  # moyenne 2, etalement +-nz (nz=1 -> [1,3])
     t = torch.arange(a.T).float() * 0.1
     x = x0[:, None] + vx0[:, None] * t[None, :]
@@ -465,7 +469,7 @@ def actor_probe(a, dev):
     """ACTOR : le world model imagine OU la balle finit (depuis la 1re moitie),
     une raquette s'y place. Taux d'interception vs baselines naives."""
     reg = a.regs[0] if a.regs else "sigreg_off"
-    ntr = a.n_trains[0]; T = a.T; Hh = T // 2; d = a.d_model; tol = 0.3
+    ntr = a.n_trains[0]; T = a.T; Hh = T // 2; d = a.d_model; tol = a.tol
     tr_o, _ = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
     trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))
     torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
