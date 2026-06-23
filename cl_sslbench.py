@@ -79,6 +79,8 @@ def get_args():
                    help="Masque la 2e moitie du vol, le JEPA predit, on decode en (x,y) -> balle reconstruite vs vraie (fidelite). Utiliser avec --readout time.")
     p.add_argument("--macro", action="store_true",
                    help="Teste la HIERARCHIE : cibles MACRO (gravite, sommet, point de chute, portee) vs MICRO (position image par image) depuis la representation du world model.")
+    p.add_argument("--forecast", action="store_true",
+                   help="PREVISION : cache la 2e moitie, prevoit macro (point de chute, sommet) vs micro (trajectoire) depuis la 1re moitie. Le vrai test H-JEPA. Utiliser --readout time.")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -400,6 +402,53 @@ def macro_probe(a, dev):
     print(f"  [MACRO] portee x (r)       : {range_r:.2f}", flush=True)
     print(f"  [micro] position/frame (r) : {micro_r:.2f}   (1=parfait, 0=nul)", flush=True)
 
+# --------------------------- forecast (prevision macro vs micro) ------------
+def forecast_probe(a, dev):
+    """Cache la 2e moitie du vol. Depuis la 1re moitie SEULEMENT, prevoit-on mieux
+    le MACRO (point de chute, prochain sommet) que le MICRO (trajectoire image/image) ?"""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    ntr = a.n_trains[0]; T = a.T; Hh = T // 2
+    tr_o, _ = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))
+    torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    te_o, _ = gen_physics(1500, a, torch.Generator().manual_seed(99999))
+    tex, tey, _ = _motion(1500, a, torch.Generator().manual_seed(99999))
+    d = a.d_model
+    pear = lambda p, y: (lambda vp, vy: (vp * vy).sum().item() / ((vp.norm() * vy.norm()).item() + 1e-9))(p - p.mean(), y - y.mean())
+    def enc_clean(o):
+        with torch.no_grad(): return torch.cat([model.enc(o[i:i+256].to(dev)) for i in range(0, o.size(0), 256)])
+    def enc_mask(o):
+        outs = []
+        with torch.no_grad():
+            for i in range(0, o.size(0), 256):
+                ob = o[i:i+256].to(dev)
+                m = torch.zeros(ob.size(0), T, dtype=torch.bool, device=dev); m[:, Hh:] = True
+                outs.append(model.enc(ob, m))
+        return torch.cat(outs)
+    Hcl = enc_clean(tr_o)                                     # decodeur latent->xy (sur frames vues)
+    dec = nn.Linear(d, 2).to(dev); opt = torch.optim.Adam(dec.parameters(), 1e-2)
+    tgt = torch.stack([trx, tryy], -1).reshape(-1, 2).to(dev); Hf = Hcl.reshape(-1, d)
+    for _ in range(400):
+        opt.zero_grad(); F.mse_loss(dec(Hf), tgt).backward(); opt.step()
+    Ctr = enc_mask(tr_o).mean(1); hte = enc_mask(te_o); Cte = hte.mean(1)
+    def regr(ytr, yte):                                       # contexte (1re moitie) -> cible macro
+        ytr = ytr.to(dev).float(); yte = yte.to(dev).float()
+        m = nn.Linear(d, 1).to(dev); opt = torch.optim.Adam(m.parameters(), 1e-2)
+        ys = (ytr - ytr.mean()) / (ytr.std() + 1e-6)
+        for _ in range(400):
+            opt.zero_grad(); F.mse_loss(m(Ctr).squeeze(), ys).backward(); opt.step()
+        with torch.no_grad(): return pear(m(Cte).squeeze(), yte)
+    fx_r = regr(trx[:, -1], tex[:, -1])
+    apex2_r = regr(tryy[:, Hh:].max(1).values, tey[:, Hh:].max(1).values)
+    with torch.no_grad():                                     # MICRO : predicteur sur frames cachees
+        pxy = dec(model.predictor(hte)[:, Hh:].reshape(-1, d))
+    ttx = torch.stack([tex[:, Hh:], tey[:, Hh:]], -1).reshape(-1, 2).to(dev)
+    micro_r = 0.5 * (pear(pxy[:, 0], ttx[:, 0]) + pear(pxy[:, 1], ttx[:, 1]))
+    print(f"\n=== PREVISION du futur cache (contexte = 1re moitie) reg={reg} n={ntr} ===", flush=True)
+    print(f"  [MACRO] x du point de chute (r)         : {fx_r:.2f}", flush=True)
+    print(f"  [MACRO] hauteur du prochain sommet (r)  : {apex2_r:.2f}", flush=True)
+    print(f"  [micro] position image/image future (r) : {micro_r:.2f}   (1=parfait, 0=nul)", flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -407,6 +456,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.forecast:                                            # prevision macro vs micro (H-JEPA)
+        forecast_probe(a, dev); return
     if a.macro:                                               # hierarchie macro vs micro
         macro_probe(a, dev); return
     if a.traj:                                                # balle reconstruite vs vraie
