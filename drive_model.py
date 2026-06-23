@@ -28,14 +28,14 @@ def sigreg(z):
 
 # --------------------------- rendu image ego-centree ------------------------
 def render(ego_x, ped_x, ped_y, G):
-    """(n,T) -> images (n,T,G*G). Vue top-down centree sur l'ego : x relatif a l'ego."""
-    XLO, XHI, YLO, YHI = -1.0, 7.0, -1.6, 1.6
+    """(n,T) -> images (n,T,G*G). Vue top-down centree sur l'ego (unites m) : x relatif a l'ego."""
+    XLO, XHI, YLO, YHI = -5.0, 30.0, -5.0, 5.0               # capteur : 30 m devant, route +-3.5 m
     xr = ped_x - ego_x                                        # (n,T) position relative du pieton
     col = (xr - XLO) / (XHI - XLO) * G
     row = (YHI - ped_y) / (YHI - YLO) * G
     idx = torch.arange(G).float()
     ry = YHI - (idx + 0.5) / G * (YHI - YLO)                  # world-y du centre de chaque ligne
-    road = (ry.abs() < 0.9).float().view(1, 1, G, 1) * 0.3    # bande route (constante)
+    road = (ry.abs() < 3.5).float().view(1, 1, G, 1) * 0.3    # bande route (constante)
     n, T = xr.shape
     img = road.expand(n, T, G, G).clone()
     dcol = idx.view(1, 1, 1, G) - col.unsqueeze(-1).unsqueeze(-1)
@@ -101,18 +101,22 @@ def probe(Xtr, ytr, Xte, yte, dev, steps=400):
     return acc, 0.5 * (rec_pos + rec_neg), rec_pos
 
 def braked_traj(brake, t_dec, env):
-    """Trajectoire ego sous controle : vitesse constante puis freine a partir de t_dec
-    (s'arrete AVANT le passage). Si pas de freinage : vitesse constante (peut percuter)."""
-    T = env.T; xs = []; x = 0.0; v = env.ego_speed; xstop = env.cw_x - 0.8
+    """Trajectoire ego sous controle : vitesse constante puis freine (a_brake m/s^2) a t_dec.
+    La physique l'arrete (dist = v^2/2a) ; t_dec derive pour stopper AVANT le passage."""
+    T = env.T; xs = []; x = 0.0; v = env.ego_speed
     for t in range(T):
         xs.append(round(x, 2))
         if brake and t >= t_dec:
-            v = max(0.0, v - 0.12) if x < xstop else 0.0
+            v = max(0.0, v - env.a_brake * env.dt)
         x += v * env.dt
     return xs
 
 def actor_eval(m, tr_o, tr_y, te_o, te_eps, te_y, a, env, dev):
     """L'actor anticipe le conflit (world model, frames 0..t_dec) et freine si proba>seuil."""
+    bd = env.ego_speed ** 2 / (2 * env.a_brake)              # distance de freinage (m)
+    a.t_dec = int((env.cw_x - bd - 2.0) / (env.ego_speed * env.dt))   # dernier instant sur pour freiner
+    print(f"  (physique : dist freinage {bd:.1f} m -> decision a t={a.t_dec}, "
+          f"soit {env.cw_x - env.ego_speed*env.dt*a.t_dec:.1f} m avant le passage)", flush=True)
     Xtr = m.context(tr_o.to(dev), a.t_dec); Xte = m.context(te_o.to(dev), a.t_dec)
     clf = nn.Linear(Xtr.size(1), 2).to(dev); opt = torch.optim.Adam(clf.parameters(), 1e-2)
     ytr = tr_y.to(dev)
@@ -153,7 +157,8 @@ def get_args():
 
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    env = argparse.Namespace(T=24, dt=1.0, ego_speed=0.5, cw_x=6.0, road=0.9, p_cross=a.p_cross, cross_dur=6)
+    env = argparse.Namespace(T=40, dt=0.2, ego_speed=8.0, ped_speed=1.4, cw_x=38.0, road=3.5,
+                             p_cross=a.p_cross, a_brake=4.0)
     T = env.T; half = T // 2; obs_dim = a.G * a.G
     tr_o, tr_y, _ = make_data(a.n_train, env, a.G, 1000 + a.seed)
     te_o, te_y, te_eps = make_data(a.n_test, env, a.G, 99999)
