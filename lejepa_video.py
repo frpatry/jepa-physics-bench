@@ -36,15 +36,35 @@ def load_frames(path, T, H):
     idx = np.linspace(0, len(a) - 1, T).astype(int)
     return a[idx]                                              # (T, H, H, 3)
 
-def get_data(a):
-    p = hf_hub_download("sayakpaul/ucf101-subset", "UCF101_subset.tar.gz", repo_type="dataset")
+def _download_extract(a):
+    if a.source == "full":                                    # UCF101 COMPLET (101 classes, ~13k videos)
+        from huggingface_hub import list_repo_files
+        import zipfile
+        repo = "quchenyuan/UCF101-ZIP"
+        root = "/content/ucf_full"
+        if not os.path.exists(root + "/_done"):
+            os.makedirs(root, exist_ok=True)
+            arch = [f for f in list_repo_files(repo, repo_type="dataset")
+                    if f.endswith((".zip", ".tar", ".tar.gz", ".tgz"))]
+            print(f"téléchargement UCF101 complet ({len(arch)} archive(s))…", flush=True)
+            for f in arch:
+                p = hf_hub_download(repo, f, repo_type="dataset")
+                (zipfile.ZipFile(p).extractall(root) if f.endswith(".zip") else tarfile.open(p).extractall(root))
+            open(root + "/_done", "w").close()
+        return root
+    p = hf_hub_download("sayakpaul/ucf101-subset", "UCF101_subset.tar.gz", repo_type="dataset")  # petit subset
     root = "/content/ucf_data"
     if not os.path.exists(root):
         os.makedirs(root); tarfile.open(p).extractall(root)
+    return root
+
+def get_data(a):
+    root = _download_extract(a)
     vids = glob.glob(root + "/**/*.avi", recursive=True)
     byc = defaultdict(list)
     for v in vids: byc[os.path.basename(os.path.dirname(v))].append(v)
     classes = sorted(byc)[:a.nclass]
+    print(f"{len(classes)} classes disponibles, décodage de ≤{a.per_class}/classe…", flush=True)
     X, Y = [], []
     for ci, c in enumerate(classes):
         for v in byc[c][:a.per_class]:
@@ -95,6 +115,7 @@ def get_args():
     p.add_argument("--patch", type=int, default=8)
     p.add_argument("--nclass", type=int, default=10); p.add_argument("--per_class", type=int, default=60)
     p.add_argument("--heldout", type=int, default=4, help="classes tenues a l'ecart du SSL (test de transfert)")
+    p.add_argument("--source", choices=["subset", "full"], default="subset", help="subset (10 classes) ou full (UCF101 101 classes)")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--reg_w", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--bs", type=int, default=32)
