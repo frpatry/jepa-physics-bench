@@ -81,6 +81,8 @@ def get_args():
                    help="Teste la HIERARCHIE : cibles MACRO (gravite, sommet, point de chute, portee) vs MICRO (position image par image) depuis la representation du world model.")
     p.add_argument("--forecast", action="store_true",
                    help="PREVISION : cache la 2e moitie, prevoit macro (point de chute, sommet) vs micro (trajectoire) depuis la 1re moitie. Le vrai test H-JEPA. Utiliser --readout time.")
+    p.add_argument("--actor", action="store_true",
+                   help="ACTOR : le world model imagine ou la balle finit, une raquette s'y place. Taux d'interception vs baselines naives. Utiliser avec --wind pour que ce soit non-trivial.")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -449,6 +451,47 @@ def forecast_probe(a, dev):
     print(f"  [MACRO] hauteur du prochain sommet (r)  : {apex2_r:.2f}", flush=True)
     print(f"  [micro] position image/image future (r) : {micro_r:.2f}   (1=parfait, 0=nul)", flush=True)
 
+# --------------------------- actor (imaginer -> agir) -----------------------
+def actor_probe(a, dev):
+    """ACTOR : le world model imagine OU la balle finit (depuis la 1re moitie),
+    une raquette s'y place. Taux d'interception vs baselines naives."""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    ntr = a.n_trains[0]; T = a.T; Hh = T // 2; d = a.d_model; tol = 0.3
+    tr_o, _ = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))
+    torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    te_o, _ = gen_physics(1500, a, torch.Generator().manual_seed(99999))
+    tex, tey, _ = _motion(1500, a, torch.Generator().manual_seed(99999))
+    def enc_mask(o):
+        outs = []
+        with torch.no_grad():
+            for i in range(0, o.size(0), 256):
+                ob = o[i:i+256].to(dev)
+                m = torch.zeros(ob.size(0), T, dtype=torch.bool, device=dev); m[:, Hh:] = True
+                outs.append(model.enc(ob, m).mean(1))
+        return torch.cat(outs)
+    Ctr, Cte = enc_mask(tr_o), enc_mask(te_o)
+    yr = trx[:, -1].to(dev)                                   # cible = x final (ou la balle finit)
+    m = nn.Linear(d, 1).to(dev); opt = torch.optim.Adam(m.parameters(), 1e-2)
+    for _ in range(600):
+        opt.zero_grad(); F.mse_loss(m(Ctr).squeeze(), yr).backward(); opt.step()
+    with torch.no_grad(): actor_x = m(Cte).squeeze().cpu()
+    true_x = tex[:, -1]
+    last_x = tex[:, Hh-1]                                     # baseline : rester ou vu en dernier
+    lin_x = tex[:, Hh-1] + (tex[:, Hh-1] - tex[:, Hh-2]) * (T - Hh)   # baseline : extrapolation lineaire
+    def mae(p): return (p - true_x).abs().mean().item()
+    def hit(p): return ((p - true_x).abs() < tol).float().mean().item()
+    print(f"\n=== ACTOR : interception (reg={reg}, n={ntr}, bounce={a.bounce}, wind={a.wind}, tol={tol}) ===", flush=True)
+    print(f"  ACTOR (world model)      : erreur {mae(actor_x):.2f}   interception {hit(actor_x):.0%}", flush=True)
+    print(f"  naif: extrapolation lin. : erreur {mae(lin_x):.2f}   interception {hit(lin_x):.0%}", flush=True)
+    print(f"  naif: derniere position  : erreur {mae(last_x):.2f}   interception {hit(last_x):.0%}", flush=True)
+    out = []
+    for k in range(5):
+        out.append({"traj": [[round(float(x), 2), round(float(y), 2)] for x, y in zip(tex[k], tey[k])],
+                    "split": Hh, "true": round(float(true_x[k]), 2),
+                    "actor": round(float(actor_x[k]), 2), "naive": round(float(lin_x[k]), 2)})
+    print("ACTOR_DUMP " + json.dumps(out), flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -456,6 +499,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.actor:                                               # imaginer -> agir (interception)
+        actor_probe(a, dev); return
     if a.forecast:                                            # prevision macro vs micro (H-JEPA)
         forecast_probe(a, dev); return
     if a.macro:                                               # hierarchie macro vs micro
