@@ -35,7 +35,7 @@ def render(ego_x, ped_x, ped_y, G):
     row = (YHI - ped_y) / (YHI - YLO) * G
     idx = torch.arange(G).float()
     ry = YHI - (idx + 0.5) / G * (YHI - YLO)                  # world-y du centre de chaque ligne
-    road = (ry.abs() < 3.5).float().view(1, 1, G, 1) * 0.3    # bande route (constante)
+    road = (ry.abs() < 2.5).float().view(1, 1, G, 1) * 0.3    # bande route (constante)
     n, T = xr.shape
     img = road.expand(n, T, G, G).clone()
     dcol = idx.view(1, 1, 1, G) - col.unsqueeze(-1).unsqueeze(-1)
@@ -160,8 +160,8 @@ def get_args():
 
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    env = argparse.Namespace(T=40, dt=0.2, ego_speed=8.0, ped_speed=1.4, cw_x=38.0, road=3.5,
-                             p_cross=a.p_cross, a_brake=4.0)
+    env = argparse.Namespace(T=40, dt=0.2, ego_speed=8.0, ped_speed=1.4, cw_x=38.0, road=2.5,
+                             path_half=1.0, p_cross=a.p_cross, a_brake=4.0)
     T = env.T; half = T // 2; obs_dim = a.G * a.G
     tr_o, tr_y, _ = make_data(a.n_train, env, a.G, 1000 + a.seed)
     te_o, te_y, te_eps = make_data(a.n_test, env, a.G, 99999)
