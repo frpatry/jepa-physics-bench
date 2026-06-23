@@ -63,35 +63,39 @@ def main():
         if st % 400 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in list(enc.parameters()) + list(pred.parameters()): prm.requires_grad = False
 
-    # ---- 2) imaginer le futur (latents) ----
-    def imagine(o, t0):                                       # (B,ntok,obs) -> futur impose pooled (B,d)
+    # ---- 2) repr causale : contexte OBSERVE (0..t) + futur IMAGINE (>t) ----
+    def ctx_fut(o, t0):                                       # encodeur ne voit QUE 0..t0
         m = (frame_of > t0).unsqueeze(0).expand(o.size(0), -1)
-        fut = pred(enc(o, m))[:, frame_of > t0]               # latents des frames > t0 (imaginees)
-        return fut                                            # (B, nfut, d)
+        h = enc(o, m)
+        ctx = h[:, frame_of <= t0].mean(1)                    # evidence observee (causale)
+        fut = pred(h)[:, frame_of > t0]                       # futur imagine (B,nfut,d)
+        return ctx, fut
 
     # residu du predicteur (echelle du bruit pour echantillonner K futurs)
     with torch.no_grad():
         o = Xt[tr[np.random.randint(0, len(tr), min(16, len(tr)))]].to(dev)
-        t0h = a.T // 2; z = enc(o, None); fu = imagine(o, t0h)
+        t0h = a.T // 2; z = enc(o, None); _, fu = ctx_fut(o, t0h)
         sigma = (z[:, frame_of > t0h] - fu).std().item()
     print(f"  residu predicteur sigma={sigma:.3f}", flush=True)
 
     # ---- 3) tete collision sur le futur imagine ----
-    head = nn.Sequential(nn.Linear(d, 128), nn.GELU(), nn.Linear(128, 2)).to(dev)
+    head = nn.Sequential(nn.Linear(2 * d, 128), nn.GELU(), nn.Linear(128, 2)).to(dev)
     oph = torch.optim.Adam(head.parameters(), 1e-3)
     for st in range(a.head_steps):
         bi = tr[np.random.randint(0, len(tr), a.bs)]; o = Xt[bi].to(dev)
         t0 = np.random.randint(2, a.T - 1)
-        with torch.no_grad(): gf = imagine(o, t0).mean(1)     # (B,d) futur imagine, pooled
+        with torch.no_grad():
+            ctx, fut = ctx_fut(o, t0); gf = torch.cat([ctx, fut.mean(1)], -1)  # contexte + futur
         lab = Yt[torch.tensor(bi)].to(dev)
         oph.zero_grad(); F.cross_entropy(head(gf), lab).backward(); oph.step()
 
     @torch.no_grad()
     def risk(i, t0, K):                                       # P(collision) par K futurs bruites
-        o = Xt[i:i+1].to(dev); fut = imagine(o, t0)           # (1,nfut,d)
+        o = Xt[i:i+1].to(dev); ctx, fut = ctx_fut(o, t0)
         nf = fut.size(1)
         futK = fut.expand(K, -1, -1) + sigma * a.noise * torch.randn(K, nf, d, device=dev)
-        return round(float(head(futK.mean(1)).softmax(-1)[:, 1].mean()), 3)
+        gf = torch.cat([ctx.expand(K, -1), futK.mean(1)], -1)
+        return round(float(head(gf).softmax(-1)[:, 1].mean()), 3)
 
     # ---- 4) eval : accuracy + anticipation ----
     @torch.no_grad()
@@ -99,7 +103,7 @@ def main():
         ok = 0; tot = 0
         for j in range(0, len(te), 32):
             idx = te[j:j+32]; o = Xt[torch.tensor(idx)].to(dev)
-            pr = head(imagine(o, t0).mean(1)).argmax(-1)
+            ctx, fut = ctx_fut(o, t0); pr = head(torch.cat([ctx, fut.mean(1)], -1)).argmax(-1)
             ok += int((pr == Yt[torch.tensor(idx)].to(dev)).sum()); tot += len(idx)
         return ok / tot
     half = a.T // 2
@@ -111,7 +115,7 @@ def main():
     # ---- 5) heatmap (gradient du risque -> patches visibles) ----
     def saliency(i, t0, fv):
         o = Xt[i:i+1].to(dev).detach().requires_grad_(True)
-        gf = imagine(o, t0).mean(1); logit = head(gf)[0, 1]
+        ctx, fut = ctx_fut(o, t0); gf = torch.cat([ctx, fut.mean(1)], -1); logit = head(gf)[0, 1]
         enc.zero_grad(); pred.zero_grad(); head.zero_grad()
         if o.grad is not None: o.grad.zero_()
         logit.backward()
