@@ -77,6 +77,8 @@ def get_args():
                    help="Entraine 1 modele et sort la matrice de confusion g_vrai x g_predit (modele vs verite). Utilise --regs[0], --n_trains[0].")
     p.add_argument("--traj", action="store_true",
                    help="Masque la 2e moitie du vol, le JEPA predit, on decode en (x,y) -> balle reconstruite vs vraie (fidelite). Utiliser avec --readout time.")
+    p.add_argument("--macro", action="store_true",
+                   help="Teste la HIERARCHIE : cibles MACRO (gravite, sommet, point de chute, portee) vs MICRO (position image par image) depuis la representation du world model.")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -352,6 +354,52 @@ def traj_dump(a, dev):
                     "mask": [int(m) for m in mask[0].cpu()]})
     print("TRAJ_DUMP " + json.dumps(out), flush=True)
 
+# --------------------------- macro vs micro (hierarchie) --------------------
+def macro_probe(a, dev):
+    """Teste la HIERARCHIE : le world model encode-t-il le MACRO (gravite, sommet,
+    point de chute, portee) mieux que le MICRO (position image par image) ?"""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    ntr = a.n_trains[0]
+    tr_o, trgi = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))
+    torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    te_o, tegi = gen_physics(1500, a, torch.Generator().manual_seed(99999))
+    tex, tey, _ = _motion(1500, a, torch.Generator().manual_seed(99999))
+    pool = lambda o: torch.cat([model.enc(o[i:i+256].to(dev)).mean(1) for i in range(0, o.size(0), 256)])
+    with torch.no_grad():
+        Xtr, Xte = pool(tr_o), pool(te_o)
+    def pear(p, y): vp = p - p.mean(); vy = y - y.mean(); return (vp * vy).sum().item() / ((vp.norm() * vy.norm()).item() + 1e-9)
+    def regr(ytr, yte):                                       # regression lineaire -> correlation r
+        ytr = ytr.to(dev).float(); yte = yte.to(dev).float()
+        m = nn.Linear(Xtr.size(1), 1).to(dev); opt = torch.optim.Adam(m.parameters(), 1e-2)
+        ys = (ytr - ytr.mean()) / (ytr.std() + 1e-6)
+        for _ in range(400):
+            opt.zero_grad(); F.mse_loss(m(Xtr).squeeze(), ys).backward(); opt.step()
+        with torch.no_grad(): return pear(m(Xte).squeeze(), yte)
+    apex_r = regr(tryy.max(1).values, tey.max(1).values)
+    finalx_r = regr(trx[:, -1], tex[:, -1])
+    range_r = regr(trx.max(1).values - trx.min(1).values, tex.max(1).values - tex.min(1).values)
+    yg = trgi.to(dev); clf = nn.Linear(Xtr.size(1), a.n_gbins).to(dev); opt = torch.optim.Adam(clf.parameters(), 1e-2)
+    for _ in range(a.probe_steps):
+        opt.zero_grad(); F.cross_entropy(clf(Xtr), yg).backward(); opt.step()
+    with torch.no_grad(): gacc = (clf(Xte).argmax(-1) == tegi.to(dev)).float().mean().item()
+    with torch.no_grad():                                     # MICRO : position image par image
+        Htr = torch.cat([model.enc(tr_o[i:i+256].to(dev)) for i in range(0, ntr, 256)])
+        Hte = torch.cat([model.enc(te_o[i:i+256].to(dev)) for i in range(0, 1500, 256)])
+    dec = nn.Linear(Htr.size(-1), 2).to(dev); opt = torch.optim.Adam(dec.parameters(), 1e-2)
+    tgt = torch.stack([trx, tryy], -1).reshape(-1, 2).to(dev); Hf = Htr.reshape(-1, Htr.size(-1))
+    for _ in range(400):
+        opt.zero_grad(); F.mse_loss(dec(Hf), tgt).backward(); opt.step()
+    with torch.no_grad(): pe = dec(Hte.reshape(-1, Hte.size(-1)))
+    tt = torch.stack([tex, tey], -1).reshape(-1, 2).to(dev)
+    micro_r = 0.5 * (pear(pe[:, 0], tt[:, 0]) + pear(pe[:, 1], tt[:, 1]))
+    print(f"\n=== HIERARCHIE macro vs micro (reg={reg}, n={ntr}) ===", flush=True)
+    print(f"  [MACRO] gravite (acc)      : {gacc:.2f}   (hasard {1/a.n_gbins:.2f})", flush=True)
+    print(f"  [MACRO] hauteur sommet (r) : {apex_r:.2f}", flush=True)
+    print(f"  [MACRO] x final (r)        : {finalx_r:.2f}", flush=True)
+    print(f"  [MACRO] portee x (r)       : {range_r:.2f}", flush=True)
+    print(f"  [micro] position/frame (r) : {micro_r:.2f}   (1=parfait, 0=nul)", flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -359,6 +407,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.macro:                                               # hierarchie macro vs micro
+        macro_probe(a, dev); return
     if a.traj:                                                # balle reconstruite vs vraie
         traj_dump(a, dev); return
     if a.dump:                                                # matrice de confusion predit vs vrai
