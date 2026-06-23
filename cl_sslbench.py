@@ -452,6 +452,15 @@ def forecast_probe(a, dev):
     print(f"  [micro] position image/image future (r) : {micro_r:.2f}   (1=parfait, 0=nul)", flush=True)
 
 # --------------------------- actor (imaginer -> agir) -----------------------
+def _landing(xx, yy):
+    """x au PREMIER contact au sol (1er minimum local de y). Dépend du TIMING -> de g."""
+    n, T = yy.shape
+    li = torch.full((n,), T - 1, dtype=torch.long); found = torch.zeros(n, dtype=torch.bool)
+    for i in range(1, T - 1):
+        loc = (yy[:, i] < yy[:, i - 1]) & (yy[:, i] <= yy[:, i + 1]) & (~found)
+        li[loc] = i; found = found | loc
+    return xx[torch.arange(n), li], li
+
 def actor_probe(a, dev):
     """ACTOR : le world model imagine OU la balle finit (depuis la 1re moitie),
     une raquette s'y place. Taux d'interception vs baselines naives."""
@@ -471,24 +480,25 @@ def actor_probe(a, dev):
                 outs.append(model.enc(ob, m).mean(1))
         return torch.cat(outs)
     Ctr, Cte = enc_mask(tr_o), enc_mask(te_o)
-    yr = trx[:, -1].to(dev)                                   # cible = x final (ou la balle finit)
+    tr_land, _ = _landing(trx, tryy)                          # cible = x au 1er contact sol (depend de g)
+    true_x, te_li = _landing(tex, tey)
+    yr = tr_land.to(dev)
     m = nn.Linear(d, 1).to(dev); opt = torch.optim.Adam(m.parameters(), 1e-2)
     for _ in range(600):
         opt.zero_grad(); F.mse_loss(m(Ctr).squeeze(), yr).backward(); opt.step()
     with torch.no_grad(): actor_x = m(Cte).squeeze().cpu()
-    true_x = tex[:, -1]
     last_x = tex[:, Hh-1]                                     # baseline : rester ou vu en dernier
-    lin_x = tex[:, Hh-1] + (tex[:, Hh-1] - tex[:, Hh-2]) * (T - Hh)   # baseline : extrapolation lineaire
+    lin_x = tex[:, Hh-1] + (tex[:, Hh-1] - tex[:, Hh-2]) * (T - Hh)   # baseline : extrapolation lineaire (mauvais timing)
     def mae(p): return (p - true_x).abs().mean().item()
     def hit(p): return ((p - true_x).abs() < tol).float().mean().item()
-    print(f"\n=== ACTOR : interception (reg={reg}, n={ntr}, bounce={a.bounce}, wind={a.wind}, tol={tol}) ===", flush=True)
+    print(f"\n=== ACTOR : interception au 1er contact sol (reg={reg}, n={ntr}, bounce={a.bounce}, wind={a.wind}, tol={tol}) ===", flush=True)
     print(f"  ACTOR (world model)      : erreur {mae(actor_x):.2f}   interception {hit(actor_x):.0%}", flush=True)
     print(f"  naif: extrapolation lin. : erreur {mae(lin_x):.2f}   interception {hit(lin_x):.0%}", flush=True)
     print(f"  naif: derniere position  : erreur {mae(last_x):.2f}   interception {hit(last_x):.0%}", flush=True)
     out = []
     for k in range(5):
         out.append({"traj": [[round(float(x), 2), round(float(y), 2)] for x, y in zip(tex[k], tey[k])],
-                    "split": Hh, "true": round(float(true_x[k]), 2),
+                    "split": Hh, "land_frame": int(te_li[k]), "true": round(float(true_x[k]), 2),
                     "actor": round(float(actor_x[k]), 2), "naive": round(float(lin_x[k]), 2)})
     print("ACTOR_DUMP " + json.dumps(out), flush=True)
 
