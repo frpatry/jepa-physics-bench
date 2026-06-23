@@ -46,9 +46,9 @@ def main():
         acc = (clf(feats(te)).argmax(-1) == Yt[te].to(dev)).float().mean().item()
     print(f"sonde danger (dashcam) test acc = {acc:.2f}", flush=True)
     # ---- clips de collision pour la visu ----
+    import imageio
     pos_te = [int(i) for i in te if Y[i] == 1][:a.k_viz]
-    out = []
-    for i in pos_te:
+    for k, i in enumerate(pos_te):
         o = Xpt[i:i+1].to(dev).requires_grad_(True)
         logit = clf(enc.enc(o).mean(1))[0, 1]                 # risque (avec gradient vers l'entrée)
         enc.zero_grad(); clf.zero_grad()
@@ -62,14 +62,26 @@ def main():
             for t in range(a.T):
                 m = torch.zeros(1, ntok, dtype=torch.bool, device=dev); m[:, (t + 1) * nP * nP:] = True
                 risk.append(round(float(clf(enc.enc(od, m).mean(1)).softmax(-1)[0, 1]), 2))
-        fb = []
+        S = 256                                               # taille d'affichage
+        gif = []
         for f in range(a.T):
-            img = cv2.cvtColor((Xf[i, f] * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 70])
-            fb.append(base64.b64encode(buf).decode())
-        out.append({"frames": fb, "risk": risk,
-                    "heat": [[[round(float(sal[t, r, c]), 2) for c in range(nP)] for r in range(nP)] for t in range(a.T)]})
-    print("RISK_DUMP " + json.dumps({"H": a.H, "nP": nP, "clips": out}), flush=True)
+            base = cv2.resize((Xf[i, f] * 255).astype(np.uint8), (S, S), interpolation=cv2.INTER_LINEAR)
+            hb = cv2.resize((sal[f] * 255).astype(np.uint8), (S, S), interpolation=cv2.INTER_CUBIC)
+            hb = cv2.GaussianBlur(hb, (0, 0), 12)             # lissage -> heatmap propre
+            hc = cv2.cvtColor(cv2.applyColorMap(hb, cv2.COLORMAP_JET), cv2.COLOR_BGR2RGB)
+            ov = (0.55 * base + 0.45 * hc).clip(0, 255).astype(np.uint8)
+            # jauge de risque (barre verticale a droite) + texte
+            bh = int(risk[f] * (S - 20)); col = (255, 40, 40) if risk[f] > 0.5 else (255, 200, 0)
+            cv2.rectangle(ov, (S - 18, S - 10 - bh), (S - 6, S - 10), col, -1)
+            cv2.rectangle(ov, (S - 18, 10), (S - 6, S - 10), (255, 255, 255), 1)
+            cv2.putText(ov, f"risque {risk[f]:.2f}", (8, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+            gif.append(ov)
+        path = f"/content/risk_clip{k}.gif"; imageio.mimsave(path, gif, duration=0.3)
+        verdict = "DANGER DETECTE" if risk[-1] > 0.5 else "rate (risque bas)"
+        print(f"  clip {k}: {path}  | risque final {risk[-1]:.2f}  -> {verdict}", flush=True)
+    print("\nAfficher les GIF dans Colab :", flush=True)
+    print("from IPython.display import Image, display", flush=True)
+    print("for k in range(%d): display(Image('/content/risk_clip%%d.gif'%%k))" % len(pos_te), flush=True)
 
 if __name__ == "__main__":
     main()
