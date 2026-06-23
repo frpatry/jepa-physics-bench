@@ -18,29 +18,23 @@ import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import cv2
 from lejepa_video import patchify, WM, probe, load_frames, get_data
 
-def decode_bytes(b, path, T, H):
-    p = path
-    if b:
-        f = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False); f.write(b); f.close(); p = f.name
-    if not p: return None
-    return load_frames(p, T, H)
-
 def load_nexar(n, T, H):
-    from datasets import load_dataset, Video
-    ds = load_dataset("nexar-ai/nexar_collision_prediction", split="train", streaming=True)
-    ds = ds.cast_column("video", Video(decode=False)).shuffle(seed=0, buffer_size=300)
-    pos, neg = [], []; seen = 0
-    for ex in ds:
-        if len(pos) >= n // 2 and len(neg) >= n // 2: break
-        if seen > 6000: break
-        seen += 1
-        toe = ex.get("time_of_event"); lbl = 1 if (toe and toe > 0) else 0
-        bk = pos if lbl else neg
-        if len(bk) >= n // 2: continue
-        v = ex["video"]; fr = decode_bytes(v.get("bytes"), v.get("path"), T, H)
-        if fr is not None: bk.append(fr)
-    X = np.asarray(pos + neg, np.float32); Y = np.array([1] * len(pos) + [0] * len(neg))
-    print(f"Nexar : {len(pos)} collisions + {len(neg)} normales", flush=True)
+    from huggingface_hub import list_repo_files, hf_hub_download
+    repo = "nexar-ai/nexar_collision_prediction"
+    files = list_repo_files(repo, repo_type="dataset")
+    pos = [f for f in files if "positive/" in f and f.endswith(".mp4")][:n // 2]
+    neg = [f for f in files if "negative/" in f and f.endswith(".mp4")][:n // 2]
+    X, Y = [], []
+    for lbl, lst in [(1, pos), (0, neg)]:
+        for f in lst:
+            try:
+                p = hf_hub_download(repo, f, repo_type="dataset")
+                fr = load_frames(p, T, H)
+                if fr is not None: X.append(fr); Y.append(lbl)
+            except Exception as e:
+                print("skip", f, str(e)[:60])
+    X = np.asarray(X, np.float32); Y = np.array(Y)
+    print(f"Nexar : {int((Y == 1).sum())} collisions + {int((Y == 0).sum())} normales", flush=True)
     return X, Y
 
 def train_wm(X, ntok, obs, a, dev, tag):
