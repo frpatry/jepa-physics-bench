@@ -115,19 +115,21 @@ def actor_eval(m, tr_o, tr_y, te_o, te_eps, te_y, a, env, dev):
     """L'actor anticipe le conflit (world model, frames 0..t_dec) et freine si proba>seuil."""
     Xtr = m.context(tr_o.to(dev), a.t_dec); Xte = m.context(te_o.to(dev), a.t_dec)
     clf = nn.Linear(Xtr.size(1), 2).to(dev); opt = torch.optim.Adam(clf.parameters(), 1e-2)
-    w = torch.tensor([1.0, (tr_y == 0).sum() / max(1, (tr_y == 1).sum())], device=dev)
     ytr = tr_y.to(dev)
-    for _ in range(400):
-        opt.zero_grad(); F.cross_entropy(clf(Xtr), ytr, weight=w).backward(); opt.step()
+    for _ in range(400):                                         # sonde NON ponderee (calibree)
+        opt.zero_grad(); F.cross_entropy(clf(Xtr), ytr).backward(); opt.step()
     with torch.no_grad(): P = clf(Xte).softmax(-1)[:, 1].cpu()
-    brake = P > a.thr; conf = te_y.bool()
-    col = (conf & ~brake).float().mean().item()                 # actor percute = conflit non anticipe
-    fstop = (~conf & brake).float().mean().item()               # faux arret = freine pour rien
-    caught = (conf & brake).sum().item() / max(1, conf.sum().item())
-    naive_col = conf.float().mean().item()                      # naif reactif : freine trop tard -> percute tout conflit
-    print(f"\n=== ACTOR (decision a t={a.t_dec}, seuil {a.thr}) ===", flush=True)
-    print(f"  ACTOR (world model) : collisions {col:.0%}   faux arrets {fstop:.0%}   conflits anticipes {caught:.0%}", flush=True)
-    print(f"  naif reactif        : collisions {naive_col:.0%}   (freine quand le pieton est deja sur la route = trop tard)", flush=True)
+    conf = te_y.bool(); naive_col = conf.float().mean().item()
+    print(f"\n=== ACTOR : compromis securite/confort (decision a t={a.t_dec}) ===", flush=True)
+    print(f"  naif reactif (freine trop tard) : collisions {naive_col:.0%}   faux arrets 0%", flush=True)
+    print(f"  {'seuil':>6} | collisions | faux arrets | conflits anticipes", flush=True)
+    for thr in [0.2, 0.35, 0.5, 0.65, 0.8]:
+        brake = P > thr
+        col = (conf & ~brake).float().mean().item()
+        fstop = (~conf & brake).float().mean().item()
+        caught = (conf & brake).sum().item() / max(1, conf.sum().item())
+        print(f"  {thr:>5} |   {col:>5.0%}    |   {fstop:>5.0%}     |   {caught:>4.0%}", flush=True)
+    brake = P > a.thr
     nd = a.dump_n or 6
     out = [{"ego_x": braked_traj(bool(brake[k]), a.t_dec, env), "ped_x": te_eps[k]["ped_x"],
             "ped_y": te_eps[k]["ped_y"], "conflict": te_eps[k]["conflict"],
