@@ -7,19 +7,24 @@ spatial (tubelets) + masquage TEMPOREL (frames > t) pour apprendre à IMAGINER l
 
   - SSL V-JEPA : tubelets spatiaux + masquage temporel -> le prédicteur attentionnel
     apprend à imaginer les latents futurs aux positions cibles.
+  - TRANSFERT (--ssl_source) : world model pré-entraîné sur VIDEO VARIEE (UCF101), gelé,
+    puis on transfère seulement la tête collision sur la dashcam -> teste la thèse
+    "vidéo variée -> world model générique qui anticipe mieux le danger".
   - Risque (B) : on masque les frames > t, le prédicteur imagine les latents futurs, une
     tête collision lit [contexte observé causal ; futur imaginé]. K futurs ECHANTILLONNES
     (bruit gaussien, légitime car SIGReg garde les latents isotropes) -> risque = P moyenne.
   - Heatmap 12x12 : gradient du risque vers les patches visibles (= où est le danger).
 
-  python driving_rollout.py --n_nexar 800 --H 96 --patch 8 --T 16 --k_viz 3
+  python driving_rollout.py --ssl_source ucf --n_nexar 800 --H 96 --patch 8 --T 16 --k_viz 3
   (si OOM : baisser --bs)
 """
 import argparse
+from argparse import Namespace
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import cv2, imageio
 from vjepa import patchify, VJEPA, tube_masks, temporal_mask, _idx, _gather
 from driving_transfer import load_nexar
+from lejepa_video import get_data
 
 def get_args():
     p = argparse.ArgumentParser()
@@ -33,6 +38,10 @@ def get_args():
     p.add_argument("--n_nexar", type=int, default=800); p.add_argument("--k_viz", type=int, default=3)
     p.add_argument("--K", type=int, default=32, help="nb de futurs echantillonnes pour le risque")
     p.add_argument("--noise", type=float, default=1.0, help="echelle du bruit latent (x residu)")
+    p.add_argument("--ssl_source", choices=["ucf", "nexar", "both"], default="ucf",
+                   help="pré-entraînement du world model : ucf=vidéo variée (transfert), nexar=in-domaine, both=ucf+fine-tune")
+    p.add_argument("--ucf_source", default="full", help="UCF101 : subset (10 classes) ou full (101)")
+    p.add_argument("--ucf_nclass", type=int, default=40); p.add_argument("--ucf_per", type=int, default=30)
     return p.parse_args()
 
 def main():
@@ -46,20 +55,34 @@ def main():
     frame_of = torch.arange(ntok, device=dev) // npf          # frame index de chaque token
     print(f"device={dev}  {len(Xp)} clips  H={a.H} patch={a.patch} -> grille {nP}x{nP}, {ntok} tokens/clip", flush=True)
 
-    # ---- 1) SSL V-JEPA conjoint (tubelets spatiaux + masquage temporel) ----
+    # ---- 1) SSL V-JEPA (tubelets spatiaux + masquage TEMPOREL = imaginer le futur) ----
+    # --ssl_source : ucf = pré-entraînement VARIÉ (transfert) ; nexar = in-domaine ; both = ucf puis fine-tune léger.
     torch.manual_seed(0)
     m = VJEPA(obs, d, ntok, a.n_layer, a.n_head, a.reg_w, a.pred_layers).to(dev)
     opt = torch.optim.AdamW(m.parameters(), a.lr); rng = np.random.default_rng(0)
-    for st in range(a.ssl_steps):
-        bi = tr[np.random.randint(0, len(tr), a.bs)]; o = Xt[bi].to(dev)
-        if np.random.rand() < 0.5:
-            masks = [tube_masks(a.bs, a.T, nP, a.mask_ratio, 1, rng)[0].to(dev)]   # tubelets spatiaux
-        else:
-            t0 = np.random.randint(2, a.T - 1)
-            masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]                         # imaginer le futur
-        loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
-        if st % 400 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
+    def ssl_loop(pool, steps, tag):
+        for st in range(steps):
+            bi = np.random.randint(0, len(pool), a.bs); o = pool[bi].to(dev)
+            if np.random.rand() < 0.5:
+                masks = [tube_masks(a.bs, a.T, nP, a.mask_ratio, 1, rng)[0].to(dev)]   # tubelets spatiaux
+            else:
+                t0 = np.random.randint(2, a.T - 1)
+                masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]                         # imaginer le futur
+            loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
+            if st % 400 == 0: print(f"  [{tag}] step {st} loss {loss.item():.3f}", flush=True)
+    print(f"world model SSL = {a.ssl_source}", flush=True)
+    if a.ssl_source in ("ucf", "both"):                       # VIDEO VARIEE (UCF101) -> world model générique gelé
+        ua = Namespace(T=a.T, H=a.H, patch=a.patch, source=a.ucf_source, nclass=a.ucf_nclass, per_class=a.ucf_per)
+        Xu, _, _ = get_data(ua); Xu = torch.tensor(patchify(Xu, a.patch))
+        print(f"  pré-entraînement varié : {len(Xu)} clips UCF101 (H={a.H})", flush=True)
+        ssl_loop(Xu, a.ssl_steps, "SSL-UCF")
+    if a.ssl_source == "nexar":
+        ssl_loop(Xt[tr], a.ssl_steps, "SSL-Nexar")
+    elif a.ssl_source == "both":
+        ssl_loop(Xt[tr], max(1, a.ssl_steps // 3), "FT-Nexar")   # fine-tune léger in-domaine
     for prm in m.parameters(): prm.requires_grad = False
+    # NB: la tête collision (étape 3) s'entraîne TOUJOURS sur la dashcam Nexar (les labels y sont) ->
+    #     avec --ssl_source ucf, l'encodeur reste 100% générique => transfert pur.
 
     # ---- 2) repr causale : contexte OBSERVE (0..t, pool) + futur IMAGINE (>t) ----
     def ctx_fut(o, t0):                                       # encodeur ne voit QUE 0..t0 (visibles), predit > t0
