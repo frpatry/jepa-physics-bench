@@ -66,6 +66,11 @@ def get_args():
                    help="REBOND au sol (coeff de restitution) ; 0=desactive (parabole), >0=la balle rebondit (cassures = TRANSITIONS DE PHASE, cas d'echec nomme par la theorie). g RESTE recuperable en principe.")
     p.add_argument("--wind", type=float, default=0.0,
                    help="VENT : rafales aleatoires (force exterieure imprevisible) ajoutees a la vitesse a CHAQUE instant. 0=calme, >0=turbulent. Realiste et non-stationnaire (vs gravite magique). Combinable avec --bounce.")
+    p.add_argument("--vision", action="store_true",
+                   help="MODE VISION : la balle est DESSINEE en image grid x grid (blob gaussien) a chaque instant = mini-video, au lieu de coordonnees projetees. Plus riche et redondant (facon V-JEPA).")
+    p.add_argument("--grid", type=int, default=16, help="cote de l'image en mode vision (grid x grid pixels)")
+    p.add_argument("--vnoise", type=float, default=0.0,
+                   help="BRUIT VISUEL : grain ajoute aux PIXELS (corruption de l'image, pas de la trajectoire). Different du vent (qui perturbe le mouvement).")
     p.add_argument("--readout", choices=["pool", "time"], default="pool",
                    help="pool=moyenne temporelle (ancien, ecrase le temps) ; time=fidele au temps (par instant, predit les instants masques, sonde sur toute la trajectoire) comme V-JEPA")
     p.add_argument("--oracle", action="store_true",
@@ -118,6 +123,18 @@ def gen_physics(n, a, gen):
              - drift[:, None] * (t[None, :] ** 3))
     else:                                                    # g constant -> parabole (stationnaire)
         y = y0[:, None] + vy0[:, None] * t[None, :] - 0.5 * g[:, None] * (t[None, :] ** 2)
+    if a.vision:                                            # MODE VISION : rendre la balle en image
+        G = a.grid                                          #   grid x grid (blob gaussien), fenetre FIXE
+        xb0, xb1, yb0, yb1 = -3.0, 3.0, -0.2, 3.0           #   monde fixe (partage train/test)
+        gxc = (x - xb0) / (xb1 - xb0) * G                   # (n,T) colonne flottante
+        gyc = (yb1 - y) / (yb1 - yb0) * G                   # (n,T) ligne (y vers le haut)
+        idx = torch.arange(G).float()
+        dcol = idx.view(1, 1, 1, G) - gxc.unsqueeze(-1).unsqueeze(-1)   # (n,T,1,G)
+        drow = idx.view(1, 1, G, 1) - gyc.unsqueeze(-1).unsqueeze(-1)   # (n,T,G,1)
+        img = torch.exp(-(dcol ** 2 + drow ** 2) / (2 * 1.1 ** 2))      # (n,T,G,G) blob
+        img = img.reshape(n, a.T, G * G)
+        img = img + a.vnoise * torch.randn(n, a.T, G * G, generator=gen)  # bruit VISUEL (pixels)
+        return img, gi
     pos = torch.stack([x, y], -1)
     # CAPTEUR FIXE : W partage entre train ET test (sinon le modele est teste dans un
     # espace projete qu'il n'a jamais vu -> tout au hasard). Seed dedie, INDEPENDANT de `gen`.
@@ -267,6 +284,7 @@ def oracle_ceiling(a, dev):
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
+    if a.vision: a.obs = a.grid ** 2                          # l'entree devient grid x grid pixels
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
@@ -275,6 +293,7 @@ def main():
     os.makedirs(a.out, exist_ok=True)
     te_o, te_y = gen_physics(1500, a, torch.Generator().manual_seed(99999))
     print(f"device={dev}  physique T={a.T} obs={a.obs} g_bins={a.n_gbins} "
+          f"{'VISION '+str(a.grid)+'x'+str(a.grid)+' vnoise='+str(a.vnoise)+' ' if a.vision else ''}"
           f"(chance sonde={1/a.n_gbins:.0%})  reg_w={a.reg_w}  "
           f"nuisance={a.nuisance}  nonstat={a.nonstat}  bounce={a.bounce}  wind={a.wind}  readout={a.readout} "
           f"({'+'.join([s for s in ['REBOND' if a.bounce>0 else '', 'VENT' if a.wind>0 else '', 'DERIVE' if a.nonstat>0 else ''] if s]) or 'STATIONNAIRE'})\n", flush=True)
@@ -311,7 +330,8 @@ def main():
     with open(os.path.join(a.out, "ssl_metrics.json"), "w") as f:
         json.dump({"meta": {"chance": 1/a.n_gbins, "n_trains": a.n_trains, "regs": a.regs,
                             "reg_w": a.reg_w, "nuisance": a.nuisance, "nonstat": a.nonstat,
-                            "bounce": a.bounce, "wind": a.wind, "readout": a.readout},
+                            "bounce": a.bounce, "wind": a.wind, "readout": a.readout,
+                            "vision": a.vision, "vnoise": a.vnoise, "grid": a.grid},
                    "summary": summary}, f, indent=2)
     print(f"\n[json] -> {os.path.join(a.out, 'ssl_metrics.json')}")
 
