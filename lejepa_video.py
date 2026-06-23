@@ -94,6 +94,7 @@ def get_args():
     p.add_argument("--T", type=int, default=16); p.add_argument("--H", type=int, default=32)
     p.add_argument("--patch", type=int, default=8)
     p.add_argument("--nclass", type=int, default=10); p.add_argument("--per_class", type=int, default=60)
+    p.add_argument("--heldout", type=int, default=4, help="classes tenues a l'ecart du SSL (test de transfert)")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--reg_w", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--bs", type=int, default=32)
@@ -104,26 +105,38 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     X, Y, classes = get_data(a); nc = len(classes)
     Xp = patchify(X, a.patch); ntok = Xp.shape[1]; obs = Xp.shape[2]
-    print(f"\n{len(X)} vraies videos UCF101 | {nc} classes {classes}", flush=True)
-    print(f"chance {1/nc:.0%} | {ntok} tokens/video ({a.T} frames x {(a.H//a.patch)**2} patches) dim {obs}", flush=True)
-    Xt = torch.tensor(Xp); Yt = torch.tensor(Y)
-    g = torch.Generator().manual_seed(0); perm = torch.randperm(len(X), generator=g)
-    ntr = int(0.8 * len(X)); tr, te = perm[:ntr], perm[ntr:]
+    Xt = torch.tensor(Xp); Y = np.asarray(Y)
+    nseen = nc - a.heldout
+    seen, unseen = list(range(nseen)), list(range(nseen, nc))
+    seen_idx = np.where(np.isin(Y, seen))[0]                  # videos des classes VUES (pour le SSL)
+    print(f"\n{len(X)} vraies videos UCF101 | {nc} classes", flush=True)
+    print(f"  SSL (vues)   : {[classes[i] for i in seen]}", flush=True)
+    print(f"  TRANSFERT (jamais vues) : {[classes[i] for i in unseen]}", flush=True)
+    print(f"  {ntok} tokens/video, dim {obs}", flush=True)
+
+    # ---- LeJEPA SSL UNIQUEMENT sur les classes vues (aucun label, aucune classe held-out) ----
     torch.manual_seed(0); m = WM(obs, a.d_model, ntok, a.n_layer, a.n_head, a.reg_w).to(dev)
-    opt = torch.optim.AdamW(m.parameters(), a.lr); bs = min(a.bs, len(tr))
+    opt = torch.optim.AdamW(m.parameters(), a.lr); bs = min(a.bs, len(seen_idx))
     for st in range(a.steps):
-        bi = tr[torch.randint(0, len(tr), (bs,))]; o = Xt[bi].to(dev)
+        bi = seen_idx[np.random.randint(0, len(seen_idx), bs)]; o = Xt[bi].to(dev)
         loss = m(o, a.mask_ratio); opt.zero_grad(); loss.backward(); opt.step()
         if st % 200 == 0: print(f"  [LeJEPA] step {st} loss {loss.item():.3f}", flush=True)
+
     @torch.no_grad()
-    def feats(idx): return torch.cat([m.feat(Xt[idx[i:i+32]].to(dev)) for i in range(0, len(idx), 32)])
-    acc = probe(feats(tr), Yt[tr].to(dev), feats(te), Yt[te].to(dev), dev, nc)
-    rtr = Xt[tr].reshape(len(tr), -1).to(dev); rte = Xt[te].reshape(len(te), -1).to(dev)
-    racc = probe(rtr, Yt[tr].to(dev), rte, Yt[te].to(dev), dev, nc)
-    print(f"\n=== LeJEPA (SIGReg) sur VRAIE video UCF101 — sonde action ({len(te)} test) ===", flush=True)
-    print(f"  LeJEPA features : {acc:.2f}", flush=True)
-    print(f"  pixels bruts    : {racc:.2f}", flush=True)
-    print(f"  hasard          : {1/nc:.2f}", flush=True)
+    def feats(idx): return torch.cat([m.feat(Xt[torch.tensor(idx[i:i+32])].to(dev)) for i in range(0, len(idx), 32)])
+    def eval_classes(cids, name):
+        idx = np.where(np.isin(Y, cids))[0]
+        remap = {c: i for i, c in enumerate(cids)}
+        lab = torch.tensor([remap[int(Y[i])] for i in idx])
+        g = torch.Generator().manual_seed(1); pm = torch.randperm(len(idx), generator=g)
+        nt = int(0.7 * len(idx)); tr, te = pm[:nt].numpy(), pm[nt:].numpy()
+        F_ = feats(idx)
+        acc = probe(F_[tr], lab[tr].to(dev), F_[te], lab[te].to(dev), dev, len(cids))
+        print(f"  {name:38s}: {acc:.2f}   (hasard {1/len(cids):.2f}, {len(te)} test)", flush=True)
+        return acc
+    print(f"\n=== TRANSFERT DE CONNAISSANCE (LeJEPA SIGReg, vraie video) ===", flush=True)
+    eval_classes(seen, "classes VUES au SSL (reference)")
+    eval_classes(unseen, "classes JAMAIS VUES (transfert)")
 
 if __name__ == "__main__":
     main()
