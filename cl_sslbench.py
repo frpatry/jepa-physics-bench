@@ -75,6 +75,8 @@ def get_args():
                    help="pool=moyenne temporelle (ancien, ecrase le temps) ; time=fidele au temps (par instant, predit les instants masques, sonde sur toute la trajectoire) comme V-JEPA")
     p.add_argument("--dump", action="store_true",
                    help="Entraine 1 modele et sort la matrice de confusion g_vrai x g_predit (modele vs verite). Utilise --regs[0], --n_trains[0].")
+    p.add_argument("--traj", action="store_true",
+                   help="Masque la 2e moitie du vol, le JEPA predit, on decode en (x,y) -> balle reconstruite vs vraie (fidelite). Utiliser avec --readout time.")
     p.add_argument("--oracle", action="store_true",
                    help="PLAFOND supervise : sonde directe sur donnees brutes (zero SSL). Repond : g est-il recuperable de ces donnees ? lin(traj)=identif. lineaire ; lin(moyenne)=ce que pool peut au mieux ; MLP(traj)=recuperable du tout ?")
     p.add_argument("--d_model", type=int, default=128); p.add_argument("--n_layer", type=int, default=3)
@@ -88,7 +90,7 @@ def get_args():
     return p.parse_args()
 
 # --------------------------- données physique -------------------------------
-def gen_physics(n, a, gen):
+def _motion(n, a, gen):
     gvals = torch.linspace(5.0, 15.0, a.n_gbins)
     gi = torch.randint(0, a.n_gbins, (n,), generator=gen); g = gvals[gi]
     nz = a.nuisance                                          # echelle des parasites (1.0 = original)
@@ -125,6 +127,10 @@ def gen_physics(n, a, gen):
              - drift[:, None] * (t[None, :] ** 3))
     else:                                                    # g constant -> parabole (stationnaire)
         y = y0[:, None] + vy0[:, None] * t[None, :] - 0.5 * g[:, None] * (t[None, :] ** 2)
+    return x, y, gi
+
+def gen_physics(n, a, gen):
+    x, y, gi = _motion(n, a, gen)
     if a.vision:                                            # MODE VISION : rendre la balle en image
         G = a.grid                                          #   grid x grid (blob gaussien), fenetre FIXE
         xb0, xb1, yb0, yb1 = -3.0, 3.0, -0.2, 3.0           #   monde fixe (partage train/test)
@@ -314,6 +320,38 @@ def dump_predictions(a, dev):
               open(os.path.join(a.out, "dump.json"), "w"), indent=2)
     print(f"[json] -> {a.out}/dump.json", flush=True)
 
+# --------------------------- traj (balle reconstruite vs vraie) -------------
+def traj_dump(a, dev):
+    """Masque la 2e moitie du vol, laisse le JEPA PREDIRE les instants caches,
+    DECODE ses latents en positions (x,y) -> on compare la balle imaginee a la vraie."""
+    reg = a.regs[0] if a.regs else "sigreg_off"
+    ntr = a.n_trains[0]; T = a.T
+    tr_o, _ = gen_physics(ntr, a, torch.Generator().manual_seed(1000))
+    trx, tryy, _ = _motion(ntr, a, torch.Generator().manual_seed(1000))   # memes tirages = memes positions
+    torch.manual_seed(a.seed); model = JEPA(a, reg).to(dev); train(model, tr_o, a, dev)
+    with torch.no_grad():
+        H = torch.cat([model.enc(tr_o[i:i+256].to(dev)) for i in range(0, ntr, 256)])  # (n,T,d)
+    d = H.size(-1)
+    dec = nn.Linear(d, 2).to(dev); opt = torch.optim.Adam(dec.parameters(), 1e-2)
+    Hf = H.reshape(-1, d); tgt = torch.stack([trx, tryy], -1).reshape(-1, 2).to(dev)
+    for _ in range(400):
+        opt.zero_grad(); F.mse_loss(dec(Hf), tgt).backward(); opt.step()
+    K = 3
+    te_o, _ = gen_physics(64, a, torch.Generator().manual_seed(7))
+    tex, tey, _ = _motion(64, a, torch.Generator().manual_seed(7))
+    mask = torch.zeros(1, T, dtype=torch.bool, device=dev); mask[0, T // 2:] = True
+    out = []
+    for k in range(K):
+        o = te_o[k:k+1].to(dev)
+        with torch.no_grad():
+            p = model.predictor(model.enc(o, mask))           # latents predits (1,T,d)
+            predxy = dec(p)[0].cpu()
+        true = torch.stack([tex[k], tey[k]], -1)
+        out.append({"true": [[round(float(x), 2), round(float(y), 2)] for x, y in true],
+                    "pred": [[round(float(x), 2), round(float(y), 2)] for x, y in predxy],
+                    "mask": [int(m) for m in mask[0].cpu()]})
+    print("TRAJ_DUMP " + json.dumps(out), flush=True)
+
 # --------------------------- main -------------------------------------------
 def main():
     a = get_args(); a.seq = a.T
@@ -321,6 +359,8 @@ def main():
     dev = ("cuda" if torch.cuda.is_available()
            else "mps" if torch.backends.mps.is_available()    # GPU Apple Silicon (Metal)
            else "cpu")
+    if a.traj:                                                # balle reconstruite vs vraie
+        traj_dump(a, dev); return
     if a.dump:                                                # matrice de confusion predit vs vrai
         dump_predictions(a, dev); return
     if a.oracle:                                              # plafond supervisé, puis stop
