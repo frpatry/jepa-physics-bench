@@ -134,10 +134,13 @@ def actor_eval(m, tr_o, tr_y, te_o, te_eps, te_y, a, env, dev):
         caught = (conf & brake).sum().item() / max(1, conf.sum().item())
         print(f"  {thr:>5} |   {col:>5.0%}    |   {fstop:>5.0%}     |   {caught:>4.0%}", flush=True)
     brake = P > a.thr
-    nd = a.dump_n or 6
+    sel = []                                                  # echantillon REPRESENTATIF
+    for cond, _lab in [(brake & conf, "evite"), (~brake & conf, "rate"),
+                       (brake & ~conf, "faux-arret"), (~brake & ~conf, "sur")]:
+        sel += torch.nonzero(cond).flatten().tolist()[:2]
     out = [{"ego_x": braked_traj(bool(brake[k]), a.t_dec, env), "ped_x": te_eps[k]["ped_x"],
             "ped_y": te_eps[k]["ped_y"], "conflict": te_eps[k]["conflict"],
-            "brake": bool(brake[k]), "p_conf": round(float(P[k]), 2), "t_dec": a.t_dec} for k in range(nd)]
+            "brake": bool(brake[k]), "p_conf": round(float(P[k]), 2), "t_dec": a.t_dec} for k in sel]
     print("ACTOR3_DUMP " + json.dumps(out), flush=True)
 
 def get_args():
