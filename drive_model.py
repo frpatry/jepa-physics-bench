@@ -100,13 +100,50 @@ def probe(Xtr, ytr, Xte, yte, dev, steps=400):
     rec_neg = ((pr == 0) & (yte == 0)).sum().item() / max(1, (yte == 0).sum().item())
     return acc, 0.5 * (rec_pos + rec_neg), rec_pos
 
+def braked_traj(brake, t_dec, env):
+    """Trajectoire ego sous controle : vitesse constante puis freine a partir de t_dec
+    (s'arrete AVANT le passage). Si pas de freinage : vitesse constante (peut percuter)."""
+    T = env.T; xs = []; x = 0.0; v = env.ego_speed; xstop = env.cw_x - 0.8
+    for t in range(T):
+        xs.append(round(x, 2))
+        if brake and t >= t_dec:
+            v = max(0.0, v - 0.12) if x < xstop else 0.0
+        x += v * env.dt
+    return xs
+
+def actor_eval(m, tr_o, tr_y, te_o, te_eps, te_y, a, env, dev):
+    """L'actor anticipe le conflit (world model, frames 0..t_dec) et freine si proba>seuil."""
+    Xtr = m.context(tr_o.to(dev), a.t_dec); Xte = m.context(te_o.to(dev), a.t_dec)
+    clf = nn.Linear(Xtr.size(1), 2).to(dev); opt = torch.optim.Adam(clf.parameters(), 1e-2)
+    w = torch.tensor([1.0, (tr_y == 0).sum() / max(1, (tr_y == 1).sum())], device=dev)
+    ytr = tr_y.to(dev)
+    for _ in range(400):
+        opt.zero_grad(); F.cross_entropy(clf(Xtr), ytr, weight=w).backward(); opt.step()
+    with torch.no_grad(): P = clf(Xte).softmax(-1)[:, 1].cpu()
+    brake = P > a.thr; conf = te_y.bool()
+    col = (conf & ~brake).float().mean().item()                 # actor percute = conflit non anticipe
+    fstop = (~conf & brake).float().mean().item()               # faux arret = freine pour rien
+    caught = (conf & brake).sum().item() / max(1, conf.sum().item())
+    naive_col = conf.float().mean().item()                      # naif reactif : freine trop tard -> percute tout conflit
+    print(f"\n=== ACTOR (decision a t={a.t_dec}, seuil {a.thr}) ===", flush=True)
+    print(f"  ACTOR (world model) : collisions {col:.0%}   faux arrets {fstop:.0%}   conflits anticipes {caught:.0%}", flush=True)
+    print(f"  naif reactif        : collisions {naive_col:.0%}   (freine quand le pieton est deja sur la route = trop tard)", flush=True)
+    nd = a.dump_n or 6
+    out = [{"ego_x": braked_traj(bool(brake[k]), a.t_dec, env), "ped_x": te_eps[k]["ped_x"],
+            "ped_y": te_eps[k]["ped_y"], "conflict": te_eps[k]["conflict"],
+            "brake": bool(brake[k]), "p_conf": round(float(P[k]), 2), "t_dec": a.t_dec} for k in range(nd)]
+    print("ACTOR3_DUMP " + json.dumps(out), flush=True)
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--G", type=int, default=24); p.add_argument("--d_model", type=int, default=128)
     p.add_argument("--n_layer", type=int, default=3); p.add_argument("--n_head", type=int, default=4)
-    p.add_argument("--steps", type=int, default=1500); p.add_argument("--bs", type=int, default=128)
+    p.add_argument("--steps", type=int, default=2000); p.add_argument("--bs", type=int, default=128)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--mask_ratio", type=float, default=0.4)
-    p.add_argument("--reg_w", type=float, default=25.0)
+    p.add_argument("--reg_w", type=float, default=1.0, help="poids SIGReg (1 sur images ; 25 ecrasait)")
+    p.add_argument("--actor", action="store_true", help="PHASE 3 : l'actor anticipe et freine ; collisions vs naif reactif")
+    p.add_argument("--t_dec", type=int, default=8, help="instant de decision de l'actor (frames vues 0..t_dec-1)")
+    p.add_argument("--thr", type=float, default=0.5, help="seuil de proba conflit pour freiner (cout collision eleve -> plus bas = prudent)")
     p.add_argument("--n_train", type=int, default=4000); p.add_argument("--n_test", type=int, default=1500)
     p.add_argument("--p_cross", type=float, default=0.6); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--dump_n", type=int, default=0, help="dump N episodes test avec proba conflit predite")
@@ -126,6 +163,8 @@ def main():
         o = tr_o[torch.randint(0, a.n_train, (a.bs,))].to(dev)
         loss = m(o, a.mask_ratio); opt.zero_grad(); loss.backward(); opt.step()
         if st % 300 == 0: print(f"  step {st}  loss {loss.item():.3f}", flush=True)
+    if a.actor:
+        actor_eval(m, tr_o, tr_y, te_o, te_eps, te_y, a, env, dev); return
     # ANTICIPATION : conflit depuis la 1re moitie seulement
     Xtr = m.context(tr_o.to(dev), half); Xte = m.context(te_o.to(dev), half)
     acc, bal, rec = probe(Xtr, tr_y.to(dev), Xte, te_y.to(dev), dev)
