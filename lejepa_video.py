@@ -116,6 +116,7 @@ def get_args():
     p.add_argument("--nclass", type=int, default=10); p.add_argument("--per_class", type=int, default=60)
     p.add_argument("--heldout", type=int, default=4, help="classes tenues a l'ecart du SSL (test de transfert)")
     p.add_argument("--source", choices=["subset", "full"], default="subset", help="subset (10 classes) ou full (UCF101 101 classes)")
+    p.add_argument("--map", action="store_true", help="dump une carte 2D (t-SNE) des features = VOIR que le modele organise le monde (sans labels)")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--reg_w", type=float, default=1.0)
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--bs", type=int, default=32)
@@ -145,6 +146,17 @@ def main():
 
     @torch.no_grad()
     def feats(idx): return torch.cat([m.feat(Xt[torch.tensor(idx[i:i+32])].to(dev)) for i in range(0, len(idx), 32)])
+    if a.map:                                                 # CARTE 2D des features (sans labels pour l'apprentissage)
+        from sklearn.manifold import TSNE
+        F = feats(np.arange(len(Y))).cpu().numpy()
+        co = TSNE(n_components=2, init="pca", perplexity=30).fit_transform(F)
+        co = (co - co.mean(0)) / (co.std(0) + 1e-6)
+        sset = set(seen); rng = np.random.default_rng(0)
+        sel = rng.choice(len(Y), min(600, len(Y)), replace=False)
+        pts = [{"x": round(float(co[i, 0]), 2), "y": round(float(co[i, 1]), 2),
+                "c": int(Y[i]), "seen": bool(int(Y[i]) in sset)} for i in sel]
+        print("MAP_DUMP " + json.dumps({"classes": classes, "pts": pts}), flush=True)
+        return
     def eval_classes(cids, name):
         idx = np.where(np.isin(Y, cids))[0]
         remap = {c: i for i, c in enumerate(cids)}
