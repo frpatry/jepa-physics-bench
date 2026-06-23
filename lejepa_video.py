@@ -7,7 +7,7 @@ Donnees REELLES : UCF101-subset (actions). Sonde action vs pixels bruts vs hasar
 
   python lejepa_video.py --steps 2000 --nclass 10 --per_class 60
 """
-import argparse, os, glob, tarfile
+import argparse, os, glob, tarfile, json
 from collections import defaultdict
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import cv2
