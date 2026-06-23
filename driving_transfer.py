@@ -68,26 +68,36 @@ def main():
     g = torch.Generator().manual_seed(1); pm = torch.randperm(len(Xn), generator=g)
     nt = int(0.7 * len(Xn)); tr, te = pm[:nt].numpy(), pm[nt:].numpy()
 
+    def probe_mlp(Xtr, ytr, Xte, yte):                        # sonde plus profonde (non-linéaire)
+        clf = nn.Sequential(nn.Linear(Xtr.size(1), 256), nn.GELU(), nn.Linear(256, 2)).to(dev)
+        opt = torch.optim.Adam(clf.parameters(), 1e-3)
+        for _ in range(600):
+            opt.zero_grad(); F.cross_entropy(clf(Xtr), ytr).backward(); opt.step()
+        with torch.no_grad(): return (clf(Xte).argmax(-1) == yte).float().mean().item()
     @torch.no_grad()
     def feats(model, idx): return torch.cat([model.feat(Xnt[torch.tensor(idx[i:i+32])].to(dev)) for i in range(0, len(idx), 32)])
     def run_probe(model):
-        return probe(feats(model, tr), Ynt[tr].to(dev), feats(model, te), Ynt[te].to(dev), dev, 2)
+        Ftr, Fte = feats(model, tr), feats(model, te)
+        lin = probe(Ftr, Ynt[tr].to(dev), Fte, Ynt[te].to(dev), dev, 2)
+        mlp = probe_mlp(Ftr, Ynt[tr].to(dev), Fte, Ynt[te].to(dev))
+        return lin, mlp
 
     # --- #2 GRAAL : encodeur UCF101 (générique), gelé, sur dashcam ---
     uargs = Namespace(T=a.T, H=a.H, patch=a.patch, source=a.ucf_source, nclass=a.ucf_nclass, per_class=a.ucf_per)
     Xu, _, _ = get_data(uargs); Xu = patchify(Xu, a.patch)
     print(f"\nUCF101 générique : {len(Xu)} vidéos, entraînement de l'encodeur…", flush=True)
     enc_ucf = train_wm(Xu, ntok, obs, a, dev, "UCF→generic")
-    acc2 = run_probe(enc_ucf)
+    lin2, mlp2 = run_probe(enc_ucf)
 
     # --- #1 réf : encodeur entraîné sur dashcam ---
     print(f"\nEncodeur in-domaine sur dashcam…", flush=True)
     enc_nex = train_wm(Xn[tr], ntok, obs, a, dev, "dashcam")
-    acc1 = run_probe(enc_nex)
+    lin1, mlp1 = run_probe(enc_nex)
 
     print(f"\n=== DÉTECTER LE DANGER ROUTIER (collision imminente, {len(te)} test) ===", flush=True)
-    print(f"  #2 GRAAL  UCF101 (maquillage/sport) gelé -> dashcam : {acc2:.2f}", flush=True)
-    print(f"  #1 réf    entraîné sur dashcam            -> dashcam : {acc1:.2f}", flush=True)
+    print(f"  {'':38s}  sonde lin.  sonde MLP", flush=True)
+    print(f"  #2 GRAAL  UCF101 (maquillage/sport) gelé : {lin2:.2f}        {mlp2:.2f}", flush=True)
+    print(f"  #1 réf    entraîné sur dashcam           : {lin1:.2f}        {mlp1:.2f}", flush=True)
     print(f"  hasard : 0.50", flush=True)
 
 if __name__ == "__main__":
