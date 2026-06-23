@@ -71,13 +71,16 @@ def get_args():
     p.add_argument("--mask_ratio", type=float, default=0.4)
     p.add_argument("--n_train", type=int, default=600); p.add_argument("--n_test", type=int, default=200)
     p.add_argument("--seed", type=int, default=0); p.add_argument("--dump_n", type=int, default=1)
+    p.add_argument("--G", type=int, default=16, help="taille image (scaling perception)")
+    p.add_argument("--vnoise", type=float, default=0.0, help="bruit visuel (perception plus dure)")
     return p.parse_args()
 
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
-    obs_dim = G * G
+    global G; G = a.G; obs_dim = G * G                         # taille image parametrable (scaling)
     tr = make_routes(a.n_train, a, 1000 + a.seed); te = make_routes(a.n_test, a, 99999)
     TR = torch.tensor(np.stack([route_obs(r) for r in tr]))    # (n,T,G*G)
+    if a.vnoise > 0: TR = TR + a.vnoise * torch.randn_like(TR)  # bruit visuel (perception dure)
     Vtr = torch.tensor(np.array([r["ego_v"] for r in tr]), dtype=torch.float32)
     print(f"device={dev}  routes train={a.n_train} test={a.n_test}  G={G} W={W} T={a.T}", flush=True)
 
@@ -121,7 +124,9 @@ def main():
         hit = False
         for t in range(a.T):
             xs.append(round(x, 2)); vs.append(round(v, 2))
-            buf = buf[1:] + [render_frame(x, ev, {i: pe[i][t] for i in pe})]
+            fr_img = render_frame(x, ev, {i: pe[i][t] for i in pe})
+            if a.vnoise > 0: fr_img = fr_img + a.vnoise * np.random.standard_normal(obs_dim).astype(np.float32)
+            buf = buf[1:] + [fr_img]
             vbuf = vbuf[1:] + [v]
             win = torch.tensor(np.stack(buf), dtype=torch.float32).unsqueeze(0)
             with torch.no_grad():
