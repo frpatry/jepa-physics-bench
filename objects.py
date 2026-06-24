@@ -80,7 +80,7 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=2500); p.add_argument("--T", type=int, default=12)
     p.add_argument("--H", type=int, default=48); p.add_argument("--patch", type=int, default=8)
-    p.add_argument("--n_obj", type=int, default=3)
+    p.add_argument("--n_obj", type=int, default=3); p.add_argument("--dt", type=float, default=0.045)
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--reg_w", type=float, default=1.0); p.add_argument("--mask_ratio", type=float, default=0.5)
@@ -93,7 +93,7 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     nP = a.H // a.patch; npf = nP * nP; ntok = a.T * npf; d = a.d_model
     print(f"device={dev}  monde {a.n_obj} objets  H={a.H} -> grille {nP}x{nP}, {ntok} tokens/clip", flush=True)
-    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, seed=0)
+    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, dt=a.dt, seed=0)
     Xp = patchify(F0, a.patch); obs = Xp.shape[2]
     Xt = torch.tensor(Xp); g = torch.Generator().manual_seed(1); pm = torch.randperm(a.n, generator=g)
     nt = int(0.8 * a.n); tr, te = pm[:nt].numpy(), pm[nt:].numpy()
@@ -112,46 +112,48 @@ def main():
         if st % 400 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in m.parameters(): prm.requires_grad = False
 
-    # ---- SONDE 1 : état (position + vitesse de chaque objet) depuis le latent par frame ----
-    Z = per_frame_latent(m, Xt, a.T, npf, dev)                   # (n,T,2d)
+    # ---- décodeur de POSITION (sonde gelée) : latent par frame -> positions des objets ----
+    Z = per_frame_latent(m, Xt, a.T, npf, dev)                   # (n,T,2d) latents propres
     fd = Z.size(-1)
-    St = torch.tensor(S.reshape(a.n, a.T, -1))                   # (n,T,n_obj*4)
-    def flat(idx): return Z[idx].reshape(-1, fd).to(dev), St[idx].reshape(-1, a.n_obj * 4).to(dev)
-    Ztr, Ytr = flat(tr); Zte, Yte = flat(te)
-    mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
-    head = nn.Sequential(nn.Linear(fd, 256), nn.GELU(), nn.Linear(256, a.n_obj * 4)).to(dev)
-    oh = torch.optim.Adam(head.parameters(), 1e-3)
-    for _ in range(800):
-        oh.zero_grad(); F.mse_loss(head(Ztr), (Ytr - mu) / sd).backward(); oh.step()
-    with torch.no_grad(): pr = head(Zte) * sd + mu
-    pos_r2 = r2(pr.reshape(-1, a.n_obj, 4)[..., :2].reshape(len(pr), -1), Yte.reshape(-1, a.n_obj, 4)[..., :2].reshape(len(pr), -1))
-    vel_r2 = r2(pr.reshape(-1, a.n_obj, 4)[..., 2:].reshape(len(pr), -1), Yte.reshape(-1, a.n_obj, 4)[..., 2:].reshape(len(pr), -1))
-
-    # ---- SONDE 2 : anticipation de collision (1re moitié -> collision dans la 2e ?) ----
-    t0 = a.T // 2
-    lab = torch.tensor((C[:, t0+1:].sum(1) > 0).astype(np.int64))             # collision après t0 ?
+    P = torch.tensor(S[..., :2].reshape(a.n, a.T, -1)).float()   # (n,T,n_obj*2) positions vraies
+    Vv = torch.tensor(S[..., 2:].reshape(a.n, a.T, -1)).float()  # (n,T,n_obj*2) vitesses vraies
+    Ztr = Z[tr].reshape(-1, fd).to(dev); Ptr = P[tr].reshape(-1, a.n_obj * 2).to(dev)
+    pmu, psd = Ptr.mean(0), Ptr.std(0) + 1e-6
+    dec = nn.Sequential(nn.Linear(fd, 256), nn.GELU(), nn.Linear(256, a.n_obj * 2)).to(dev)
+    od = torch.optim.Adam(dec.parameters(), 1e-3)
+    for _ in range(1000):
+        od.zero_grad(); F.mse_loss(dec(Ztr), (Ptr - pmu) / psd).backward(); od.step()
     @torch.no_grad()
-    def ctx_fut_feat(idx):                                       # contexte observé + futur imaginé
+    def decode(z): return dec(z.to(dev)) * psd + pmu
+    pos_now = r2(decode(Z[te].reshape(-1, fd)), P[te].reshape(-1, a.n_obj * 2).to(dev))   # sait-il OÙ (frames vues)
+
+    # ---- PRÉDICTION DU FUTUR : comprend-il la DYNAMIQUE ? (depuis la 1re moitié, prédire la suite) ----
+    t0 = a.T // 2; nf = a.T - t0 - 1                             # frames futures t0+1..T-1
+    @torch.no_grad()
+    def imagine(idx):                                           # descripteurs futurs IMAGINÉS (.,nf,2d)
         out = []
         for i in range(0, len(idx), 16):
             o = Xt[idx[i:i+16]].to(dev); msk = temporal_mask(o.size(0), a.T, nP, t0, dev)
-            ctx, fut = m.predict_targets(o, msk); out.append(torch.cat([ctx, fut.mean(1)], -1).cpu())
+            _, fut = m.predict_targets(o, msk)                  # (b, nf*npf, d)
+            zf = fut.reshape(fut.size(0), nf, npf, fut.size(-1))
+            out.append(torch.cat([zf.mean(2), zf.amax(2)], -1).cpu())   # (b,nf,2d)
         return torch.cat(out)
-    def clf_acc(Ftr, ytr, Fte, yte):
-        clf = nn.Sequential(nn.Linear(Ftr.size(1), 128), nn.GELU(), nn.Linear(128, 2)).to(dev)
-        op = torch.optim.Adam(clf.parameters(), 1e-3); n1 = int(ytr.sum())
-        w = torch.tensor([len(ytr)/(2*(len(ytr)-n1)+1), len(ytr)/(2*n1+1)], device=dev)  # classes équilibrées
-        for _ in range(800):
-            op.zero_grad(); F.cross_entropy(clf(Ftr.to(dev)), ytr.to(dev), weight=w).backward(); op.step()
-        with torch.no_grad(): return (clf(Fte.to(dev)).argmax(-1).cpu() == yte).float().mean().item()
-    acc_wm = clf_acc(ctx_fut_feat(tr), lab[tr], ctx_fut_feat(te), lab[te])
-    # ORACLE supervisé : mêmes frames 0..t0 brutes -> "l'info est-elle là ?"
-    raw = torch.tensor(F0[:, :t0+1].reshape(a.n, -1))
-    acc_oracle = clf_acc(raw[tr], lab[tr], raw[te], lab[te])
+    # tout passe par le MÊME décodeur (comparaison juste) : imaginer vs figer la derniere vue vs plafond
+    gt = P[te][:, t0+1:].to(dev).reshape(-1, a.n_obj * 2)        # positions futures vraies
+    r2_wm = r2(decode(imagine(te).reshape(-1, fd)), gt)         # futur IMAGINÉ par le world model
+    frozen = Z[te][:, t0:t0+1].expand(-1, nf, -1).reshape(-1, fd)  # on FIGE le dernier latent observé
+    r2_frozen = r2(decode(frozen), gt)                          # = "rien ne bouge"
+    r2_ceil = r2(decode(Z[te][:, t0+1:].reshape(-1, fd)), gt)   # plafond : décodage du futur RÉEL (limite décodeur)
+    # repere physique (avec l'etat VRAI) : ce qu'une extrapolation ligne droite atteindrait
+    p0 = P[te][:, t0:t0+1].to(dev); v0 = Vv[te][:, t0:t0+1].to(dev)
+    ks = torch.arange(1, nf + 1).view(1, nf, 1).float().to(dev)
+    r2_constv = r2((p0 + v0 * a.dt * ks).reshape(-1, a.n_obj * 2), gt)
 
     print(f"\n=== COMPRÉHENSION DU MONDE D'OBJETS ===", flush=True)
-    print(f"  SONDE ÉTAT (R², 1.0=parfait) : position={pos_r2:.2f}  vitesse={vel_r2:.2f}", flush=True)
-    print(f"  ANTICIPATION COLLISION (acc) : world model={acc_wm:.2f}  | oracle={acc_oracle:.2f}  | hasard={1-lab.float().mean():.2f}", flush=True)
+    print(f"  SAIT OÙ sont les objets (R² position, frames vues) : {pos_now:.2f}", flush=True)
+    print(f"  PRÉDIT LE FUTUR (même décodeur) : imaginé={r2_wm:.2f}  vs  figé(rien ne bouge)={r2_frozen:.2f}  "
+          f"| plafond(futur réel)={r2_ceil:.2f}", flush=True)
+    print(f"  (repère physique, état vrai : extrapolation ligne droite atteindrait {r2_constv:.2f})", flush=True)
 
 if __name__ == "__main__":
     main()
