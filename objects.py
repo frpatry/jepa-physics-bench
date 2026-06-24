@@ -117,14 +117,14 @@ def main():
     fd = Z.size(-1)
     P = torch.tensor(S[..., :2].reshape(a.n, a.T, -1)).float()   # (n,T,n_obj*2) positions vraies
     Vv = torch.tensor(S[..., 2:].reshape(a.n, a.T, -1)).float()  # (n,T,n_obj*2) vitesses vraies
-    Ztr = Z[tr].reshape(-1, fd).to(dev); Ptr = P[tr].reshape(-1, a.n_obj * 2).to(dev)
-    pmu, psd = Ptr.mean(0), Ptr.std(0) + 1e-6
-    dec = nn.Sequential(nn.Linear(fd, 256), nn.GELU(), nn.Linear(256, a.n_obj * 2)).to(dev)
-    od = torch.optim.Adam(dec.parameters(), 1e-3)
-    for _ in range(1000):
-        od.zero_grad(); F.mse_loss(dec(Ztr), (Ptr - pmu) / psd).backward(); od.step()
-    @torch.no_grad()
-    def decode(z): return dec(z.to(dev)) * psd + pmu
+    Ptr = P[tr].reshape(-1, a.n_obj * 2).to(dev); pmu, psd = Ptr.mean(0), Ptr.std(0) + 1e-6
+    def train_dec(Zf, Pf):                                       # entraîne un décodeur latent->position
+        d2 = nn.Sequential(nn.Linear(fd, 256), nn.GELU(), nn.Linear(256, a.n_obj * 2)).to(dev)
+        op = torch.optim.Adam(d2.parameters(), 1e-3)
+        for _ in range(1000):
+            op.zero_grad(); F.mse_loss(d2(Zf), (Pf - pmu) / psd).backward(); op.step()
+        return lambda z: d2(z.to(dev)) * psd + pmu
+    decode = train_dec(Z[tr].reshape(-1, fd).to(dev), Ptr)       # décodeur appris sur latents PROPRES
     pos_now = r2(decode(Z[te].reshape(-1, fd)), P[te].reshape(-1, a.n_obj * 2).to(dev))   # sait-il OÙ (frames vues)
 
     # ---- PRÉDICTION DU FUTUR : comprend-il la DYNAMIQUE ? (depuis la 1re moitié, prédire la suite) ----
@@ -138,22 +138,26 @@ def main():
             zf = fut.reshape(fut.size(0), nf, npf, fut.size(-1))
             out.append(torch.cat([zf.mean(2), zf.amax(2)], -1).cpu())   # (b,nf,2d)
         return torch.cat(out)
-    # tout passe par le MÊME décodeur (comparaison juste) : imaginer vs figer la derniere vue vs plafond
+    # comparaison juste (même décodeur "propre") : imaginer vs figer la derniere vue vs plafond
     gt = P[te][:, t0+1:].to(dev).reshape(-1, a.n_obj * 2)        # positions futures vraies
-    r2_wm = r2(decode(imagine(te).reshape(-1, fd)), gt)         # futur IMAGINÉ par le world model
+    Zi_te = imagine(te)                                          # futurs IMAGINÉS (test)
+    r2_wm = r2(decode(Zi_te.reshape(-1, fd)), gt)              # futur imaginé, décodeur propre
     frozen = Z[te][:, t0:t0+1].expand(-1, nf, -1).reshape(-1, fd)  # on FIGE le dernier latent observé
     r2_frozen = r2(decode(frozen), gt)                          # = "rien ne bouge"
     r2_ceil = r2(decode(Z[te][:, t0+1:].reshape(-1, fd)), gt)   # plafond : décodage du futur RÉEL (limite décodeur)
-    # repere physique (avec l'etat VRAI) : ce qu'une extrapolation ligne droite atteindrait
+    # DIAGNOSTIC : ré-apprendre le décodeur SUR les latents imaginés -> le futur imaginé est-il LISIBLE ?
+    dec_i = train_dec(imagine(tr).reshape(-1, fd).to(dev), P[tr][:, t0+1:].reshape(-1, a.n_obj * 2).to(dev))
+    r2_wm_relu = r2(dec_i(Zi_te.reshape(-1, fd)), gt)
+    # repere physique (etat VRAI) : ce qu'une extrapolation ligne droite atteindrait
     p0 = P[te][:, t0:t0+1].to(dev); v0 = Vv[te][:, t0:t0+1].to(dev)
     ks = torch.arange(1, nf + 1).view(1, nf, 1).float().to(dev)
     r2_constv = r2((p0 + v0 * a.dt * ks).reshape(-1, a.n_obj * 2), gt)
 
     print(f"\n=== COMPRÉHENSION DU MONDE D'OBJETS ===", flush=True)
     print(f"  SAIT OÙ sont les objets (R² position, frames vues) : {pos_now:.2f}", flush=True)
-    print(f"  PRÉDIT LE FUTUR (même décodeur) : imaginé={r2_wm:.2f}  vs  figé(rien ne bouge)={r2_frozen:.2f}  "
-          f"| plafond(futur réel)={r2_ceil:.2f}", flush=True)
-    print(f"  (repère physique, état vrai : extrapolation ligne droite atteindrait {r2_constv:.2f})", flush=True)
+    print(f"  PRÉDIT LE FUTUR : imaginé={r2_wm:.2f}  vs  figé(rien ne bouge)={r2_frozen:.2f}  | plafond(futur réel)={r2_ceil:.2f}", flush=True)
+    print(f"  DIAGNOSTIC futur imaginé LISIBLE (décodeur ré-appris dessus) : {r2_wm_relu:.2f}", flush=True)
+    print(f"  (repère physique, état vrai : ligne droite atteindrait {r2_constv:.2f})", flush=True)
 
 if __name__ == "__main__":
     main()
