@@ -171,12 +171,23 @@ def main():
         return torch.stack(preds, 1)                            # (N,nf,fd)
     r2_g = r2(decode(rollout_g(te).reshape(-1, fd)), gt)
 
+    # ---- TEST DÉCISIF : les latents contiennent-ils « OÙ ÇA VA » ? ----
+    # depuis 2 latents passés, prédire DIRECTEMENT les positions futures (pas de latent, pas de rollout qui dérive).
+    Pfut = P[:, t0+1:].reshape(a.n, -1)                          # (n, nf*n_obj*2) positions futures vraies
+    def ctx2(idx): return torch.cat([Z[idx][:, t0-1], Z[idx][:, t0]], -1).to(dev)   # 2 latents passés
+    Pm, Ps = Pfut[tr].to(dev).mean(0), Pfut[tr].to(dev).std(0) + 1e-6
+    gp = nn.Sequential(nn.Linear(2 * fd, 512), nn.GELU(), nn.Linear(512, Pfut.size(1))).to(dev)
+    ogp = torch.optim.Adam(gp.parameters(), 1e-3); Xin, Yin = ctx2(tr), Pfut[tr].to(dev)
+    for _ in range(2500):
+        ogp.zero_grad(); F.mse_loss(gp(Xin), (Yin - Pm) / Ps).backward(); ogp.step()
+    with torch.no_grad(): r2_gpos = r2(gp(ctx2(te)) * Ps + Pm, Pfut[te].to(dev))
+
     print(f"\n=== COMPRÉHENSION DU MONDE D'OBJETS ===", flush=True)
     print(f"  SAIT OÙ sont les objets (R² position, frames vues) : {pos_now:.2f}", flush=True)
-    print(f"  PRÉDIT LE FUTUR : figé(rien ne bouge)={r2_frozen:.2f}  | plafond(futur réel)={r2_ceil:.2f}", flush=True)
-    print(f"    - prédicteur masqué (V-JEPA)        : {r2_wm:.2f}   (lisible ré-appris : {r2_wm_relu:.2f})", flush=True)
-    print(f"    - prédicteur DIRECT g([z-1,z])->z+1 : {r2_g:.2f}   <- bat-il figé ?", flush=True)
-    print(f"  (repère physique, état vrai : ligne droite atteindrait {r2_constv:.2f})", flush=True)
+    print(f"  --- prédire le futur (R², vs figé={r2_frozen:.2f}, plafond={r2_ceil:.2f}, physique={r2_constv:.2f}) ---", flush=True)
+    print(f"  ► latents savent-ils OÙ ÇA VA (positions futures depuis 2 latents) : {r2_gpos:.2f}   <- DÉCISIF", flush=True)
+    print(f"    prédicteur masqué (V-JEPA)            : {r2_wm:.2f}   (lisible ré-appris : {r2_wm_relu:.2f})", flush=True)
+    print(f"    prédicteur direct latent g([z-1,z])   : {r2_g:.2f}", flush=True)
 
 if __name__ == "__main__":
     main()
