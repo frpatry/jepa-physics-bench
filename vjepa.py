@@ -128,10 +128,19 @@ class VJEPA(nn.Module):
 
     @torch.no_grad()
     def feat(s, o):
-        """representation pour la sonde : encodeur complet -> pooling moyen (B,d)."""
+        """representation pour la sonde : encodeur complet -> pooling moyen (B,d).
+        ATTENTION : a haute resolution (beaucoup de tokens) la moyenne DILUE un signal localise
+        (ex. une collision sur quelques patches) -> preferer tokens()+sonde attentive."""
         B, N, _ = o.shape
         allidx = torch.arange(N, device=o.device).expand(B, -1)
         return s.enc(o, allidx).mean(1)
+
+    @torch.no_grad()
+    def tokens(s, o):
+        """latents PAR TOKEN (B,ntok,d), non poolés -> pour la sonde attentive (readout non diluant)."""
+        B, N, _ = o.shape
+        allidx = torch.arange(N, device=o.device).expand(B, -1)
+        return s.enc(o, allidx)
 
     def predict_targets(s, o, m):
         """contexte observe (pool) + latents cibles imagines, pour rollout / MPC.
@@ -146,3 +155,28 @@ def probe(Xtr, ytr, Xte, yte, dev, nc, steps=500):
     for _ in range(steps):
         opt.zero_grad(); F.cross_entropy(clf(Xtr), ytr).backward(); opt.step()
     with torch.no_grad(): return (clf(Xte).argmax(-1) == yte).float().mean().item()
+
+# ---------------------------------------------------------------- sonde ATTENTIVE (protocole V-JEPA)
+class AttentiveProbe(nn.Module):
+    """une requete apprise pondere les tokens (cross-attention) -> classif. Encodeur GELE ;
+    seule la sonde apprend => readout qui NE DILUE PAS (apprend OU regarder, ex. la collision)."""
+    def __init__(s, d, nc, nh=4):
+        super().__init__()
+        s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        s.attn = nn.MultiheadAttention(d, nh, batch_first=True)
+        s.ln = nn.LayerNorm(d); s.fc = nn.Linear(d, nc)
+    def forward(s, toks):                                          # toks:(B,ntok,d) latents geles
+        q = s.q.expand(toks.size(0), -1, -1)
+        pooled, _ = s.attn(q, toks, toks)                          # (B,1,d)
+        return s.fc(s.ln(pooled[:, 0]))
+
+def attentive_probe(Ttr, ytr, Tte, yte, dev, nc, steps=800, lr=1e-3, bs=64):
+    """Ttr/Tte:(N,ntok,d) latents geles (CPU ok, batches vers dev). ytr/yte:(N,) sur CPU."""
+    clf = AttentiveProbe(Ttr.size(-1), nc).to(dev); opt = torch.optim.Adam(clf.parameters(), lr)
+    n = len(Ttr)
+    for _ in range(steps):
+        bi = torch.randint(0, n, (min(bs, n),))
+        opt.zero_grad(); F.cross_entropy(clf(Ttr[bi].to(dev)), ytr[bi].to(dev)).backward(); opt.step()
+    with torch.no_grad():
+        pr = torch.cat([clf(Tte[i:i+bs].to(dev)).argmax(-1).cpu() for i in range(0, len(Tte), bs)])
+    return (pr == yte).float().mean().item()

@@ -21,7 +21,7 @@ import argparse
 from argparse import Namespace
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 import cv2
-from vjepa import patchify, VJEPA, probe, tube_masks
+from vjepa import patchify, VJEPA, probe, attentive_probe, tube_masks
 from lejepa_video import load_frames, get_data
 
 def load_nexar(n, T, H):
@@ -90,28 +90,34 @@ def main():
         with torch.no_grad(): return (clf(Xte).argmax(-1) == yte).float().mean().item()
     @torch.no_grad()
     def feats(model, idx): return torch.cat([model.feat(Xnt[torch.tensor(idx[i:i+32])].to(dev)) for i in range(0, len(idx), 32)])
+    @torch.no_grad()
+    def token_feats(model, idx):                              # latents PAR TOKEN (CPU) pour la sonde attentive
+        return torch.cat([model.tokens(Xnt[torch.tensor(idx[i:i+16])].to(dev)).cpu() for i in range(0, len(idx), 16)])
     def run_probe(model):
-        Ftr, Fte = feats(model, tr), feats(model, te)
+        Ftr, Fte = feats(model, tr), feats(model, te)                          # poolé (moyenne)
         lin = probe(Ftr, Ynt[tr].to(dev), Fte, Ynt[te].to(dev), dev, 2)
         mlp = probe_mlp(Ftr, Ynt[tr].to(dev), Fte, Ynt[te].to(dev))
-        return lin, mlp
+        Ttr, Tte = token_feats(model, tr), token_feats(model, te)              # par-token (non diluant)
+        att = attentive_probe(Ttr, Ynt[tr], Tte, Ynt[te], dev, 2)
+        return lin, mlp, att
 
     # --- #2 GRAAL : encodeur UCF101 (générique), gelé, sur dashcam ---
     uargs = Namespace(T=a.T, H=a.H, patch=a.patch, source=a.ucf_source, nclass=a.ucf_nclass, per_class=a.ucf_per)
     Xu, _, _ = get_data(uargs); Xu = patchify(Xu, a.patch)
     print(f"\nUCF101 générique : {len(Xu)} vidéos, entraînement de l'encodeur V-JEPA…", flush=True)
     enc_ucf = train_wm(Xu, ntok, obs, nP, a, dev, "UCF→generic")
-    lin2, mlp2 = run_probe(enc_ucf)
+    lin2, mlp2, att2 = run_probe(enc_ucf)
 
     # --- #1 réf : encodeur entraîné sur dashcam ---
     print(f"\nEncodeur V-JEPA in-domaine sur dashcam…", flush=True)
     enc_nex = train_wm(Xn[tr], ntok, obs, nP, a, dev, "dashcam")
-    lin1, mlp1 = run_probe(enc_nex)
+    lin1, mlp1, att1 = run_probe(enc_nex)
 
     print(f"\n=== DÉTECTER LE DANGER ROUTIER (collision imminente, {len(te)} test) ===", flush=True)
-    print(f"  {'':38s}  sonde lin.  sonde MLP", flush=True)
-    print(f"  #2 GRAAL  UCF101 (maquillage/sport) gelé : {lin2:.2f}        {mlp2:.2f}", flush=True)
-    print(f"  #1 réf    entraîné sur dashcam           : {lin1:.2f}        {mlp1:.2f}", flush=True)
+    print(f"  H={a.H} grille {nP}x{nP} | n_mask={a.n_mask} | mean-pool dilue à haute résolution, l'attentif non", flush=True)
+    print(f"  {'':38s}  lin.   MLP    attentif", flush=True)
+    print(f"  #2 GRAAL  UCF101 (maquillage/sport) gelé : {lin2:.2f}   {mlp2:.2f}   {att2:.2f}", flush=True)
+    print(f"  #1 réf    entraîné sur dashcam           : {lin1:.2f}   {mlp1:.2f}   {att1:.2f}", flush=True)
     print(f"  hasard : 0.50", flush=True)
 
 if __name__ == "__main__":
