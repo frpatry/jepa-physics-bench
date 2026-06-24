@@ -81,6 +81,7 @@ def get_args():
     p.add_argument("--n", type=int, default=2500); p.add_argument("--T", type=int, default=12)
     p.add_argument("--H", type=int, default=48); p.add_argument("--patch", type=int, default=8)
     p.add_argument("--n_obj", type=int, default=3); p.add_argument("--dt", type=float, default=0.045)
+    p.add_argument("--pred_k", type=int, default=2, help="horizon de prédiction (frames en avant) : court = apprenable")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--reg_w", type=float, default=1.0); p.add_argument("--mask_ratio", type=float, default=0.5)
@@ -107,7 +108,8 @@ def main():
         if np.random.rand() < 0.5:
             masks = [mk.to(dev) for mk in tube_masks(a.bs, a.T, nP, a.mask_ratio, a.n_mask, rng)]
         else:
-            t0 = np.random.randint(2, a.T - 1); masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]
+            t0 = a.T - 1 - np.random.randint(1, a.pred_k + 1)    # masque seulement les pred_k dernières (horizon court)
+            masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]
         loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
         if st % 400 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in m.parameters(): prm.requires_grad = False
@@ -127,8 +129,8 @@ def main():
     decode = train_dec(Z[tr].reshape(-1, fd).to(dev), Ptr)       # décodeur appris sur latents PROPRES
     pos_now = r2(decode(Z[te].reshape(-1, fd)), P[te].reshape(-1, a.n_obj * 2).to(dev))   # sait-il OÙ (frames vues)
 
-    # ---- PRÉDICTION DU FUTUR : comprend-il la DYNAMIQUE ? (depuis la 1re moitié, prédire la suite) ----
-    t0 = a.T // 2; nf = a.T - t0 - 1                             # frames futures t0+1..T-1
+    # ---- PRÉDICTION DU FUTUR : comprend-il la DYNAMIQUE ? (prédire les pred_k frames suivantes) ----
+    t0 = a.T - 1 - a.pred_k; nf = a.pred_k                       # contexte 0..t0, prédire t0+1..T-1 (horizon court)
     @torch.no_grad()
     def imagine(idx):                                           # descripteurs futurs IMAGINÉS (.,nf,2d)
         out = []
