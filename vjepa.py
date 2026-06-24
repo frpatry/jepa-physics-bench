@@ -159,24 +159,28 @@ def probe(Xtr, ytr, Xte, yte, dev, nc, steps=500):
 # ---------------------------------------------------------------- sonde ATTENTIVE (protocole V-JEPA)
 class AttentiveProbe(nn.Module):
     """une requete apprise pondere les tokens (cross-attention) -> classif. Encodeur GELE ;
-    seule la sonde apprend => readout qui NE DILUE PAS (apprend OU regarder, ex. la collision)."""
-    def __init__(s, d, nc, nh=4):
+    seule la sonde apprend => readout qui NE DILUE PAS (apprend OU regarder, ex. la collision).
+    Tete LEGERE + dropout : sur peu de clips elle surapprend vite, d'ou la regularisation."""
+    def __init__(s, d, nc, nh=2, p=0.2):
         super().__init__()
         s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
-        s.attn = nn.MultiheadAttention(d, nh, batch_first=True)
-        s.ln = nn.LayerNorm(d); s.fc = nn.Linear(d, nc)
+        s.attn = nn.MultiheadAttention(d, nh, batch_first=True, dropout=p)
+        s.ln = nn.LayerNorm(d); s.drop = nn.Dropout(p); s.fc = nn.Linear(d, nc)
     def forward(s, toks):                                          # toks:(B,ntok,d) latents geles
         q = s.q.expand(toks.size(0), -1, -1)
         pooled, _ = s.attn(q, toks, toks)                          # (B,1,d)
-        return s.fc(s.ln(pooled[:, 0]))
+        return s.fc(s.drop(s.ln(pooled[:, 0])))
 
-def attentive_probe(Ttr, ytr, Tte, yte, dev, nc, steps=800, lr=1e-3, bs=64):
-    """Ttr/Tte:(N,ntok,d) latents geles (CPU ok, batches vers dev). ytr/yte:(N,) sur CPU."""
-    clf = AttentiveProbe(Ttr.size(-1), nc).to(dev); opt = torch.optim.Adam(clf.parameters(), lr)
+def attentive_probe(Ttr, ytr, Tte, yte, dev, nc, steps=400, lr=1e-3, bs=64, wd=1e-2):
+    """Ttr/Tte:(N,ntok,d) latents geles (CPU ok, batches vers dev). ytr/yte:(N,) sur CPU.
+    weight-decay + dropout + moins de pas : contre le surapprentissage sur petit jeu."""
+    clf = AttentiveProbe(Ttr.size(-1), nc).to(dev)
+    opt = torch.optim.Adam(clf.parameters(), lr, weight_decay=wd)
     n = len(Ttr)
     for _ in range(steps):
         bi = torch.randint(0, n, (min(bs, n),))
         opt.zero_grad(); F.cross_entropy(clf(Ttr[bi].to(dev)), ytr[bi].to(dev)).backward(); opt.step()
+    clf.eval()
     with torch.no_grad():
         pr = torch.cat([clf(Tte[i:i+bs].to(dev)).argmax(-1).cpu() for i in range(0, len(Tte), bs)])
     return (pr == yte).float().mean().item()
