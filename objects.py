@@ -155,10 +155,27 @@ def main():
     ks = torch.arange(1, nf + 1).view(1, nf, 1).float().to(dev)
     r2_constv = r2((p0 + v0 * a.dt * ks).reshape(-1, a.n_obj * 2), gt)
 
+    # ---- PRÉDICTEUR DE DYNAMIQUE DIRECT : g([z_{t-1}, z_t]) -> z_{t+1} sur latents GELÉS ----
+    # deux latents passés -> le suivant : g peut lire la vitesse (z_t - z_{t-1}) et extrapoler.
+    g = nn.Sequential(nn.Linear(2 * fd, 512), nn.GELU(), nn.Linear(512, fd)).to(dev)
+    og = torch.optim.Adam(g.parameters(), 1e-3); Ztr_all = Z[tr]
+    for _ in range(3000):
+        bi = torch.randint(0, len(tr), (256,)); ti = torch.randint(1, a.T - 1, (256,))
+        zin = torch.cat([Ztr_all[bi, ti - 1], Ztr_all[bi, ti]], -1).to(dev)
+        og.zero_grad(); F.mse_loss(g(zin), Ztr_all[bi, ti + 1].to(dev)).backward(); og.step()
+    @torch.no_grad()
+    def rollout_g(idx):                                          # déroule g sur nf pas depuis le contexte
+        z = Z[idx].to(dev); zp, zc = z[:, t0 - 1], z[:, t0]; preds = []
+        for _ in range(nf):
+            zn = g(torch.cat([zp, zc], -1)); preds.append(zn); zp, zc = zc, zn
+        return torch.stack(preds, 1)                            # (N,nf,fd)
+    r2_g = r2(decode(rollout_g(te).reshape(-1, fd)), gt)
+
     print(f"\n=== COMPRÉHENSION DU MONDE D'OBJETS ===", flush=True)
     print(f"  SAIT OÙ sont les objets (R² position, frames vues) : {pos_now:.2f}", flush=True)
-    print(f"  PRÉDIT LE FUTUR : imaginé={r2_wm:.2f}  vs  figé(rien ne bouge)={r2_frozen:.2f}  | plafond(futur réel)={r2_ceil:.2f}", flush=True)
-    print(f"  DIAGNOSTIC futur imaginé LISIBLE (décodeur ré-appris dessus) : {r2_wm_relu:.2f}", flush=True)
+    print(f"  PRÉDIT LE FUTUR : figé(rien ne bouge)={r2_frozen:.2f}  | plafond(futur réel)={r2_ceil:.2f}", flush=True)
+    print(f"    - prédicteur masqué (V-JEPA)        : {r2_wm:.2f}   (lisible ré-appris : {r2_wm_relu:.2f})", flush=True)
+    print(f"    - prédicteur DIRECT g([z-1,z])->z+1 : {r2_g:.2f}   <- bat-il figé ?", flush=True)
     print(f"  (repère physique, état vrai : ligne droite atteindrait {r2_constv:.2f})", flush=True)
 
 if __name__ == "__main__":
