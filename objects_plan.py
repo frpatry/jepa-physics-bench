@@ -74,13 +74,14 @@ def main():
     # ---- world model : V-JEPA SSL (sans étiquettes) ----
     torch.manual_seed(0); m = VJEPA(obs, d, ntok, a.n_layer, a.n_head, a.reg_w, a.pred_layers).to(dev)
     opt = torch.optim.AdamW(m.parameters(), a.lr); rng = np.random.default_rng(0)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.ssl_steps)        # LR -> 0 : convergence stable
     for st in range(a.ssl_steps):
         bi = tr[np.random.randint(0, len(tr), a.bs)]; o = Xt[bi].to(dev)
         if np.random.rand() < 0.5:
             masks = [mk.to(dev) for mk in tube_masks(a.bs, a.T, nP, a.mask_ratio, a.n_mask, rng)]
         else:
             t0 = np.random.randint(2, a.T - 1); masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]  # contextes de longueur VARIÉE
-        loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
+        loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step(); sched.step()
         if st % 500 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in m.parameters(): prm.requires_grad = False
 
