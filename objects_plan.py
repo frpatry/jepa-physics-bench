@@ -79,7 +79,7 @@ def main():
         if np.random.rand() < 0.5:
             masks = [mk.to(dev) for mk in tube_masks(a.bs, a.T, nP, a.mask_ratio, a.n_mask, rng)]
         else:
-            t0 = a.T - 1 - np.random.randint(1, a.pred_k + 1); masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]
+            t0 = np.random.randint(2, a.T - 1); masks = [temporal_mask(a.bs, a.T, nP, t0, dev)]  # contextes de longueur VARIÉE
         loss = m(o, masks); opt.zero_grad(); loss.backward(); opt.step()
         if st % 500 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in m.parameters(): prm.requires_grad = False
@@ -92,7 +92,7 @@ def main():
     fwd = nn.Sequential(nn.Linear(2 * fd, 512), nn.GELU(), nn.Linear(512, nf * a.n_obj * 2)).to(dev)
     ofw = torch.optim.Adam(fwd.parameters(), 1e-3)
     for _ in range(4000):
-        t0 = np.random.randint(1, a.t_obs + 1)                                  # t0 in [1,t_obs] -> prédit nf frames après
+        t0 = np.random.randint(2, a.t_obs + 1)                                  # contexte >=3 frames (cohérent avec l'encodeur)
         bi = np.random.randint(0, len(tr), 256)
         cl = m.context_latents(Xtr[bi].to(dev), t0, npf)                        # (256, t0+1, 2d) honnête
         zin = torch.cat([cl[:, t0 - 1], cl[:, t0]], -1)                         # 2 derniers latents observés
