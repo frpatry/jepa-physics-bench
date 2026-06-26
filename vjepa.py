@@ -142,6 +142,16 @@ class VJEPA(nn.Module):
         allidx = torch.arange(N, device=o.device).expand(B, -1)
         return s.enc(o, allidx)
 
+    @torch.no_grad()
+    def context_latents(s, o, t0, npf):
+        """descripteur par frame (moyenne+max) des frames OBSERVÉES 0..t0 SEULEMENT : l'encodeur
+        ne voit QUE ces frames (honnête, aucune fuite du futur, pas d'OOD). -> (B, t0+1, 2d)."""
+        B, N, _ = o.shape
+        fr = torch.arange(N, device=o.device) // npf
+        vis = _idx((fr <= t0).unsqueeze(0).expand(B, -1))
+        h = s.enc(_gather(o, vis), vis).reshape(B, t0 + 1, npf, -1)
+        return torch.cat([h.mean(2), h.amax(2)], -1)
+
     def predict_targets(s, o, m):
         """contexte observe (pool) + latents cibles imagines, pour rollout / MPC.
         ctx_pool:(B,d)  pred:(B,ntgt,d). (gradients possibles -> heatmap de saillance.)"""

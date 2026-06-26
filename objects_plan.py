@@ -48,16 +48,16 @@ def run_episode(start, target, pred_obs, true_obs, t0, a, dirs):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=2500); p.add_argument("--n_test", type=int, default=300)
-    p.add_argument("--T", type=int, default=14); p.add_argument("--H", type=int, default=48)
-    p.add_argument("--patch", type=int, default=8); p.add_argument("--n_obj", type=int, default=3)
+    p.add_argument("--T", type=int, default=12); p.add_argument("--H", type=int, default=48)
+    p.add_argument("--patch", type=int, default=8); p.add_argument("--n_obj", type=int, default=2)
     p.add_argument("--r", type=float, default=0.09); p.add_argument("--dt", type=float, default=0.045)
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--reg_w", type=float, default=1.0); p.add_argument("--mask_ratio", type=float, default=0.5)
     p.add_argument("--n_mask", type=int, default=2); p.add_argument("--pred_k", type=int, default=2)
     p.add_argument("--ssl_steps", type=int, default=5000); p.add_argument("--bs", type=int, default=32)
-    p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--t_obs", type=int, default=4)
-    p.add_argument("--aspeed", type=float, default=2.4); p.add_argument("--n_dirs", type=int, default=16)
+    p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--t_obs", type=int, default=5)
+    p.add_argument("--aspeed", type=float, default=3.3); p.add_argument("--n_dirs", type=int, default=16)
     p.add_argument("--r_safe", type=float, default=0.22); p.add_argument("--r_hit", type=float, default=0.16)
     p.add_argument("--tol", type=float, default=0.08); p.add_argument("--w_avoid", type=float, default=50.0)
     return p.parse_args()
@@ -84,34 +84,29 @@ def main():
         if st % 500 == 0: print(f"  [SSL] step {st} loss {loss.item():.3f}", flush=True)
     for prm in m.parameters(): prm.requires_grad = False
 
-    # ---- décodeur position + forward model (depuis 2 latents observés -> trajectoire future) ----
-    Z = per_frame_latent(m, Xt, a.T, npf, dev); fd = Z.size(-1)
+    # ---- forward model HONNÊTE : context_latents(0..t0) -> positions futures t0+1..t0+nf ----
+    # train ET inférence utilisent le MÊME encodage (encodeur ne voit que 0..t0) -> pas de décalage, pas de fuite.
     P = torch.tensor(S[..., :2].reshape(a.n, a.T, -1)).float()
-    Ztr = Z[tr].reshape(-1, fd).to(dev); Ptr = P[tr].reshape(-1, a.n_obj * 2).to(dev)
-    pmu, psd = Ptr.mean(0), Ptr.std(0) + 1e-6
-    dec = nn.Sequential(nn.Linear(fd, 256), nn.GELU(), nn.Linear(256, a.n_obj * 2)).to(dev)
-    od = torch.optim.Adam(dec.parameters(), 1e-3)
-    for _ in range(1000):
-        od.zero_grad(); F.mse_loss(dec(Ztr), (Ptr - pmu) / psd).backward(); od.step()
+    Xtr = Xt[tr]; Ptr = P[tr]; fd = 2 * d                                       # descripteur par frame = moyenne+max -> 2d
     nf = a.T - 1 - a.t_obs                                                      # frames à imaginer
     fwd = nn.Sequential(nn.Linear(2 * fd, 512), nn.GELU(), nn.Linear(512, nf * a.n_obj * 2)).to(dev)
     ofw = torch.optim.Adam(fwd.parameters(), 1e-3)
-    for _ in range(3000):                                                       # [z_{t-1},z_t] -> nf positions futures
-        bi = torch.randint(0, len(tr), (256,)); ti = torch.randint(1, a.T - nf, (256,))
-        zin = torch.cat([Z[tr][bi, ti - 1], Z[tr][bi, ti]], -1).to(dev)
-        tgt = torch.stack([P[tr][bi, ti + 1 + k] for k in range(nf)], 1).reshape(256, -1).to(dev)
+    for _ in range(4000):
+        t0 = np.random.randint(1, a.t_obs + 1)                                  # t0 in [1,t_obs] -> prédit nf frames après
+        bi = np.random.randint(0, len(tr), 256)
+        cl = m.context_latents(Xtr[bi].to(dev), t0, npf)                        # (256, t0+1, 2d) honnête
+        zin = torch.cat([cl[:, t0 - 1], cl[:, t0]], -1)                         # 2 derniers latents observés
+        tgt = Ptr[bi][:, t0 + 1:t0 + 1 + nf].reshape(256, -1).to(dev)
         ofw.zero_grad(); F.mse_loss(fwd(zin), tgt).backward(); ofw.step()
 
     # ---- ÉPISODES de navigation (mêmes obstacles pour les 3 politiques) ----
     Fe, Se, _ = gen_clips(a.n_test, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=777)  # trajectoires d'obstacles test
     true_obs = Se[..., :2]                                                       # (n_test,T,n_obj,2)
-    # observation HONNÊTE : frames 0..t_obs réelles, futur "figé" sur la frame t_obs (pas de fuite)
-    Fpad = Fe.copy()
-    for t in range(a.t_obs + 1, a.T): Fpad[:, t] = Fe[:, a.t_obs]
-    Ze = per_frame_latent(m, torch.tensor(patchify(Fpad, a.patch)), a.T, npf, dev)  # latents observés
-    with torch.no_grad():
-        zin = torch.cat([Ze[:, a.t_obs - 1], Ze[:, a.t_obs]], -1).to(dev)
-        imag = (fwd(zin)).reshape(a.n_test, nf, a.n_obj, 2).cpu().numpy()         # obstacles IMAGINÉS
+    Xe = torch.tensor(patchify(Fe, a.patch))
+    with torch.no_grad():                                                        # encodage HONNÊTE des frames 0..t_obs
+        cl = torch.cat([m.context_latents(Xe[i:i+64].to(dev), a.t_obs, npf).cpu() for i in range(0, a.n_test, 64)])
+        zin = torch.cat([cl[:, a.t_obs - 1], cl[:, a.t_obs]], -1).to(dev)
+        imag = fwd(zin).reshape(a.n_test, nf, a.n_obj, 2).cpu().numpy()           # obstacles IMAGINÉS
     start = np.array([0.05, 0.5], np.float32); target = np.array([0.95, 0.5], np.float32)
     dirs = unit_dirs(a.n_dirs)
     def field(kind, i):                                                          # positions obstacles supposées (T,n_obj,2)
