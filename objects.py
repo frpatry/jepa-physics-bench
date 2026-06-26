@@ -14,7 +14,7 @@ La vérité-terrain (positions, vitesses, collisions) ne sert QU'À mesurer, jam
 
   python objects.py --n 2500 --T 12 --H 48 --n_obj 3 --ssl_steps 3000
 """
-import argparse
+import argparse, os
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from vjepa import patchify, VJEPA, tube_masks, temporal_mask
 
@@ -61,6 +61,15 @@ def gen_clips(n, T, n_obj, H, r=0.09, dt=0.045, seed=0):
             coll[i, t] = float(hit)
     return frames, states, coll
 
+# ------------------------------------------------------------------ rendu d'une frame depuis des positions
+def render(pos, H, r, cols):
+    """positions (n_obj,2) -> image (H,H,3) : disques colorés. Sert à DESSINER le futur imaginé."""
+    yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
+    img = np.zeros((H, H, 3), np.float32)
+    for k in range(len(pos)):
+        img[(xx - pos[k, 0]) ** 2 + (yy - pos[k, 1]) ** 2 < r * r] = cols[k]
+    return img
+
 # ------------------------------------------------------------------ sondes (encodeur GELÉ)
 def per_frame_latent(m, Xt, T, npf, dev, bs=16):
     """(.,ntok,obs) -> descripteur PAR FRAME (.,T,2d) = moyenne+max sur les patches d'une frame.
@@ -81,7 +90,10 @@ def get_args():
     p.add_argument("--n", type=int, default=2500); p.add_argument("--T", type=int, default=12)
     p.add_argument("--H", type=int, default=48); p.add_argument("--patch", type=int, default=8)
     p.add_argument("--n_obj", type=int, default=3); p.add_argument("--dt", type=float, default=0.045)
+    p.add_argument("--r", type=float, default=0.09, help="rayon des objets (rendu)")
     p.add_argument("--pred_k", type=int, default=2, help="horizon de prédiction (frames en avant) : court = apprenable")
+    p.add_argument("--viz", action="store_true", help="génère des GIF 'réel vs futur imaginé'")
+    p.add_argument("--k_viz", type=int, default=3, help="nb de clips à visualiser")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--reg_w", type=float, default=1.0); p.add_argument("--mask_ratio", type=float, default=0.5)
@@ -94,7 +106,7 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     nP = a.H // a.patch; npf = nP * nP; ntok = a.T * npf; d = a.d_model
     print(f"device={dev}  monde {a.n_obj} objets  H={a.H} -> grille {nP}x{nP}, {ntok} tokens/clip", flush=True)
-    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, dt=a.dt, seed=0)
+    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=0)
     Xp = patchify(F0, a.patch); obs = Xp.shape[2]
     Xt = torch.tensor(Xp); g = torch.Generator().manual_seed(1); pm = torch.randperm(a.n, generator=g)
     nt = int(0.8 * a.n); tr, te = pm[:nt].numpy(), pm[nt:].numpy()
@@ -188,6 +200,36 @@ def main():
     print(f"  ► latents savent-ils OÙ ÇA VA (positions futures depuis 2 latents) : {r2_gpos:.2f}   <- DÉCISIF", flush=True)
     print(f"    prédicteur masqué (V-JEPA)            : {r2_wm:.2f}   (lisible ré-appris : {r2_wm_relu:.2f})", flush=True)
     print(f"    prédicteur direct latent g([z-1,z])   : {r2_g:.2f}", flush=True)
+
+    # ---- FORWARD MODEL + VISUALISATION : voir le futur IMAGINÉ vs RÉEL ----
+    if a.viz:
+        from PIL import Image
+        t0v = a.T // 2; nfv = a.T - 1 - t0v                     # contexte = 1re moitié, on imagine la suite
+        fwd = nn.Sequential(nn.Linear(2 * fd, 512), nn.GELU(), nn.Linear(512, nfv * a.n_obj * 2)).to(dev)
+        ofw = torch.optim.Adam(fwd.parameters(), 1e-3)
+        for _ in range(3000):                                   # depuis 2 latents -> nfv positions futures (one-shot, pas de dérive)
+            bi = torch.randint(0, len(tr), (256,)); ti = torch.randint(1, a.T - nfv, (256,))
+            zin = torch.cat([Z[tr][bi, ti - 1], Z[tr][bi, ti]], -1).to(dev)
+            tgt = torch.stack([P[tr][bi, ti + 1 + k] for k in range(nfv)], 1).reshape(256, -1).to(dev)
+            ofw.zero_grad(); F.mse_loss(fwd(zin), tgt).backward(); ofw.step()
+        outdir = "/content" if os.path.isdir("/content") else "."
+        cols = COLORS[:a.n_obj]; up = max(2, 192 // a.H)
+        def big(im): a8 = (im * 255).clip(0, 255).astype(np.uint8); return np.repeat(np.repeat(a8, up, 0), up, 1)
+        sep = np.full((a.H * up, 4, 3), 255, np.uint8)
+        sel = [int(i) for i in te[:a.k_viz]]
+        for j, i in enumerate(sel):
+            with torch.no_grad():
+                zin = torch.cat([Z[i:i+1, t0v - 1], Z[i:i+1, t0v]], -1).to(dev)
+                pf = fwd(zin).reshape(nfv, a.n_obj, 2).cpu().numpy()
+            frames = []
+            for t in range(a.T):
+                right = F0[i, t] if t <= t0v else render(pf[t - t0v - 1], a.H, a.r, cols)   # réel (contexte) puis imaginé
+                frames.append(Image.fromarray(np.hstack([big(F0[i, t]), sep, big(right)])))   # gauche=réel | droite=imaginé
+            path = f"{outdir}/objworld_{j}.gif"
+            frames[0].save(path, save_all=True, append_images=frames[1:], duration=180, loop=0)
+            print(f"  GIF {j}: {path}  (gauche=RÉEL, droite=IMAGINÉ à partir de t={t0v})", flush=True)
+        print("Afficher : from IPython.display import Image as IM, display", flush=True)
+        print(f"for j in range({len(sel)}): display(IM('{outdir}/objworld_%d.gif'%j))", flush=True)
 
 if __name__ == "__main__":
     main()
