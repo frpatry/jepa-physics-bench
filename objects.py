@@ -21,8 +21,9 @@ from vjepa import patchify, VJEPA, tube_masks, temporal_mask
 COLORS = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1]], np.float32)
 
 # ------------------------------------------------------------------ environnement (numpy pur)
-def gen_clips(n, T, n_obj, H, r=0.09, dt=0.045, seed=0):
-    """Renvoie frames (n,T,H,H,3), states (n,T,n_obj,4)=[x,y,vx,vy], coll (n,T) = collision ce pas."""
+def gen_clips(n, T, n_obj, H, r=0.09, dt=0.045, seed=0, bounce=True):
+    """Renvoie frames (n,T,H,H,3), states (n,T,n_obj,4)=[x,y,vx,vy], coll (n,T) = collision ce pas.
+    bounce=False : vitesse CONSTANTE, sans rebond ni collision (dynamique prédictible = ligne droite)."""
     rng = np.random.default_rng(seed)
     cols = COLORS[:n_obj]
     yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H            # grille pour le rendu
@@ -45,20 +46,21 @@ def gen_clips(n, T, n_obj, H, r=0.09, dt=0.045, seed=0):
                 img[m] = cols[k]
             frames[i, t] = img
             pos = pos + vel * dt                                  # avance
-            for dim in (0, 1):                                    # rebond sur les murs
-                lo = pos[:, dim] < r; vel[lo, dim] = np.abs(vel[lo, dim]); pos[lo, dim] = r
-                hi = pos[:, dim] > 1 - r; vel[hi, dim] = -np.abs(vel[hi, dim]); pos[hi, dim] = 1 - r
-            hit = False                                           # collisions élastiques paire à paire
-            for a in range(n_obj):
-                for b in range(a + 1, n_obj):
-                    dv = pos[a] - pos[b]; dist = np.linalg.norm(dv)
-                    if 1e-6 < dist < 2 * r:
-                        nrm = dv / dist; rel = np.dot(vel[a] - vel[b], nrm)
-                        if rel < 0:                               # ils se rapprochent
-                            vel[a] -= rel * nrm; vel[b] += rel * nrm          # masse égale : échange composante normale
-                            ov = 2 * r - dist; pos[a] += nrm * ov / 2; pos[b] -= nrm * ov / 2
-                            hit = True
-            coll[i, t] = float(hit)
+            if bounce:
+                for dim in (0, 1):                                # rebond sur les murs
+                    lo = pos[:, dim] < r; vel[lo, dim] = np.abs(vel[lo, dim]); pos[lo, dim] = r
+                    hi = pos[:, dim] > 1 - r; vel[hi, dim] = -np.abs(vel[hi, dim]); pos[hi, dim] = 1 - r
+                hit = False                                       # collisions élastiques paire à paire
+                for a in range(n_obj):
+                    for b in range(a + 1, n_obj):
+                        dv = pos[a] - pos[b]; dist = np.linalg.norm(dv)
+                        if 1e-6 < dist < 2 * r:
+                            nrm = dv / dist; rel = np.dot(vel[a] - vel[b], nrm)
+                            if rel < 0:                           # ils se rapprochent
+                                vel[a] -= rel * nrm; vel[b] += rel * nrm      # masse égale : échange composante normale
+                                ov = 2 * r - dist; pos[a] += nrm * ov / 2; pos[b] -= nrm * ov / 2
+                                hit = True
+                coll[i, t] = float(hit)
     return frames, states, coll
 
 # ------------------------------------------------------------------ rendu d'une frame depuis des positions

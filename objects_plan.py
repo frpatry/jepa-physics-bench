@@ -51,6 +51,7 @@ def get_args():
     p.add_argument("--T", type=int, default=12); p.add_argument("--H", type=int, default=48)
     p.add_argument("--patch", type=int, default=8); p.add_argument("--n_obj", type=int, default=2)
     p.add_argument("--r", type=float, default=0.09); p.add_argument("--dt", type=float, default=0.045)
+    p.add_argument("--bounce", type=int, default=0, help="0=ligne droite (prédictible, démo System-2), 1=rebonds (dur)")
     p.add_argument("--d_model", type=int, default=256); p.add_argument("--n_layer", type=int, default=4)
     p.add_argument("--n_head", type=int, default=4); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--reg_w", type=float, default=1.0); p.add_argument("--mask_ratio", type=float, default=0.5)
@@ -66,7 +67,7 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     nP = a.H // a.patch; npf = nP * nP; ntok = a.T * npf; d = a.d_model
     print(f"device={dev}  agent + {a.n_obj} obstacles  H={a.H} -> {ntok} tokens/clip", flush=True)
-    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=0)        # vidéos d'obstacles (SSL)
+    F0, S, C = gen_clips(a.n, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=0, bounce=bool(a.bounce))   # vidéos d'obstacles (SSL)
     Xt = torch.tensor(patchify(F0, a.patch)); obs = Xt.shape[2]
     g = torch.Generator().manual_seed(1); pm = torch.randperm(a.n, generator=g)
     tr = pm[:int(0.85 * a.n)].numpy()
@@ -101,7 +102,7 @@ def main():
         ofw.zero_grad(); F.mse_loss(fwd(zin), tgt).backward(); ofw.step()
 
     # ---- ÉPISODES de navigation (mêmes obstacles pour les 3 politiques) ----
-    Fe, Se, _ = gen_clips(a.n_test, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=777)  # trajectoires d'obstacles test
+    Fe, Se, _ = gen_clips(a.n_test, a.T, a.n_obj, a.H, r=a.r, dt=a.dt, seed=777, bounce=bool(a.bounce))  # obstacles test
     true_obs = Se[..., :2]                                                       # (n_test,T,n_obj,2)
     Xe = torch.tensor(patchify(Fe, a.patch))
     with torch.no_grad():                                                        # encodage HONNÊTE des frames 0..t_obs
