@@ -95,7 +95,8 @@ class SeqAttention(nn.Module):
         return q
 
 class Model(nn.Module):
-    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3, init="learned", mode="par"):
+    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3, init="learned", mode="par",
+                 bg="const"):
         super().__init__(); s.res = res; s.K = K; s.D = D; s.slot_dim = slot_dim; s.mode = mode
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
                               nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
@@ -105,9 +106,13 @@ class Model(nn.Module):
         # scope, il recommence sur le reste. K-1 rounds + reliquat final = fond. Poids partagés.
         s.sa = (SeqAttention(K, D, iters) if mode == "seq" else
                 SlotAttention(2, D, iters, init) if mode == "peel" else SlotAttention(K, D, iters, init))
+        s.bg_mode = bg
         if mode == "peel":                                                # une init (objet,reste) DISTINCTE par round
             s.peel_init = nn.Parameter(torch.randn(1, K - 1, 2, D) * 0.5) # sinon les ROUNDS sont des clones (run 10 :
                                                                           # tous les rounds dissèquent le même objet)
+            s.bg = nn.Parameter(torch.zeros(1, 3, 1, 1))                  # reliquat = COULEUR UNIE apprise (3 nombres,
+                                                                          # zéro spatial) : un objet raté devient
+                                                                          # inexplicable -> rater une prise coûte cher
         s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
         if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
             s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
@@ -138,7 +143,8 @@ class Model(nn.Module):
                 a = torch.softmax(alog, dim=1)                           # partition objet/reste DANS le scope
                 masks.append(scope * a[:, 0]); rgbs.append(rgb[:, 0])    # l'objet cerné est engrangé
                 scope = scope * a[:, 1]                                  # on passe au suivant
-            masks.append(scope); rgbs.append(rgb[:, 1])                  # reliquat = fond (rgb du dernier "reste")
+            masks.append(scope)                                          # reliquat : couleur unie (const) ou
+            rgbs.append(s.bg.expand(B, 3, H, H) if s.bg_mode == "const" else rgb[:, 1])  # ancien slot riche
             a = torch.stack(masks, 1); rgbs = torch.stack(rgbs, 1)       # (B,K,1,H,H) somme=1 ; (B,K,3,H,H)
             return (rgbs * a).sum(1), a[:, :, 0], None, rgbs
         if s.mode == "seq":                                              # explaining away séquentiel
@@ -204,6 +210,8 @@ def get_args():
     p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--mode", choices=["par", "seq", "peel"], default="par")  # peel = run-4 récursif (objet par objet)
+    p.add_argument("--bg", choices=["const", "slot"], default="const")    # peel : reliquat = couleur unie (ferme la
+                                                                          # porte dérobée) ou ancien slot riche
     p.add_argument("--loss", choices=["mse", "mix"], default="mse")       # mix = vraisemblance de mélange par pixel
     p.add_argument("--sig", type=float, default=0.1)                      # écart-type du mélange (loss mix)
     return p.parse_args()
@@ -216,7 +224,7 @@ def main():
     print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  mode={a.mode}  init={a.init}"
           f"  seed={a.seed}  (découverte SANS étiquettes)", flush=True)
     m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters, init=a.init,
-              mode=a.mode).to(dev)
+              mode=a.mode, bg=a.bg).to(dev)
     opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)                                          # warmup LR : crucial pour que les slots se différencient
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
