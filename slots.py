@@ -134,9 +134,8 @@ class Model(nn.Module):
                 masks.append(scope * a[:, 0]); rgbs.append(rgb[:, 0])    # l'objet cerné est engrangé
                 scope = scope * a[:, 1]                                  # on passe au suivant
             masks.append(scope); rgbs.append(rgb[:, 1])                  # reliquat = fond (rgb du dernier "reste")
-            a = torch.stack(masks, 1)                                    # (B,K,1,H,H), somme = 1
-            recon = (torch.stack(rgbs, 1) * a).sum(1)
-            return recon, a[:, :, 0], None
+            a = torch.stack(masks, 1); rgbs = torch.stack(rgbs, 1)       # (B,K,1,H,H) somme=1 ; (B,K,3,H,H)
+            return (rgbs * a).sum(1), a[:, :, 0], None, rgbs
         if s.mode == "seq":                                              # explaining away séquentiel
             fn = s.sa.ni(f); kf = s.sa.k(fn); vf = s.sa.v(fn)
             scope = torch.ones(B, 1, H, H, device=img.device)            # ce qui RESTE à expliquer
@@ -151,9 +150,8 @@ class Model(nn.Module):
                 else:
                     masks.append(scope)                                  # le dernier ramasse le reliquat (fond)
                 rgbs.append(rgb)
-            a = torch.stack(masks, 1)                                    # (B,K,1,H,H), somme = 1
-            recon = (torch.stack(rgbs, 1) * a).sum(1)
-            return recon, a[:, :, 0], None
+            a = torch.stack(masks, 1); rgbs = torch.stack(rgbs, 1)       # (B,K,1,H,H) somme=1 ; (B,K,3,H,H)
+            return (rgbs * a).sum(1), a[:, :, 0], None, rgbs
         slots, attn = s.sa(f)                                            # slots:(B,K,D)  attn:(B,N,K)
         sl = s.down(slots)                                               # (B,K,slot_dim)
         x = sl.reshape(B * s.K, s.slot_dim, 1, 1).expand(-1, -1, s.dres, s.dres).permute(0, 2, 3, 1)
@@ -161,7 +159,14 @@ class Model(nn.Module):
         out = s.dec(x).reshape(B, s.K, 4, img.size(2), img.size(3))
         rgb, a = out[:, :, :3], out[:, :, 3:4]; a = torch.softmax(a, dim=1)   # masques de décodage (compétition)
         recon = (rgb * a).sum(1)                                         # (B,3,H,H)
-        return recon, a[:, :, 0], attn                                  # a masks (B,K,H,H)
+        return recon, a[:, :, 0], attn, rgb                             # a masks (B,K,H,H)
+
+def mixture_nll(img, rgbs, masks, sig=0.1):
+    """-log p(x) sous le modèle de MÉLANGE par pixel (MONet/IODINE) : p(x) = Σ_k m_k N(x|rgb_k, σ²).
+    Interdit le mélange de couleurs : l'optimum = UN slot explique le pixel avec un poids -> 1."""
+    d2 = ((img.unsqueeze(1) - rgbs) ** 2).sum(2)                         # (B,K,H,H)
+    logp = (masks + 1e-8).log() - d2 / (2 * sig * sig)
+    return -torch.logsumexp(logp, 1).mean()
 
 def match_error(masks, P, H):
     """centre de masse de chaque masque -> apparié aux vrais objets (Hungarian) -> erreur position."""
@@ -194,6 +199,8 @@ def get_args():
     p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--mode", choices=["par", "seq", "peel"], default="par")  # peel = run-4 récursif (objet par objet)
+    p.add_argument("--loss", choices=["mse", "mix"], default="mse")       # mix = vraisemblance de mélange par pixel
+    p.add_argument("--sig", type=float, default=0.1)                      # écart-type du mélange (loss mix)
     return p.parse_args()
 
 def main():
@@ -211,22 +218,24 @@ def main():
                                               0.5 * (1 + math.cos(math.pi * max(0, st - warm) / max(1, a.steps - warm))))
     for st in range(a.steps):
         bi = np.random.randint(0, a.n, a.bs); img = Xt[bi].to(dev)
-        recon, _, _ = m(img); loss = F.mse_loss(recon, img)
+        recon, masks_tr, _, rgbs = m(img)
+        mse = F.mse_loss(recon, img)
+        loss = mixture_nll(img, rgbs, masks_tr, a.sig) if a.loss == "mix" else mse
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step(); sched.step()
         if st % 500 == 0:
             with torch.no_grad():
                 te = torch.tensor(gen(200, a.H, a.n_obj, a.r, seed=7)[0].transpose(0, 3, 1, 2)).to(dev)
-                recon_te, masks, _ = m(te); err = match_error(masks, gen(200, a.H, a.n_obj, a.r, seed=7)[1], a.H)
+                recon_te, masks, _, _ = m(te); err = match_error(masks, gen(200, a.H, a.n_obj, a.r, seed=7)[1], a.H)
                 # séparation = moyenne du max sur K par pixel : 1/K = slots clones, ->1 = décomposition dure
                 sep = masks.max(1).values.mean().item()
-            print(f"  step {st:5d}  recon {loss.item():.4f}  erreur position (slots->objets) {err:.3f}"
+            print(f"  step {st:5d}  recon {mse.item():.4f}  erreur position (slots->objets) {err:.3f}"
                   f"  séparation {sep:.2f} (1/K={1/a.K:.2f}=clones, 1=dur)", flush=True)
     # figure : image + masques par slot
     try:
         import matplotlib, os; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         with torch.no_grad():
             v = torch.tensor(gen(4, a.H, a.n_obj, a.r, seed=3)[0].transpose(0, 3, 1, 2)).to(dev)
-            recon, masks, _ = m(v)
+            recon, masks, _, _ = m(v)
         fig, ax = plt.subplots(4, a.K + 2, figsize=(2 * (a.K + 2), 8))
         for i in range(4):
             ax[i, 0].imshow(v[i].permute(1, 2, 0).cpu().clip(0, 1)); ax[i, 0].set_title("image" if i == 0 else "")
