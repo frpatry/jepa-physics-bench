@@ -52,9 +52,11 @@ class SlotAttention(nn.Module):
         s.q = nn.Linear(dim, dim, bias=False); s.k = nn.Linear(dim, dim, bias=False); s.v = nn.Linear(dim, dim, bias=False)
         s.gru = nn.GRUCell(dim, dim); s.mlp = nn.Sequential(nn.Linear(dim, dim * 2), nn.ReLU(), nn.Linear(dim * 2, dim))
         s.ni = nn.LayerNorm(dim); s.ns = nn.LayerNorm(dim); s.nm = nn.LayerNorm(dim)
-    def forward(s, inp, scope=None):                                      # inp:(B,N,dim)  scope:(B,N,1) optionnel
+    def forward(s, inp, scope=None, slots0=None):                         # inp:(B,N,dim)  scope:(B,N,1) optionnel
         B, N, _ = inp.shape
-        if s.init == "learned":
+        if slots0 is not None:
+            slots = slots0                                                # init fournie (peel : une par round)
+        elif s.init == "learned":
             slots = s.init_slots.expand(B, -1, -1)
         else:
             slots = s.mu + s.logsig.exp() * torch.randn(B, s.K, s.dim, device=inp.device)
@@ -103,6 +105,9 @@ class Model(nn.Module):
         # scope, il recommence sur le reste. K-1 rounds + reliquat final = fond. Poids partagés.
         s.sa = (SeqAttention(K, D, iters) if mode == "seq" else
                 SlotAttention(2, D, iters, init) if mode == "peel" else SlotAttention(K, D, iters, init))
+        if mode == "peel":                                                # une init (objet,reste) DISTINCTE par round
+            s.peel_init = nn.Parameter(torch.randn(1, K - 1, 2, D) * 0.5) # sinon les ROUNDS sont des clones (run 10 :
+                                                                          # tous les rounds dissèquent le même objet)
         s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
         if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
             s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
@@ -126,7 +131,7 @@ class Model(nn.Module):
             rgbs, masks = [], []
             for j in range(s.K - 1):
                 sc = F.adaptive_avg_pool2d(scope, s.res).reshape(B, s.res * s.res, 1)
-                slots2, _ = s.sa(f, scope=sc)                            # compétition objet/reste sous scope
+                slots2, _ = s.sa(f, scope=sc, slots0=s.peel_init[:, j].expand(B, -1, -1))  # init du round j
                 sl = s.down(slots2).reshape(B * 2, s.slot_dim)
                 rgb, alog = s.decode_one(sl, H)                          # (B*2,3,H,H), (B*2,1,H,H)
                 rgb = rgb.reshape(B, 2, 3, H, H); alog = alog.reshape(B, 2, 1, H, H)
