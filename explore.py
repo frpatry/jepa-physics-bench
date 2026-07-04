@@ -45,10 +45,12 @@ def poke(pos, masses, i, d, force, r):
     return p
 
 class Enc(nn.Module):
+    """CNN qui GARDE une grille spatiale 8x8 (pas de pooling global) -> la POSITION reste lisible."""
     def __init__(s, d):
         super().__init__()
         s.net = nn.Sequential(nn.Conv2d(3, 16, 3, 2, 1), nn.GELU(), nn.Conv2d(16, 32, 3, 2, 1), nn.GELU(),
-                              nn.Conv2d(32, 64, 3, 2, 1), nn.GELU(), nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(64, d))
+                              nn.Conv2d(32, 64, 3, 2, 1), nn.GELU(),
+                              nn.AdaptiveAvgPool2d(8), nn.Flatten(), nn.Linear(64 * 8 * 8, d))  # grille 8x8 conservée
     def forward(s, x): return s.net(x)
 
 class Dyn(nn.Module):
@@ -120,7 +122,7 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--N", type=int, default=400); p.add_argument("--n_obj", type=int, default=4)
     p.add_argument("--H", type=int, default=32); p.add_argument("--r", type=float, default=0.10)
-    p.add_argument("--d", type=int, default=64); p.add_argument("--K", type=int, default=4)
+    p.add_argument("--d", type=int, default=128); p.add_argument("--K", type=int, default=4)
     p.add_argument("--force", type=float, default=0.15); p.add_argument("--bs", type=int, default=32)
     p.add_argument("--train_steps", type=int, default=20); p.add_argument("--warmup", type=int, default=40)
     p.add_argument("--eval_every", type=int, default=25)
