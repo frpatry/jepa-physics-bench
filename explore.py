@@ -79,12 +79,13 @@ def evaluate(enc, ens, a, dev, masses):
     zb = enc(Bimg); za = enc(Aimg)
     pred = torch.stack([m(zb, acts) for m in ens]).mean(0)       # latent futur prédit
     pos_after = torch.tensor(np.stack(Ap).reshape(len(Ap), -1)).to(dev)  # vraies positions futures
-    # sonde latent->positions (entraînée sur latents propres, appliquée au latent prédit)
+    # sonde entraînée DIRECTEMENT sur les latents PRÉDITS (pas de décalage train/inférence) :
+    # mesure honnêtement "le résultat est-il DANS la prédiction ?"
     ntr = 200; probe = nn.Sequential(nn.Linear(a.d, 128), nn.GELU(), nn.Linear(128, a.n_obj * 2)).to(dev)
     op = torch.optim.Adam(probe.parameters(), 1e-2)
     with torch.enable_grad():
         for _ in range(300):
-            op.zero_grad(); F.mse_loss(probe(za[:ntr]), pos_after[:ntr]).backward(); op.step()
+            op.zero_grad(); F.mse_loss(probe(pred[:ntr]), pos_after[:ntr]).backward(); op.step()
     pp = probe(pred[ntr:]); gt = pos_after[ntr:]
     ssr = (pp - gt).pow(2).sum(0); sst = (gt - gt.mean(0)).pow(2).sum(0) + 1e-9
     return float((1 - ssr / sst).mean())
