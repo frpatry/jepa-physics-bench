@@ -14,14 +14,21 @@ Repo GitHub : **frpatry/jepa-physics-bench** (public). Tout tourne sur **Colab G
 ---
 
 ## OÙ ON EN EST (immédiat)
-**Direction actuelle : perception object-centric ÉMERGENTE via Slot Attention (`slots.py`)** — la fondation principielle, choisie après avoir diagnostiqué 3 murs (voir plus bas).
+**✅ FONDATION OBJECT-CENTRIC ACQUISE (run GPU 12).** `slots.py` découvre les objets sans supervision :
+**erreur position 0.048** (≈2 px/48), séparation 0.95, **sur scènes VARIABLES** (1-4 objets, couleurs au hasard).
+Un slot par disque quel que soit leur nombre, prises excédentaires vides (le comptage émerge), fond au reliquat.
 
-**Statut immédiat** : en attente d'un run Colab GPU de `slots.py` (corrigé : grille fine **24×24** + objets plus gros **r=0.15**).
-- 1er run GPU : **erreur position plate à 0.31** = slots NON séparés (piège de la « reconstruction paresseuse » sur fond noir).
-- Fix poussé (grille fine + objets plus gros → la recon EXIGE d'utiliser plusieurs slots).
-- **À surveiller** : l'erreur de position doit **descendre** ; la **figure `slots.png`** (cellule 3) doit montrer **chaque slot capturant UN disque**.
-- Notebook : `slots_colab.ipynb`. Commande : `python slots.py --n 5000 --n_obj 3 --H 48 --K 4 --steps 15000 --bs 64`.
-- Si ça sépare → poser la **dynamique sur les slots**. Si encore plat → itérer (plus de pas / LR / nb de slots, ou approche alternative). Slot Attention est **capricieux**.
+**Recette gagnante** (12 runs, chaque échec a fermé une échappatoire économique) :
+`--mode peel` (épluchage récursif, IDÉE DE L'UTILISATEUR : le cerneur prend un objet, scope×(1−masque), suivant)
++ inits apprises distinctes par round (sinon rounds clones) + `--loss mix` (vraisemblance de mélange par pixel,
+interdit le partage doux) + reliquat = couleur unie apprise (ferme la porte dérobée) + décodeur SBD 1×1 faible
++ goulot slot_dim 16 (plancher : 8 dégénère) + `--vary 1` (scènes variables — LE déclencheur final : sans ça,
+des masques-gabarits indépendants de l'image paient autant que percevoir).
+
+Commande du run gagnant : `python -u slots.py --n 5000 --n_obj 4 --H 48 --K 5 --steps 20000 --bs 64 --mode peel --loss mix --vary 1`
+
+**Limite résiduelle** : deux disques qui se touchent fusionnent parfois dans une prise — le statique est
+fondamentalement ambigu là-dessus ; c'est le mouvement qui désambiguïse (common fate) → prochaine étape.
 
 ---
 
@@ -48,7 +55,7 @@ Repo GitHub : **frpatry/jepa-physics-bench** (public). Tout tourne sur **Colab G
 - **`driving_transfer.py`** — transfert UCF→dashcam Nexar (meilleur **~0.78 à H=32** ; H=96 dilue via mean-pool ; sonde attentive a échoué/surappris).
 - **`driving_rollout.py`** — prédiction collision par rollout (au hasard = mur prédiction honnête).
 - **`explore.py` / `explore_state.py`** — actif (curiosité) vs passif. **Résultat : curiosité naïve ≤ hasard.**
-- **`slots.py`** — **ACTUEL** : Slot Attention, découverte d'objets non supervisée (métrique = erreur position slots→objets via Hungarian ; + warmup LR).
+- **`slots.py`** — **ACTUEL, VALIDÉ** : découverte d'objets non supervisée, err 0.048 sur scènes variables. Modes : `par` (Slot Attention classique), `seq` (explaining away), **`peel` (gagnant)** ; `--loss mix`, `--bg const`, `--vary 1`, inits par round. Métrique : erreur position Hungarian + séparation des masques.
 - **Notebooks dédiés** (chacun : cellule 1 = git pull) : `drive_colab.ipynb`, `objects_colab.ipynb`, `explore_colab.ipynb`, `slots_colab.ipynb`.
 
 ---
@@ -69,8 +76,10 @@ Repo GitHub : **frpatry/jepa-physics-bench** (public). Tout tourne sur **Colab G
 ---
 
 ## PROCHAINES ACTIONS
-1. **Faire séparer les slots** (`slots.py`) — grille fine + objets plus gros poussés ; peut nécessiter d'itérer (pas/LR/slots).
-2. Une fois les slots émergés : **poser la dynamique sur les slots** (prédire l'évolution de chaque objet) → tester la **prédiction honnête du futur** sur un état object-centré (là où le latent global échouait).
-3. Puis re-tester **l'edge** (apprentissage actif, ou world model sur slots) sur une **fondation saine**.
+1. **Dynamique sur les slots** : séquences du monde qui bouge (disques avec vitesses/rebonds, cf. objects.py),
+   encoder frame t → slots → prédire slot_t+1 (petit MLP partagé) → décoder t+1 avec la même recette.
+   Double gain attendu : (a) prédiction honnête du futur sur état object-centré (là où le latent global
+   s'effondrait) ; (b) le common fate devrait séparer les objets qui se touchent (limite résiduelle du statique).
+2. Puis re-tester **l'edge** (apprentissage actif, world model sur slots, planner) sur cette fondation saine.
 
 Objectif affiché de l'utilisateur : produire de la **connaissance réutilisable** (ligne LeCun), pas sur-scaler Meta.
