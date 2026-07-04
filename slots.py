@@ -69,13 +69,34 @@ class SlotAttention(nn.Module):
             slots = slots + s.mlp(s.nm(slots))
         return slots, attn                                               # attn:(B,N,K) masques
 
+class SeqAttention(nn.Module):
+    """Décomposition SÉQUENTIELLE (explaining away, esprit MONet) : le slot j lit l'image
+    via attention restreinte au SCOPE (ce qui reste à expliquer), peint sa part, le scope
+    est réduit multiplicativement scope*(1-masque), le slot suivant ne voit que le reste.
+    Le dernier slot ramasse le reliquat (fond). Brise la symétrie PAR CONSTRUCTION :
+    aucune égalité possible entre slots. Émergent : rien ne dit où/quoi sont les objets."""
+    def __init__(s, K, dim, iters=3):
+        super().__init__(); s.K, s.dim, s.iters = K, dim, iters
+        s.q0 = nn.Parameter(torch.randn(1, K, dim) * 0.5)                 # une requête apprise par étape
+        s.q = nn.Linear(dim, dim, bias=False); s.k = nn.Linear(dim, dim, bias=False); s.v = nn.Linear(dim, dim, bias=False)
+        s.ni = nn.LayerNorm(dim); s.ns = nn.LayerNorm(dim)
+        s.mlp = nn.Sequential(nn.Linear(dim, dim), nn.ReLU(), nn.Linear(dim, dim))
+    def read(s, kf, vf, j, logscope, B):                                  # lecture attentionnelle sous scope
+        q = s.q0[:, j].expand(B, -1)                                      # (B,dim)
+        for _ in range(s.iters):
+            logit = (kf @ s.q(s.ns(q)).unsqueeze(-1)).squeeze(-1) * s.dim ** -0.5
+            att = torch.softmax(logit + logscope, dim=1)                  # (B,N) : ne regarde que le reste
+            u = (att.unsqueeze(1) @ vf).squeeze(1)                        # (B,dim)
+            q = u + s.mlp(q)
+        return q
+
 class Model(nn.Module):
-    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3, init="learned"):
-        super().__init__(); s.res = res; s.K = K; s.D = D; s.slot_dim = slot_dim
+    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3, init="learned", mode="par"):
+        super().__init__(); s.res = res; s.K = K; s.D = D; s.slot_dim = slot_dim; s.mode = mode
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
                               nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
         s.pe = PosEmbed(D, res); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
-        s.sa = SlotAttention(K, D, iters, init)
+        s.sa = SeqAttention(K, D, iters) if mode == "seq" else SlotAttention(K, D, iters, init)
         s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
         if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
             s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
@@ -85,9 +106,32 @@ class Model(nn.Module):
             s.dres = res; s.pe_d = PosEmbed(slot_dim, res)
             s.dec = nn.Sequential(nn.ConvTranspose2d(slot_dim, D, 5, 2, 2, 1), nn.ReLU(),
                                   nn.Conv2d(D, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, 4, 3, 1, 1))  # res -> H
+    def decode_one(s, sl, H):                                            # sl:(B,slot_dim) -> rgb, logit alpha
+        B = sl.size(0)
+        x = sl.reshape(B, s.slot_dim, 1, 1).expand(-1, -1, s.dres, s.dres).permute(0, 2, 3, 1)
+        x = s.pe_d(x).permute(0, 3, 1, 2)
+        out = s.dec(x)                                                   # (B,4,H,H)
+        return out[:, :3], out[:, 3:4]
     def forward(s, img):                                                 # img:(B,3,H,H)
-        B = img.size(0); f = s.enc(img)                                  # (B,D,res,res)
+        B, H = img.size(0), img.size(2); f = s.enc(img)                  # (B,D,res,res)
         f = f.permute(0, 2, 3, 1); f = s.pe(f).reshape(B, s.res * s.res, s.D); f = s.mlp(f)
+        if s.mode == "seq":                                              # explaining away séquentiel
+            fn = s.sa.ni(f); kf = s.sa.k(fn); vf = s.sa.v(fn)
+            scope = torch.ones(B, 1, H, H, device=img.device)            # ce qui RESTE à expliquer
+            rgbs, masks = [], []
+            for j in range(s.K):
+                sc = F.adaptive_avg_pool2d(scope, s.res).reshape(B, s.res * s.res)
+                slot = s.sa.read(kf, vf, j, (sc + 1e-8).log(), B)        # attention restreinte au scope
+                rgb, alog = s.decode_one(s.down(slot), H)
+                if j < s.K - 1:
+                    m = torch.sigmoid(alog)                              # part réclamée par ce slot
+                    masks.append(scope * m); scope = scope * (1 - m)     # retrait multiplicatif
+                else:
+                    masks.append(scope)                                  # le dernier ramasse le reliquat (fond)
+                rgbs.append(rgb)
+            a = torch.stack(masks, 1)                                    # (B,K,1,H,H), somme = 1
+            recon = (torch.stack(rgbs, 1) * a).sum(1)
+            return recon, a[:, :, 0], None
         slots, attn = s.sa(f)                                            # slots:(B,K,D)  attn:(B,N,K)
         sl = s.down(slots)                                               # (B,K,slot_dim)
         x = sl.reshape(B * s.K, s.slot_dim, 1, 1).expand(-1, -1, s.dres, s.dres).permute(0, 2, 3, 1)
@@ -127,6 +171,7 @@ def get_args():
     p.add_argument("--dec_w", type=int, default=32); p.add_argument("--iters", type=int, default=3)
     p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--mode", choices=["par", "seq"], default="par")       # seq = explaining away (MONet-esprit)
     return p.parse_args()
 
 def main():
@@ -134,9 +179,10 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     X, P = gen(a.n, a.H, a.n_obj, a.r)
     Xt = torch.tensor(X.transpose(0, 3, 1, 2))
-    print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  init={a.init}  seed={a.seed}"
-          f"  (découverte SANS étiquettes)", flush=True)
-    m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters, init=a.init).to(dev)
+    print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  mode={a.mode}  init={a.init}"
+          f"  seed={a.seed}  (découverte SANS étiquettes)", flush=True)
+    m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters, init=a.init,
+              mode=a.mode).to(dev)
     opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)                                          # warmup LR : crucial pour que les slots se différencient
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
