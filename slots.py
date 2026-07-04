@@ -22,16 +22,21 @@ import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 
 COLS = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 0], [1, 0, 1], [0, 1, 1]], np.float32)
 
-def gen(n, H, n_obj, r, seed=0):
+def gen(n, H, n_obj, r, seed=0, vary=0):
+    """vary=1 : nombre d'objets ALÉATOIRE (1..n_obj) + couleurs tirées au hasard dans la palette.
+    Casse la régularité du monde (sinon des masques-gabarits indépendants de l'image paient)."""
     rng = np.random.default_rng(seed); yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
     X = np.zeros((n, H, H, 3), np.float32); P = np.zeros((n, n_obj, 2), np.float32)
+    C = np.full(n, n_obj, np.int64)
     for i in range(n):
-        for k in range(n_obj):
+        if vary: C[i] = rng.integers(1, n_obj + 1)
+        cols = rng.permutation(len(COLS))[:C[i]] if vary else np.arange(C[i])
+        for k in range(C[i]):
             for _ in range(50):
                 c = rng.uniform(r, 1 - r, 2).astype(np.float32)
                 if k == 0 or np.all(np.linalg.norm(P[i, :k] - c, axis=1) > 2.2 * r): P[i, k] = c; break
-            X[i][(xx - P[i, k, 0]) ** 2 + (yy - P[i, k, 1]) ** 2 < r * r] = COLS[k]
-    return X, P
+            X[i][(xx - P[i, k, 0]) ** 2 + (yy - P[i, k, 1]) ** 2 < r * r] = COLS[cols[k]]
+    return X, P, C
 
 def build_grid(res):
     r = np.linspace(0., 1., res, dtype=np.float32); x, y = np.meshgrid(r, r)
@@ -179,7 +184,7 @@ def mixture_nll(img, rgbs, masks, sig=0.1):
     logp = (masks + 1e-8).log() - d2 / (2 * sig * sig)
     return -torch.logsumexp(logp, 1).mean()
 
-def match_error(masks, P, H):
+def match_error(masks, P, H, C=None):
     """centre de masse de chaque masque -> apparié aux vrais objets (Hungarian) -> erreur position."""
     try: from scipy.optimize import linear_sum_assignment
     except Exception: linear_sum_assignment = None
@@ -189,7 +194,7 @@ def match_error(masks, P, H):
         m = masks[i]; w = m / (m.sum((-1, -2), keepdim=True) + 1e-8)
         cx = (w * gx).sum((-1, -2)); cy = (w * gy).sum((-1, -2))         # (K,)
         cen = torch.stack([cx, cy], -1).detach().cpu().numpy()           # (K,2)
-        gt = P[i]                                                        # (n_obj,2)
+        gt = P[i] if C is None else P[i][:C[i]]                          # (n_obj_i,2)
         cost = np.linalg.norm(cen[:, None] - gt[None], axis=-1)         # (K,n_obj)
         if linear_sum_assignment is not None:
             ri, ci = linear_sum_assignment(cost); errs.append(cost[ri, ci].mean())
@@ -209,6 +214,7 @@ def get_args():
     p.add_argument("--dec_w", type=int, default=32); p.add_argument("--iters", type=int, default=3)
     p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--vary", type=int, default=0)                         # 1 = nb objets 1..n_obj + couleurs au hasard
     p.add_argument("--mode", choices=["par", "seq", "peel"], default="par")  # peel = run-4 récursif (objet par objet)
     p.add_argument("--bg", choices=["const", "slot"], default="const")    # peel : reliquat = couleur unie (ferme la
                                                                           # porte dérobée) ou ancien slot riche
@@ -219,9 +225,10 @@ def get_args():
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed); np.random.seed(a.seed)
-    X, P = gen(a.n, a.H, a.n_obj, a.r)
+    X, P, _ = gen(a.n, a.H, a.n_obj, a.r, vary=a.vary)
     Xt = torch.tensor(X.transpose(0, 3, 1, 2))
-    print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  mode={a.mode}  init={a.init}"
+    nobj = f"1..{a.n_obj} objets (variable) + couleurs au hasard" if a.vary else f"{a.n_obj} objets"
+    print(f"device={dev}  {a.n} images  {nobj}  K={a.K} slots  mode={a.mode}  init={a.init}"
           f"  seed={a.seed}  (découverte SANS étiquettes)", flush=True)
     m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters, init=a.init,
               mode=a.mode, bg=a.bg).to(dev)
@@ -237,8 +244,9 @@ def main():
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step(); sched.step()
         if st % 500 == 0:
             with torch.no_grad():
-                te = torch.tensor(gen(200, a.H, a.n_obj, a.r, seed=7)[0].transpose(0, 3, 1, 2)).to(dev)
-                recon_te, masks, _, _ = m(te); err = match_error(masks, gen(200, a.H, a.n_obj, a.r, seed=7)[1], a.H)
+                Xe, Pe, Ce = gen(200, a.H, a.n_obj, a.r, seed=7, vary=a.vary)
+                te = torch.tensor(Xe.transpose(0, 3, 1, 2)).to(dev)
+                recon_te, masks, _, _ = m(te); err = match_error(masks, Pe, a.H, Ce)
                 # séparation = moyenne du max sur K par pixel : 1/K = slots clones, ->1 = décomposition dure
                 sep = masks.max(1).values.mean().item()
             print(f"  step {st:5d}  recon {mse.item():.4f}  erreur position (slots->objets) {err:.3f}"
@@ -247,7 +255,7 @@ def main():
     try:
         import matplotlib, os; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         with torch.no_grad():
-            v = torch.tensor(gen(4, a.H, a.n_obj, a.r, seed=3)[0].transpose(0, 3, 1, 2)).to(dev)
+            v = torch.tensor(gen(4, a.H, a.n_obj, a.r, seed=3, vary=a.vary)[0].transpose(0, 3, 1, 2)).to(dev)
             recon, masks, _, _ = m(v)
         fig, ax = plt.subplots(4, a.K + 2, figsize=(2 * (a.K + 2), 8))
         for i in range(4):
