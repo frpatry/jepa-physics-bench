@@ -52,7 +52,7 @@ class SlotAttention(nn.Module):
         s.q = nn.Linear(dim, dim, bias=False); s.k = nn.Linear(dim, dim, bias=False); s.v = nn.Linear(dim, dim, bias=False)
         s.gru = nn.GRUCell(dim, dim); s.mlp = nn.Sequential(nn.Linear(dim, dim * 2), nn.ReLU(), nn.Linear(dim * 2, dim))
         s.ni = nn.LayerNorm(dim); s.ns = nn.LayerNorm(dim); s.nm = nn.LayerNorm(dim)
-    def forward(s, inp):                                                  # inp:(B,N,dim)
+    def forward(s, inp, scope=None):                                      # inp:(B,N,dim)  scope:(B,N,1) optionnel
         B, N, _ = inp.shape
         if s.init == "learned":
             slots = s.init_slots.expand(B, -1, -1)
@@ -63,7 +63,9 @@ class SlotAttention(nn.Module):
         for _ in range(s.iters):
             prev = slots; q = s.q(s.ns(slots))
             att = torch.softmax((k @ q.transpose(-1, -2)) * s.dim ** -0.5, dim=-1)  # (B,N,K) : les slots SE DISPUTENT
-            attn = att + 1e-8; w = attn / attn.sum(1, keepdim=True)                 # moyenne pondérée sur N
+            attn = att + 1e-8
+            if scope is not None: attn = attn * scope                               # ne lit que ce qui reste à expliquer
+            w = attn / attn.sum(1, keepdim=True)                                    # moyenne pondérée sur N
             upd = w.transpose(-1, -2) @ v                                           # (B,K,dim)
             slots = s.gru(upd.reshape(-1, s.dim), prev.reshape(-1, s.dim)).reshape(B, s.K, s.dim)
             slots = slots + s.mlp(s.nm(slots))
@@ -96,7 +98,11 @@ class Model(nn.Module):
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
                               nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
         s.pe = PosEmbed(D, res); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
-        s.sa = SeqAttention(K, D, iters) if mode == "seq" else SlotAttention(K, D, iters, init)
+        # peel = le mécanisme gagnant du run 4 (compétition SlotAttention) réduit à 2 slots aux rôles
+        # appris ("objet" vs "reste"), appliqué RÉCURSIVEMENT : il cerne un objet, on le retire du
+        # scope, il recommence sur le reste. K-1 rounds + reliquat final = fond. Poids partagés.
+        s.sa = (SeqAttention(K, D, iters) if mode == "seq" else
+                SlotAttention(2, D, iters, init) if mode == "peel" else SlotAttention(K, D, iters, init))
         s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
         if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
             s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
@@ -115,6 +121,22 @@ class Model(nn.Module):
     def forward(s, img):                                                 # img:(B,3,H,H)
         B, H = img.size(0), img.size(2); f = s.enc(img)                  # (B,D,res,res)
         f = f.permute(0, 2, 3, 1); f = s.pe(f).reshape(B, s.res * s.res, s.D); f = s.mlp(f)
+        if s.mode == "peel":                                             # épluchage : run-4 récursif
+            scope = torch.ones(B, 1, H, H, device=img.device)            # ce qui RESTE à expliquer
+            rgbs, masks = [], []
+            for j in range(s.K - 1):
+                sc = F.adaptive_avg_pool2d(scope, s.res).reshape(B, s.res * s.res, 1)
+                slots2, _ = s.sa(f, scope=sc)                            # compétition objet/reste sous scope
+                sl = s.down(slots2).reshape(B * 2, s.slot_dim)
+                rgb, alog = s.decode_one(sl, H)                          # (B*2,3,H,H), (B*2,1,H,H)
+                rgb = rgb.reshape(B, 2, 3, H, H); alog = alog.reshape(B, 2, 1, H, H)
+                a = torch.softmax(alog, dim=1)                           # partition objet/reste DANS le scope
+                masks.append(scope * a[:, 0]); rgbs.append(rgb[:, 0])    # l'objet cerné est engrangé
+                scope = scope * a[:, 1]                                  # on passe au suivant
+            masks.append(scope); rgbs.append(rgb[:, 1])                  # reliquat = fond (rgb du dernier "reste")
+            a = torch.stack(masks, 1)                                    # (B,K,1,H,H), somme = 1
+            recon = (torch.stack(rgbs, 1) * a).sum(1)
+            return recon, a[:, :, 0], None
         if s.mode == "seq":                                              # explaining away séquentiel
             fn = s.sa.ni(f); kf = s.sa.k(fn); vf = s.sa.v(fn)
             scope = torch.ones(B, 1, H, H, device=img.device)            # ce qui RESTE à expliquer
@@ -171,7 +193,7 @@ def get_args():
     p.add_argument("--dec_w", type=int, default=32); p.add_argument("--iters", type=int, default=3)
     p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--mode", choices=["par", "seq"], default="par")       # seq = explaining away (MONet-esprit)
+    p.add_argument("--mode", choices=["par", "seq", "peel"], default="par")  # peel = run-4 récursif (objet par objet)
     return p.parse_args()
 
 def main():
