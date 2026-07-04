@@ -11,7 +11,11 @@ c'est le "où est ce patch" générique, pas des coordonnées d'objet injectées
 Mesure : les masques localisent-ils les objets ? (centre de masse par slot -> apparié aux vrais
 objets par Hungarian -> erreur de position). C'est la qualité de découverte, émergente.
 
-  python slots.py --n 4000 --n_obj 3 --H 48 --steps 8000
+Anti-collapse (leçon du run GPU) : un décodeur conv puissant + slots 64d = reconstruction
+paresseuse (un slot peint tout, erreur position plate). Fix : goulot slot_dim=16 + Spatial
+Broadcast Decoder en convs 1x1 (faible) -> peindre 1 objet/slot devient la solution optimale.
+
+  python slots.py --n 5000 --n_obj 3 --H 48 --K 4 --steps 15000 --bs 64
 """
 import argparse, math
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
@@ -60,20 +64,27 @@ class SlotAttention(nn.Module):
         return slots, attn                                               # attn:(B,N,K) masques
 
 class Model(nn.Module):
-    def __init__(s, H, K, D=64, res=24):
-        super().__init__(); s.res = res; s.K = K; s.D = D
+    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3):
+        super().__init__(); s.res = res; s.K = K; s.D = D; s.slot_dim = slot_dim
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
                               nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
         s.pe = PosEmbed(D, res); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
-        s.sa = SlotAttention(K, D)
-        s.dres = res; s.pe_d = PosEmbed(D, res)
-        s.dec = nn.Sequential(nn.ConvTranspose2d(D, D, 5, 2, 2, 1), nn.ReLU(),
-                              nn.Conv2d(D, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, 4, 3, 1, 1))  # res -> H (24 -> 48)
+        s.sa = SlotAttention(K, D, iters)
+        s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
+        if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
+            s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
+            s.dec = nn.Sequential(nn.Conv2d(slot_dim, dec_w, 1), nn.ReLU(),
+                                  nn.Conv2d(dec_w, dec_w, 1), nn.ReLU(), nn.Conv2d(dec_w, 4, 1))
+        else:                             # ancien décodeur conv (trop puissant -> collapse paresseux observé)
+            s.dres = res; s.pe_d = PosEmbed(slot_dim, res)
+            s.dec = nn.Sequential(nn.ConvTranspose2d(slot_dim, D, 5, 2, 2, 1), nn.ReLU(),
+                                  nn.Conv2d(D, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, 4, 3, 1, 1))  # res -> H
     def forward(s, img):                                                 # img:(B,3,H,H)
         B = img.size(0); f = s.enc(img)                                  # (B,D,res,res)
         f = f.permute(0, 2, 3, 1); f = s.pe(f).reshape(B, s.res * s.res, s.D); f = s.mlp(f)
         slots, attn = s.sa(f)                                            # slots:(B,K,D)  attn:(B,N,K)
-        x = slots.reshape(B * s.K, s.D, 1, 1).expand(-1, -1, s.dres, s.dres).permute(0, 2, 3, 1)
+        sl = s.down(slots)                                               # (B,K,slot_dim)
+        x = sl.reshape(B * s.K, s.slot_dim, 1, 1).expand(-1, -1, s.dres, s.dres).permute(0, 2, 3, 1)
         x = s.pe_d(x).permute(0, 3, 1, 2)
         out = s.dec(x).reshape(B, s.K, 4, img.size(2), img.size(3))
         rgb, a = out[:, :, :3], out[:, :, 3:4]; a = torch.softmax(a, dim=1)   # masques de décodage (compétition)
@@ -105,6 +116,9 @@ def get_args():
     p.add_argument("--K", type=int, default=4); p.add_argument("--D", type=int, default=64)
     p.add_argument("--steps", type=int, default=8000); p.add_argument("--bs", type=int, default=64)
     p.add_argument("--lr", type=float, default=4e-4)
+    p.add_argument("--slot_dim", type=int, default=16)                    # goulot par slot avant décodage
+    p.add_argument("--dec", choices=["sbd", "conv"], default="sbd")       # sbd = décodeur faible (anti-collapse)
+    p.add_argument("--dec_w", type=int, default=32); p.add_argument("--iters", type=int, default=3)
     return p.parse_args()
 
 def main():
@@ -112,7 +126,8 @@ def main():
     X, P = gen(a.n, a.H, a.n_obj, a.r)
     Xt = torch.tensor(X.transpose(0, 3, 1, 2))
     print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  (découverte SANS étiquettes)", flush=True)
-    m = Model(a.H, a.K, a.D).to(dev); opt = torch.optim.Adam(m.parameters(), a.lr)
+    m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters).to(dev)
+    opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)                                          # warmup LR : crucial pour que les slots se différencient
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
                                               0.5 * (1 + math.cos(math.pi * max(0, st - warm) / max(1, a.steps - warm))))
