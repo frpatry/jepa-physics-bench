@@ -60,15 +60,15 @@ class SlotAttention(nn.Module):
         return slots, attn                                               # attn:(B,N,K) masques
 
 class Model(nn.Module):
-    def __init__(s, H, K, D=64, res=12):
+    def __init__(s, H, K, D=64, res=24):
         super().__init__(); s.res = res; s.K = K; s.D = D
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
-                              nn.Conv2d(D, D, 5, 2, 2), nn.ReLU())        # H -> res (H=48 -> 12)
+                              nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
         s.pe = PosEmbed(D, res); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
         s.sa = SlotAttention(K, D)
         s.dres = res; s.pe_d = PosEmbed(D, res)
         s.dec = nn.Sequential(nn.ConvTranspose2d(D, D, 5, 2, 2, 1), nn.ReLU(),
-                              nn.ConvTranspose2d(D, D, 5, 2, 2, 1), nn.ReLU(), nn.Conv2d(D, 4, 3, 1, 1))  # res -> H
+                              nn.Conv2d(D, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, 4, 3, 1, 1))  # res -> H (24 -> 48)
     def forward(s, img):                                                 # img:(B,3,H,H)
         B = img.size(0); f = s.enc(img)                                  # (B,D,res,res)
         f = f.permute(0, 2, 3, 1); f = s.pe(f).reshape(B, s.res * s.res, s.D); f = s.mlp(f)
@@ -89,7 +89,7 @@ def match_error(masks, P, H):
     for i in range(B):
         m = masks[i]; w = m / (m.sum((-1, -2), keepdim=True) + 1e-8)
         cx = (w * gx).sum((-1, -2)); cy = (w * gy).sum((-1, -2))         # (K,)
-        cen = torch.stack([cx, cy], -1).cpu().numpy()                    # (K,2)
+        cen = torch.stack([cx, cy], -1).detach().cpu().numpy()           # (K,2)
         gt = P[i]                                                        # (n_obj,2)
         cost = np.linalg.norm(cen[:, None] - gt[None], axis=-1)         # (K,n_obj)
         if linear_sum_assignment is not None:
@@ -101,7 +101,7 @@ def match_error(masks, P, H):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=4000); p.add_argument("--n_obj", type=int, default=3)
-    p.add_argument("--H", type=int, default=48); p.add_argument("--r", type=float, default=0.10)
+    p.add_argument("--H", type=int, default=48); p.add_argument("--r", type=float, default=0.15)
     p.add_argument("--K", type=int, default=4); p.add_argument("--D", type=int, default=64)
     p.add_argument("--steps", type=int, default=8000); p.add_argument("--bs", type=int, default=64)
     p.add_argument("--lr", type=float, default=4e-4)
