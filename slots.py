@@ -43,15 +43,21 @@ class PosEmbed(nn.Module):
     def forward(s, x): return x + s.proj(s.grid)                          # x:(B,res,res,D)
 
 class SlotAttention(nn.Module):
-    def __init__(s, K, dim, iters=3):
-        super().__init__(); s.K, s.dim, s.iters = K, dim, iters
-        s.mu = nn.Parameter(torch.randn(1, 1, dim)); s.logsig = nn.Parameter(torch.zeros(1, 1, dim))
+    def __init__(s, K, dim, iters=3, init="learned"):
+        super().__init__(); s.K, s.dim, s.iters, s.init = K, dim, iters, init
+        if init == "learned":                                             # K inits DISTINCTES apprises : brise la
+            s.init_slots = nn.Parameter(torch.randn(1, K, dim) * 0.5)     # symétrie entre slots (sinon clones)
+        else:
+            s.mu = nn.Parameter(torch.randn(1, 1, dim)); s.logsig = nn.Parameter(torch.zeros(1, 1, dim))
         s.q = nn.Linear(dim, dim, bias=False); s.k = nn.Linear(dim, dim, bias=False); s.v = nn.Linear(dim, dim, bias=False)
         s.gru = nn.GRUCell(dim, dim); s.mlp = nn.Sequential(nn.Linear(dim, dim * 2), nn.ReLU(), nn.Linear(dim * 2, dim))
         s.ni = nn.LayerNorm(dim); s.ns = nn.LayerNorm(dim); s.nm = nn.LayerNorm(dim)
     def forward(s, inp):                                                  # inp:(B,N,dim)
         B, N, _ = inp.shape
-        slots = s.mu + s.logsig.exp() * torch.randn(B, s.K, s.dim, device=inp.device)
+        if s.init == "learned":
+            slots = s.init_slots.expand(B, -1, -1)
+        else:
+            slots = s.mu + s.logsig.exp() * torch.randn(B, s.K, s.dim, device=inp.device)
         inp = s.ni(inp); k = s.k(inp); v = s.v(inp)
         attn = None
         for _ in range(s.iters):
@@ -64,12 +70,12 @@ class SlotAttention(nn.Module):
         return slots, attn                                               # attn:(B,N,K) masques
 
 class Model(nn.Module):
-    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3):
+    def __init__(s, H, K, D=64, res=24, slot_dim=16, dec="sbd", dec_w=32, iters=3, init="learned"):
         super().__init__(); s.res = res; s.K = K; s.D = D; s.slot_dim = slot_dim
         s.enc = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(),
                               nn.Conv2d(D, D, 5, 1, 2), nn.ReLU())        # H -> res (H=48 -> 24, grille fine)
         s.pe = PosEmbed(D, res); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
-        s.sa = SlotAttention(K, D, iters)
+        s.sa = SlotAttention(K, D, iters, init)
         s.down = nn.Linear(D, slot_dim)   # goulot : 16 dims ne suffisent pas pour encoder TOUTE la scène dans un slot
         if dec == "sbd":                  # Spatial Broadcast Decoder : convs 1x1 = pointwise, délibérément FAIBLE
             s.dres = H; s.pe_d = PosEmbed(slot_dim, H)
@@ -119,14 +125,18 @@ def get_args():
     p.add_argument("--slot_dim", type=int, default=16)                    # goulot par slot avant décodage
     p.add_argument("--dec", choices=["sbd", "conv"], default="sbd")       # sbd = décodeur faible (anti-collapse)
     p.add_argument("--dec_w", type=int, default=32); p.add_argument("--iters", type=int, default=3)
+    p.add_argument("--init", choices=["learned", "gauss"], default="learned")  # learned = brise la symétrie
+    p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(a.seed); np.random.seed(a.seed)
     X, P = gen(a.n, a.H, a.n_obj, a.r)
     Xt = torch.tensor(X.transpose(0, 3, 1, 2))
-    print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  (découverte SANS étiquettes)", flush=True)
-    m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters).to(dev)
+    print(f"device={dev}  {a.n} images  {a.n_obj} objets  K={a.K} slots  init={a.init}  seed={a.seed}"
+          f"  (découverte SANS étiquettes)", flush=True)
+    m = Model(a.H, a.K, a.D, slot_dim=a.slot_dim, dec=a.dec, dec_w=a.dec_w, iters=a.iters, init=a.init).to(dev)
     opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)                                          # warmup LR : crucial pour que les slots se différencient
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
@@ -138,8 +148,11 @@ def main():
         if st % 500 == 0:
             with torch.no_grad():
                 te = torch.tensor(gen(200, a.H, a.n_obj, a.r, seed=7)[0].transpose(0, 3, 1, 2)).to(dev)
-                _, masks, _ = m(te); err = match_error(masks, gen(200, a.H, a.n_obj, a.r, seed=7)[1], a.H)
-            print(f"  step {st:5d}  recon {loss.item():.4f}  erreur position (slots->objets) {err:.3f}", flush=True)
+                recon_te, masks, _ = m(te); err = match_error(masks, gen(200, a.H, a.n_obj, a.r, seed=7)[1], a.H)
+                # séparation = moyenne du max sur K par pixel : 1/K = slots clones, ->1 = décomposition dure
+                sep = masks.max(1).values.mean().item()
+            print(f"  step {st:5d}  recon {loss.item():.4f}  erreur position (slots->objets) {err:.3f}"
+                  f"  séparation {sep:.2f} (1/K={1/a.K:.2f}=clones, 1=dur)", flush=True)
     # figure : image + masques par slot
     try:
         import matplotlib, os; matplotlib.use("Agg"); import matplotlib.pyplot as plt
