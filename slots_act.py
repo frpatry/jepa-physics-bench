@@ -104,17 +104,30 @@ class ActModel(DynModel):
             prev, cur = cur, nxt
         return (m0, r0), (m1, r1), outs
 
-def cem_plan(m, x0, x1, gz, Hp=8, pop=192, iters=5, elite=16, amax=0.12, dev="cpu", mu0=None):
-    """CEM dans l'ESPACE DES SLOTS. Leçons accumulées : (run 1) un coût pixel est PLAT sans
-    recouvrement des blobs -> coût en latents de slots, lisse ; (run 2) imposer une position but à
-    l'AGENT est toxique — le CEM le tire en ligne droite À TRAVERS l'objet (percutage, plaquage au
-    mur). v3 : le but ne contient QUE l'objet (gz = 1 slot), coût one-sided = distance du slot
-    imaginé le plus proche au slot-objet but. L'agent est LIBRE : aucun terme ne le concerne,
-    c'est un moyen, pas une fin. Aucun décodage pendant la recherche (dynamique latente pure)."""
+def mask_centroids(masks, dev):
+    """(B,K,1,H,W) -> (B,K,2) : centroïde (x,y) de chaque masque décodé."""
+    H = masks.size(-1)
+    yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
+    gx = torch.tensor(xx).to(dev); gy = torch.tensor(yy).to(dev)
+    w = masks[:, :, 0]; s = w.sum((-1, -2)) + 1e-8
+    return torch.stack([(w * gx).sum((-1, -2)) / s, (w * gy).sum((-1, -2)) / s], -1)
+
+def cem_plan(m, x0, x1, c_goal, col_goal, Hp=8, pop=192, iters=5, elite=16, amax=0.12, dev="cpu", mu0=None):
+    """CEM sur CENTROÏDES DÉCODÉS. Leçons accumulées : (run 1) coût pixel = plat sans recouvrement ;
+    (run 2) position but pour l'agent = toxique (tiré à travers l'objet) ; (run 3, DIAG D/E) coût
+    en latents BRUTS = doublement cassé — le terme but est atténué ~5× en imagination (les latents
+    roulés dérivent hors du manifold de l'encodeur ; seuls les masques DÉCODÉS restent fidèles,
+    cf. DIAG C) et le terme d'approche latent (gonflé par l'écart de couleur) dominait 70% du coût,
+    exploité par le CEM (agent à moitié caché dans le coin). v4 : tout en espace POSITION décodé —
+    but = ||centroïde(objet imaginé) − centroïde(but)||, approche = 0.3×||centroïde(agent) −
+    centroïde(objet)||, termes comparables (~[0,1]), slots identifiés par COULEUR décodée."""
     with torch.no_grad():
-        _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+        _, _, S0 = m.peel(m.feats(x0))
+        mk1, rgb1, S1 = m.peel(m.feats(x1), init=S0)
+        col = (rgb1 * mk1).sum((-1, -2)) / (mk1.sum((-1, -2)) + 1e-8)      # (1,K,3) couleur par slot
+        j_obj = int((col[0, :-1] - col_goal).norm(dim=-1).argmin())        # le slot de la couleur du but
+        j_ag = 1 - j_obj                                                   # l'autre prise = l'agent
         S0 = S0.expand(pop, -1, -1); S1 = S1.expand(pop, -1, -1)
-        gzr = gz.expand(pop, -1, -1)                                       # (pop,1,slot_dim) : l'objet SEUL
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.06, device=dev)
         for _ in range(iters):
@@ -125,11 +138,11 @@ def cem_plan(m, x0, x1, gz, Hp=8, pop=192, iters=5, elite=16, amax=0.12, dev="cp
             for h in range(Hp):
                 nxt = m.step_a(cur, prev, A[:, h]); prev, cur = cur, nxt
                 if h >= Hp - 2:                                            # les 2 derniers pas comptent
-                    z = m.down(cur)                                        # (pop,K-1,slot_dim)
-                    d = torch.cdist(z, gzr)                                # (pop,K-1,1)
-                    cost = cost + d.min(1).values.squeeze(-1)              # le slot le plus proche du but
-                    cost = cost + 0.25 * (z[:, 0] - z[:, 1]).norm(dim=-1)  # approche : toucher est un
-            el = A[cost.argsort()[:elite]]                                 # prérequis pour agir
+                    mm, _ = m.imagine(cur)                                 # décode les masques (fidèles)
+                    c = mask_centroids(mm, dev)                            # (pop,K,2)
+                    cost = cost + (c[:, j_obj] - c_goal).norm(dim=-1)      # but : l'objet à sa place
+                    cost = cost + 0.3 * (c[:, j_ag] - c[:, j_obj]).norm(dim=-1)  # approche (position)
+            el = A[cost.argsort()[:elite]]
             mu, sg = el.mean(0), el.std(0) + 1e-4
     return mu.clamp(-amax, amax)
 
@@ -183,9 +196,10 @@ def run_episode(m, seed, H, r, ra, dev, policy="mpc", max_steps=25, plan_h=8, am
     goal_img = render(None, tg, col, H, r, ra)                             # but : l'OBJET SEUL à la cible
     with torch.no_grad():                                                  # (l'agent est libre — un moyen,
         gtens = torch.tensor(goal_img.transpose(2, 0, 1)).unsqueeze(0).to(dev)  # pas une fin)
-        gm, _, gS = m.peel(m.feats(gtens))
+        gm, gr, _ = m.peel(m.feats(gtens))
         j = int(gm[0, :-1, 0].sum((-1, -2)).argmax())                      # la prise qui a capturé l'objet
-        gz = m.down(gS)[:, j:j + 1]                                        # (1,1,slot_dim)
+        c_goal = mask_centroids(gm[:, j:j + 1], dev)[0, 0]                 # (2,) centroïde du but
+        col_goal = ((gr[:, j] * gm[:, j]).sum((-1, -2)) / (gm[:, j].sum((-1, -2)) + 1e-8))[0]  # (3,)
     vo = np.zeros(2, np.float32); frames = [render(pa, po, col, H, r, ra)]
     pa, po, vo, _ = sim_step(pa, po, vo, np.zeros(2, np.float32), r, ra)   # 1 pas nul -> 2 frames de contexte
     frames.append(render(pa, po, col, H, r, ra))
@@ -194,7 +208,7 @@ def run_episode(m, seed, H, r, ra, dev, policy="mpc", max_steps=25, plan_h=8, am
         if policy == "mpc":
             x0 = torch.tensor(frames[-2].transpose(2, 0, 1)).unsqueeze(0).to(dev)
             x1 = torch.tensor(frames[-1].transpose(2, 0, 1)).unsqueeze(0).to(dev)
-            plan = cem_plan(m, x0, x1, gz, Hp=plan_h, pop=pop, iters=iters, amax=amax, dev=dev, mu0=mu)
+            plan = cem_plan(m, x0, x1, c_goal, col_goal, Hp=plan_h, pop=pop, iters=iters, amax=amax, dev=dev, mu0=mu)
             a = plan[0].cpu().numpy()
             mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])      # warm-start du prochain replan
         elif policy == "oracle":                                           # borne sup : vrai sim, vrai coût
@@ -276,20 +290,25 @@ def run_diagnostics(m, a, dev):
     # de l'optimiseur. D : classer 3 plans CONNUS (oracle qui réussit / fuite au coin / immobile)
     # par le coût imaginé — s'il classe la fuite devant l'oracle, le bug est reproduit en éprouvette.
     # E : sous le plan oracle, coût imaginé vs coût sur les VRAIES frames ré-encodées, pas à pas.
-    def plan_terms(x0, x1, A):
+    def plan_terms(x0, x1, A):                                             # v4 : termes sur CENTROÏDES décodés
         with torch.no_grad():
-            _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+            _, _, S0 = m.peel(m.feats(x0))
+            mk1, rgb1, S1 = m.peel(m.feats(x1), init=S0)
+            colr = (rgb1 * mk1).sum((-1, -2)) / (mk1.sum((-1, -2)) + 1e-8)
+            j_obj = int((colr[0, :-1] - col_goal).norm(dim=-1).argmin()); j_ag = 1 - j_obj
             prev, cur, gs, ap = S0, S1, [], []
             for h in range(A.shape[0]):
                 nxt = m.step_a(cur, prev, torch.tensor(A[h:h + 1]).to(dev)); prev, cur = cur, nxt
-                z = m.down(cur)
-                gs.append(float(torch.cdist(z, gz).min())); ap.append(float((z[:, 0] - z[:, 1]).norm()))
+                mm, _ = m.imagine(cur); c = mask_centroids(mm, dev)
+                gs.append(float((c[0, j_obj] - c_goal).norm())); ap.append(float((c[0, j_ag] - c[0, j_obj]).norm()))
         return gs, ap
     def enc_goal_dist(img):
         x = torch.tensor(img.transpose(2, 0, 1)).unsqueeze(0).to(dev)
         with torch.no_grad():
-            _, _, S = m.peel(m.feats(x))
-            return float(torch.cdist(m.down(S), gz).min())
+            mk, rgb, _ = m.peel(m.feats(x))
+            colr = (rgb * mk).sum((-1, -2)) / (mk.sum((-1, -2)) + 1e-8)
+            j = int((colr[0, :-1] - col_goal).norm(dim=-1).argmin())
+            return float((mask_centroids(mk[:, j:j + 1], dev)[0, 0] - c_goal).norm())
     print("\n=== DIAG D : le coût imaginé classe-t-il bien 3 plans connus ? (+ E : dérive sous l'oracle)", flush=True)
     Hp = 8
     for k in range(4):
@@ -305,8 +324,10 @@ def run_diagnostics(m, a, dev):
         gimg = render(None, tg, col, H, r, ra)
         gx = torch.tensor(gimg.transpose(2, 0, 1)).unsqueeze(0).to(dev)
         with torch.no_grad():
-            gm, _, gS = m.peel(m.feats(gx))
-            j = int(gm[0, :-1, 0].sum((-1, -2)).argmax()); gz = m.down(gS)[:, j:j + 1]
+            gm, gr, _ = m.peel(m.feats(gx))
+            j = int(gm[0, :-1, 0].sum((-1, -2)).argmax())
+            c_goal = mask_centroids(gm[:, j:j + 1], dev)[0, 0]
+            col_goal = ((gr[:, j] * gm[:, j]).sum((-1, -2)) / (gm[:, j].sum((-1, -2)) + 1e-8))[0]
         vo = np.zeros(2, np.float32)
         pa1, po1, vo1, _ = sim_step(pa, po, vo, np.zeros(2, np.float32), r, ra)
         f0 = render(pa, po, col, H, r, ra); f1 = render(pa1, po1, col, H, r, ra)
@@ -321,7 +342,7 @@ def run_diagnostics(m, a, dev):
         out = []
         for nom, A_ in plans.items():
             gs, ap = plan_terms(x0, x1, A_)
-            cost = gs[-1] + gs[-2] + 0.25 * (ap[-1] + ap[-2])              # le coût exact du CEM
+            cost = gs[-1] + gs[-2] + 0.3 * (ap[-1] + ap[-2])               # le coût exact du CEM v4
             paa, poo, voo = pa1.copy(), po1.copy(), vo1.copy()
             for h in range(Hp): paa, poo, voo, _ = sim_step(paa, poo, voo, A_[h], r, ra)
             out.append(f"{nom}: coût imaginé {cost:.2f} (but {gs[-1]:.2f} appr {ap[-1]:.2f})"
