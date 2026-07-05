@@ -18,10 +18,15 @@ Mesures honnêtes :
 
   python slots_act.py --n 5000 --H 48 --steps 20000 --bs 64 --plan_tasks 20
 """
-import argparse, math
+import argparse, math, os
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from slots import COLS, mixture_nll, match_error
 from slots_dyn import DynModel
+
+def default_ckpt():
+    if os.path.isdir("/content/drive/MyDrive"): return "/content/drive/MyDrive/slots_act.pt"
+    if os.path.isdir("/content"): return "/content/slots_act.pt"
+    return "slots_act.pt"
 
 WHITE = np.array([1., 1., 1.], np.float32)                                 # l'agent (effecteur, comme Push-T)
 
@@ -203,6 +208,70 @@ def run_episode(m, seed, H, r, ra, dev, policy="mpc", max_steps=25, plan_h=8, am
         best = min(best, float(np.linalg.norm(po - tg)))
     return best < 0.7 * r, frames, goal_img, float(np.linalg.norm(po - tg))
 
+def run_diagnostics(m, a, dev):
+    """Trois vérifications du chemin de planification, sans réentraîner (voir échec MPC 0/20 vs
+    oracle 20/20 : le world model et le search sont hors de cause, la colle — coût latent — est
+    suspecte)."""
+    H, r, ra = a.H, a.r, a.ra
+    yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
+
+    print("\n=== DIAG A : le slot-but pointe-t-il sur l'objet ? (image but SANS agent = hors distribution)", flush=True)
+    rng = np.random.default_rng(3)
+    for with_agent in [False, True]:
+        errs = []
+        for _ in range(30):
+            col = COLS[rng.integers(0, len(COLS))]
+            tg = rng.uniform(1.5 * r, 1 - 1.5 * r, 2).astype(np.float32)
+            pa = None
+            if with_agent:
+                pa = np.array([1 - ra - 0.02, ra + 0.02], np.float32)      # agent parqué dans un coin
+                if np.linalg.norm(pa - tg) < r + ra + 0.05: pa = np.array([ra + 0.02, 1 - ra - 0.02], np.float32)
+            img = render(pa, tg, col, H, r, ra)
+            x = torch.tensor(img.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+            with torch.no_grad(): gm, _, _ = m.peel(m.feats(x))
+            j = int(gm[0, :-1, 0].sum((-1, -2)).argmax())
+            w = gm[0, j, 0].cpu().numpy(); w = w / (w.sum() + 1e-8)
+            c = np.array([(w * xx).sum(), (w * yy).sum()])
+            errs.append(float(np.linalg.norm(c - tg)))
+        lbl = "AVEC agent (in-distribution)" if with_agent else "SANS agent (image but actuelle)"
+        print(f"  {lbl} : centroïde du slot-but -> objet  moy {np.mean(errs):.3f}  max {np.max(errs):.3f}", flush=True)
+
+    print("\n=== DIAG B : le coût latent est-il monotone en distance objet-cible ?", flush=True)
+    col = COLS[1]; tg = np.array([0.35, 0.6], np.float32)
+    for goal_agent in [None, "coin"]:
+        pa_g = None if goal_agent is None else np.array([1 - ra - 0.02, ra + 0.02], np.float32)
+        gimg = render(pa_g, tg, col, H, r, ra)
+        gx = torch.tensor(gimg.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        with torch.no_grad():
+            gm, _, gS = m.peel(m.feats(gx))
+            j = int(gm[0, :-1, 0].sum((-1, -2)).argmax()); gz = m.down(gS)[:, j:j + 1]
+        pa = np.array([0.8, 0.15], np.float32)                             # agent parqué (scène encodée)
+        ds, cs = [], []
+        for px in np.linspace(r, 1 - r, 12):
+            for py in np.linspace(r, 1 - r, 12):
+                po = np.array([px, py], np.float32)
+                img = render(pa, po, col, H, r, ra)
+                x = torch.tensor(img.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+                with torch.no_grad():
+                    _, _, S = m.peel(m.feats(x))
+                    c = torch.cdist(m.down(S), gz).min().item()
+                ds.append(float(np.linalg.norm(po - tg))); cs.append(c)
+        ds, cs = np.array(ds), np.array(cs); rho = float(np.corrcoef(ds, cs)[0, 1])
+        tbl = "  ".join(f"[{lo:.1f}-{lo+0.15:.2f}]={cs[(ds >= lo) & (ds < lo + 0.15)].mean():.2f}"
+                        for lo in np.arange(0, 0.75, 0.15) if ((ds >= lo) & (ds < lo + 0.15)).any())
+        print(f"  but {'SANS' if goal_agent is None else 'AVEC'} agent : corrélation dist/coût r={rho:.2f}"
+              f"   coût par bin : {tbl}", flush=True)
+
+    print("\n=== DIAG C : l'imagination tient-elle au-delà de l'horizon d'entraînement (4) ?", flush=True)
+    Xl, Pl, Al, _ = gen_push(200, H, r, ra, T=10, seed=11, amax=a.amax)
+    Xlt = torch.tensor(Xl.transpose(0, 1, 4, 2, 3)).to(dev); Alt = torch.tensor(Al).to(dev)
+    Cl = np.full(200, 2, np.int64)
+    with torch.no_grad():
+        (_, _), (tm1, _), touts = m.rollout(Xlt[:, 0], Xlt[:, 1], Alt[:, 1:])
+    line = " ".join(f"t+{h+1} {match_error(touts[h][0][:, :, 0], Pl[:, 2 + h], H, Cl):.3f}"
+                    f"/{match_error(tm1[:, :, 0], Pl[:, 2 + h], H, Cl):.3f}" for h in range(8))
+    print(f"  imaginé/copie : {line}", flush=True)
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=5000); p.add_argument("--H", type=int, default=48)
@@ -216,6 +285,9 @@ def get_args():
     p.add_argument("--plan_tasks", type=int, default=20); p.add_argument("--plan_h", type=int, default=8)
     p.add_argument("--plan_pop", type=int, default=192); p.add_argument("--plan_iters", type=int, default=5)
     p.add_argument("--max_steps", type=int, default=25)
+    p.add_argument("--ckpt", type=str, default="")                         # '' = auto (Drive si monté)
+    p.add_argument("--load", type=int, default=0)                          # 1 = charger, sauter l'entraînement
+    p.add_argument("--diag", type=int, default=0)                          # 1 = diagnostics du coût latent
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -223,11 +295,25 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     HOR = a.T - 2
-    X, P, A, _ = gen_push(a.n, a.H, a.r, a.ra, T=a.T, seed=a.seed, amax=a.amax)
-    Xt = torch.tensor(X.transpose(0, 1, 4, 2, 3)); At = torch.tensor(A)
     print(f"device={dev}  {a.n} séquences de {a.T} frames (agent blanc + objet, actions ALÉATOIRES)"
           f"  K={a.K}  seed={a.seed}  (voit t0,t1+actions -> IMAGINE t2..t{a.T-1})", flush=True)
     m = ActModel(a.H, a.K, a.D, slot_dim=a.slot_dim, dec_w=a.dec_w, iters=a.iters).to(dev)
+    ckpt = a.ckpt or default_ckpt()
+    if a.load:
+        m.load_state_dict(torch.load(ckpt, map_location=dev)["model"]); m.eval()
+        print(f"modèle chargé <- {ckpt} (entraînement sauté)", flush=True)
+    else:
+        train(m, a, dev)
+        torch.save({"model": m.state_dict(), "args": vars(a)}, ckpt)
+        print(f"modèle sauvegardé -> {ckpt}", flush=True)
+    if a.diag:
+        run_diagnostics(m, a, dev)
+    plan_eval(m, a, dev)
+
+def train(m, a, dev):
+    HOR = a.T - 2
+    X, P, A, _ = gen_push(a.n, a.H, a.r, a.ra, T=a.T, seed=a.seed, amax=a.amax)
+    Xt = torch.tensor(X.transpose(0, 1, 4, 2, 3)); At = torch.tensor(A)
     opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
@@ -256,6 +342,7 @@ def main():
             cont = " ".join(f"t+{h+1} {hI[h]:.3f}/{hC[h]:.3f}" for h in range(HOR))
             print(f"  step {st:5d}  perception t0 {err0:.3f}  |  imaginé/copie : {imag}"
                   f"  |  AVEC CONTACT : {cont}", flush=True)
+def plan_eval(m, a, dev):
     # ===== PLANIFICATION (le test System-2) =====
     if a.plan_tasks > 0:
         m.eval()
