@@ -64,6 +64,7 @@ def get_args():
     p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32)
     p.add_argument("--lr", type=float, default=4e-4); p.add_argument("--sig", type=float, default=0.1)
     p.add_argument("--n_eval", type=int, default=150); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--diag", type=int, default=0)                          # 1 = figure des masques par slot
     return p.parse_args()
 
 def main():
@@ -110,6 +111,27 @@ def main():
                       f"  |  AVEC CONTACT : {cont}", flush=True)
         torch.save({"model": m.state_dict(), "args": vars(a)}, ckpt)
         print(f"modèle sauvegardé -> {ckpt}", flush=True)
+    if a.diag:                                                             # QUI capture QUOI ? (la figure qui
+        try:                                                               #  a tout appris aux runs 3-12)
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            ids = np.array([ntr, ntr + 5, ntr + 11])
+            xv = to_batch(X, ids, dev)
+            with torch.no_grad():
+                mk, rgb, _ = m.peel(m.feats(xv[:, 0]))
+            fig, ax = plt.subplots(len(ids), a.K + 2, figsize=(2 * (a.K + 2), 2.2 * len(ids)))
+            for i in range(len(ids)):
+                ax[i, 0].imshow(X[ids[i], 0]); ax[i, 0].set_title("image" if i == 0 else "")
+                rec = (rgb * mk).sum(1)[i].permute(1, 2, 0).cpu().clip(0, 1)
+                ax[i, 1].imshow(rec.numpy()); ax[i, 1].set_title("recon" if i == 0 else "")
+                for k in range(a.K):
+                    ax[i, k + 2].imshow(mk[i, k, 0].cpu(), cmap="viridis")
+                    nom = "reliquat" if k == a.K - 1 else f"prise {k}"
+                    ax[i, k + 2].set_title(nom if i == 0 else "")
+                for j in range(a.K + 2): ax[i, j].axis("off")
+            out = "/content/slots_pusht_diag.png" if os.path.isdir("/content") else "slots_pusht_diag.png"
+            plt.tight_layout(); plt.savefig(out); print(f"diag masques -> {out}", flush=True)
+        except Exception as e:
+            print("diag skip:", str(e)[:60], flush=True)
     # figure : contexte + [vrai | imaginé] par horizon, sur des séquences d'éval avec contact
     try:
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
