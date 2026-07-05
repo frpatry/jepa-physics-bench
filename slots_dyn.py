@@ -35,7 +35,7 @@ def gen_seq(n, H, n_obj, r, T=5, seed=0, vary=1, smin=0.04, smax=0.12, collide=1
     vary=1 : nombre d'objets 1..n_obj + couleurs au hasard (la leçon du run 12)."""
     rng = np.random.default_rng(seed); yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
     X = np.zeros((n, T, H, H, 3), np.float32); P = np.zeros((n, T, n_obj, 2), np.float32)
-    C = np.full(n, n_obj, np.int64)
+    C = np.full(n, n_obj, np.int64); hit = np.zeros(n, bool)               # hit[i] = un choc a eu lieu
     for i in range(n):
         if vary: C[i] = rng.integers(1, n_obj + 1)
         cols = rng.permutation(len(COLS))[:C[i]] if vary else np.arange(C[i])
@@ -61,13 +61,13 @@ def gen_seq(n, H, n_obj, r, T=5, seed=0, vary=1, smin=0.04, smax=0.12, collide=1
                                 d = P[i, t, a_] - P[i, t, b_]; dist = float(np.linalg.norm(d))
                                 if 1e-6 < dist < 2 * r:
                                     nv = d / dist; s_ = float((V[a_] - V[b_]) @ nv)
-                                    if s_ < 0: V[a_] -= s_ * nv; V[b_] += s_ * nv  # si rapprochement
+                                    if s_ < 0: V[a_] -= s_ * nv; V[b_] += s_ * nv; hit[i] = True
                                     push = (2 * r - dist) / 2                      # sépare au contact
                                     P[i, t, a_] = np.clip(P[i, t, a_] + push * nv, r, 1 - r)
                                     P[i, t, b_] = np.clip(P[i, t, b_] - push * nv, r, 1 - r)
             for k in range(C[i]):
                 X[i, t][(xx - P[i, t, k, 0]) ** 2 + (yy - P[i, t, k, 1]) ** 2 < r * r] = COLS[cols[k]]
-    return X, P, C
+    return X, P, C, hit
 
 class DynModel(nn.Module):
     def __init__(s, H, K, D=64, res=24, slot_dim=16, dec_w=32, iters=3):
@@ -158,8 +158,8 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     HOR = a.T - 2                                                          # nb de pas imaginés
-    X, P, C = gen_seq(a.n, a.H, a.n_obj, a.r, T=a.T, seed=a.seed, vary=a.vary,
-                      smin=a.smin, smax=a.smax, collide=a.collide)
+    X, P, C, _ = gen_seq(a.n, a.H, a.n_obj, a.r, T=a.T, seed=a.seed, vary=a.vary,
+                         smin=a.smin, smax=a.smax, collide=a.collide)
     Xt = torch.tensor(X.transpose(0, 1, 4, 2, 3))                          # (n,T,3,H,H)
     nobj = f"1..{a.n_obj} objets (variable)" if a.vary else f"{a.n_obj} objets"
     print(f"device={dev}  {a.n} séquences de {a.T} frames  {nobj}  collisions={'OUI' if a.collide else 'non'}"
@@ -169,9 +169,11 @@ def main():
     warm = max(1, a.steps // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
                                               0.5 * (1 + math.cos(math.pi * max(0, st - warm) / max(1, a.steps - warm))))
-    Xe, Pe, Ce = gen_seq(200, a.H, a.n_obj, a.r, T=a.T, seed=7, vary=a.vary,
-                         smin=a.smin, smax=a.smax, collide=a.collide)
+    Xe, Pe, Ce, He = gen_seq(400, a.H, a.n_obj, a.r, T=a.T, seed=7, vary=a.vary,
+                             smin=a.smin, smax=a.smax, collide=a.collide)
     Xet = torch.tensor(Xe.transpose(0, 1, 4, 2, 3)).to(dev)
+    hid = np.where(He)[0]                                                  # séquences AVEC choc : le test dur
+    print(f"éval : {len(He)} séquences dont {len(hid)} avec choc entre objets", flush=True)
     for st in range(a.steps):
         bi = np.random.randint(0, a.n, a.bs)
         x = Xt[bi].to(dev)                                                 # (bs,T,3,H,H)
@@ -186,14 +188,21 @@ def main():
                 err0 = match_error(tm0[:, :, 0], Pe[:, 0], a.H, Ce)        # perception t0
                 eI = [match_error(touts[h][0][:, :, 0], Pe[:, 2 + h], a.H, Ce) for h in range(HOR)]
                 eC = [match_error(tm1[:, :, 0], Pe[:, 2 + h], a.H, Ce) for h in range(HOR)]  # copie de t1
+                # le test dur : uniquement les séquences AVEC choc (la moyenne est dominée par le balistique)
+                hI = [match_error(touts[h][0][hid][:, :, 0], Pe[hid, 2 + h], a.H, Ce[hid]) for h in range(HOR)]
+                hC = [match_error(tm1[hid][:, :, 0], Pe[hid, 2 + h], a.H, Ce[hid]) for h in range(HOR)]
             imag = " ".join(f"t+{h+1} {eI[h]:.3f}/{eC[h]:.3f}" for h in range(HOR))
-            print(f"  step {st:5d}  perception t0 {err0:.3f}  |  imaginé/copie : {imag}", flush=True)
+            choc = " ".join(f"t+{h+1} {hI[h]:.3f}/{hC[h]:.3f}" for h in range(HOR))
+            print(f"  step {st:5d}  perception t0 {err0:.3f}  |  imaginé/copie : {imag}"
+                  f"  |  AVEC CHOC : {choc}", flush=True)
     # figure : contexte t0,t1 puis pour chaque horizon [vrai | imaginé]
     try:
         import matplotlib, os; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         with torch.no_grad():
-            Xv, Pv, Cv = gen_seq(4, a.H, a.n_obj, a.r, T=a.T, seed=3, vary=a.vary,
-                                 smin=a.smin, smax=a.smax, collide=a.collide)
+            Xv, Pv, Cv, Hv = gen_seq(60, a.H, a.n_obj, a.r, T=a.T, seed=3, vary=a.vary,
+                                     smin=a.smin, smax=a.smax, collide=a.collide)
+            ids = (list(np.where(Hv)[0])[:2] + list(np.where(~Hv)[0])[:2])[:4]  # 2 avec choc, 2 sans
+            Xv = Xv[ids]
             Xvt = torch.tensor(Xv.transpose(0, 1, 4, 2, 3)).to(dev)
             _, _, outs = m(Xvt[:, 0], Xvt[:, 1], horizons=HOR)
         ncol = 2 + 2 * HOR
