@@ -96,26 +96,35 @@ class ActModel(DynModel):
             prev, cur = cur, nxt
         return (m0, r0), (m1, r1), outs
 
-def goal_nll(goal, mh, rh, sig=0.1):
-    """Coût de planification par candidat : le futur imaginé explique-t-il l'image but ?"""
-    d2 = ((goal.unsqueeze(0).unsqueeze(1) - rh) ** 2).sum(2)               # (pop,K,H,H)
-    logp = (mh[:, :, 0] + 1e-8).log() - d2 / (2 * sig * sig)
-    return -torch.logsumexp(logp, 1).mean((-1, -2))                        # (pop,)
-
-def cem_plan(m, x0, x1, goal, Hp=5, pop=96, iters=4, elite=12, amax=0.12, dev="cpu"):
-    mu = torch.zeros(Hp, 2, device=dev); sg = torch.full((Hp, 2), 0.06, device=dev)
-    x0r = x0.expand(pop, -1, -1, -1); x1r = x1.expand(pop, -1, -1, -1)
+def cem_plan(m, x0, x1, gz, Hp=8, pop=192, iters=5, elite=16, amax=0.12, dev="cpu", mu0=None):
+    """CEM dans l'ESPACE DES SLOTS : coût = distance de Chamfer entre les slots imaginés (2 derniers
+    pas) et les slots du but. Leçon du run 1 : un coût pixel (NLL de l'image but) est PLAT tant que
+    les blobs ne se recouvrent pas -> aucun gradient de progrès ; la distance entre latents de slots
+    est LISSE (chaque cm de progrès de l'objet compte) — c'est le protocole DINO-WM/V-JEPA.
+    On ne décode RIEN pendant la recherche : seule la dynamique latente est roulée (rapide).
+    mu0 = warm-start (plan précédent décalé d'un pas)."""
     with torch.no_grad():
+        _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+        S0 = S0.expand(pop, -1, -1); S1 = S1.expand(pop, -1, -1)
+        gzr = gz.expand(pop, -1, -1)                                       # (pop,K-1,slot_dim)
+        mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
+        sg = torch.full((Hp, 2), 0.06, device=dev)
         for _ in range(iters):
             A = (mu + sg * torch.randn(pop, Hp, 2, device=dev)).clamp(-amax, amax)
-            _, _, outs = m.rollout(x0r, x1r, A)
-            cost = sum(goal_nll(goal, mh, rh) for mh, rh in outs[-2:])     # les 2 dernières frames imaginées
+            prev, cur, cost = S0, S1, 0.
+            for h in range(Hp):
+                nxt = m.step_a(cur, prev, A[:, h]); prev, cur = cur, nxt
+                if h >= Hp - 2:                                            # les 2 derniers pas comptent
+                    d = torch.cdist(m.down(cur), gzr)                      # (pop,K-1,K-1)
+                    cost = cost + d.min(-1).values.sum(-1) + d.min(-2).values.sum(-1)
             el = A[cost.argsort()[:elite]]
             mu, sg = el.mean(0), el.std(0) + 1e-4
     return mu.clamp(-amax, amax)
 
-def run_episode(m, seed, H, r, dev, policy="mpc", max_steps=12, plan_h=5, amax=0.12):
-    """Tâche : pousser l'objet à la cible (but = image rendue). Succès si dist finale < 0.7r."""
+def run_episode(m, seed, H, r, dev, policy="mpc", max_steps=20, plan_h=8, amax=0.12,
+                pop=192, iters=5):
+    """Tâche : pousser l'objet à la cible (but = image rendue, encodée en SLOTS une fois).
+    Succès si dist finale < 0.7r."""
     rng = np.random.default_rng(seed)
     col = COLS[rng.integers(0, len(COLS))]
     pa = rng.uniform(r, 1 - r, 2).astype(np.float32)
@@ -127,16 +136,20 @@ def run_episode(m, seed, H, r, dev, policy="mpc", max_steps=12, plan_h=5, amax=0
         if np.linalg.norm(tg - po) > 0.25: break
     u = (tg - po) / (np.linalg.norm(tg - po) + 1e-8)
     goal_img = render(np.clip(tg - 2.05 * r * u, r, 1 - r), tg, col, H, r) # but : objet à la cible, agent derrière
-    goal = torch.tensor(goal_img.transpose(2, 0, 1)).to(dev)
+    with torch.no_grad():                                                  # le but devient des SLOTS (une fois)
+        gtens = torch.tensor(goal_img.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        _, _, gS = m.peel(m.feats(gtens)); gz = m.down(gS)                 # (1,K-1,slot_dim)
     vo = np.zeros(2, np.float32); frames = [render(pa, po, col, H, r)]
     pa, po, vo, _ = sim_step(pa, po, vo, np.zeros(2, np.float32), r)       # 1 pas nul -> 2 frames de contexte
     frames.append(render(pa, po, col, H, r))
-    best = float(np.linalg.norm(po - tg))
+    best = float(np.linalg.norm(po - tg)); mu = None
     for _ in range(max_steps):
         if policy == "mpc":
             x0 = torch.tensor(frames[-2].transpose(2, 0, 1)).unsqueeze(0).to(dev)
             x1 = torch.tensor(frames[-1].transpose(2, 0, 1)).unsqueeze(0).to(dev)
-            a = cem_plan(m, x0, x1, goal, Hp=plan_h, amax=amax, dev=dev)[0].cpu().numpy()
+            plan = cem_plan(m, x0, x1, gz, Hp=plan_h, pop=pop, iters=iters, amax=amax, dev=dev, mu0=mu)
+            a = plan[0].cpu().numpy()
+            mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])      # warm-start du prochain replan
         else:
             sp = rng.uniform(0.2, 1.0) * amax; th = rng.uniform(0, 2 * np.pi)
             a = sp * np.array([np.cos(th), np.sin(th)], np.float32)
@@ -154,7 +167,9 @@ def get_args():
     p.add_argument("--iters", type=int, default=3); p.add_argument("--slot_dim", type=int, default=16)
     p.add_argument("--dec_w", type=int, default=32); p.add_argument("--sig", type=float, default=0.1)
     p.add_argument("--T", type=int, default=6); p.add_argument("--amax", type=float, default=0.12)
-    p.add_argument("--plan_tasks", type=int, default=20); p.add_argument("--plan_h", type=int, default=5)
+    p.add_argument("--plan_tasks", type=int, default=20); p.add_argument("--plan_h", type=int, default=8)
+    p.add_argument("--plan_pop", type=int, default=192); p.add_argument("--plan_iters", type=int, default=5)
+    p.add_argument("--max_steps", type=int, default=20)
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -199,10 +214,11 @@ def main():
     if a.plan_tasks > 0:
         m.eval()
         wins_m, wins_r, dists = 0, 0, []
+        kw = dict(max_steps=a.max_steps, plan_h=a.plan_h, amax=a.amax, pop=a.plan_pop, iters=a.plan_iters)
         for k in range(a.plan_tasks):
-            ok, frames, goal_img, d = run_episode(m, 1000 + k, a.H, a.r, dev, "mpc", plan_h=a.plan_h, amax=a.amax)
+            ok, frames, goal_img, d = run_episode(m, 1000 + k, a.H, a.r, dev, "mpc", **kw)
             wins_m += ok; dists.append(d)
-            ok_r, _, _, _ = run_episode(m, 1000 + k, a.H, a.r, dev, "random", plan_h=a.plan_h, amax=a.amax)
+            ok_r, _, _, _ = run_episode(m, 1000 + k, a.H, a.r, dev, "random", **kw)
             wins_r += ok_r
             print(f"  tâche {k:2d}  MPC {'OK ' if ok else 'ÉCHEC'} (dist finale {d:.3f})"
                   f"  |  aléatoire {'OK' if ok_r else 'échec'}", flush=True)
@@ -210,12 +226,12 @@ def main():
               f"  (dist finale moyenne MPC {np.mean(dists):.3f}, succès si <{0.7*a.r:.3f})", flush=True)
         try:
             import matplotlib, os; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-            ok, frames, goal_img, d = run_episode(m, 1000, a.H, a.r, dev, "mpc", plan_h=a.plan_h, amax=a.amax)
-            show = frames[::2][:7]
+            ok, frames, goal_img, d = run_episode(m, 1000, a.H, a.r, dev, "mpc", **kw)
+            show = frames[::3][:7]
             fig, ax = plt.subplots(1, len(show) + 1, figsize=(2 * (len(show) + 1), 2.4))
             ax[0].imshow(goal_img.clip(0, 1)); ax[0].set_title("BUT"); ax[0].axis("off")
             for j, fr in enumerate(show):
-                ax[j + 1].imshow(fr.clip(0, 1)); ax[j + 1].set_title(f"pas {2*j}"); ax[j + 1].axis("off")
+                ax[j + 1].imshow(fr.clip(0, 1)); ax[j + 1].set_title(f"pas {3*j}"); ax[j + 1].axis("off")
             out = "/content/slots_act.png" if os.path.isdir("/content") else "slots_act.png"
             plt.tight_layout(); plt.savefig(out)
             print(f"figure -> {out}  (épisode MPC : {'succès' if ok else 'échec'}, dist {d:.3f})", flush=True)
