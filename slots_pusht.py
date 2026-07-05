@@ -18,9 +18,26 @@ horizon, + sous-ensemble AVEC CONTACT. L'angle du T viendra au bloc 3 (planner p
   python slots_pusht.py --load 1 ...                     # recharge sans réentraîner
 """
 import argparse, math, os
-import numpy as np, torch, torch.nn.functional as F
+import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from slots import mixture_nll, match_error
 from slots_act import ActModel
+
+class PushTModel(ActModel):
+    """[RÉSULTAT NÉGATIF, gardé pour mémoire — NON UTILISÉ] Hypothèse FiLM réfutée par le test
+    contrôlé sur T tournés : additif w32 0.0197, FiLM w32 0.0235 (aucun avantage), additif
+    **w96 0.0048** (net !), additif w96 depth3 0.0482 (la profondeur nuit). Le goulot du run 1
+    Push-T (perception plate 0.184, tout flou) était la LARGEUR du décodeur, pas le type de
+    couplage slot×position — une somme+ReLU à largeur 96 peint très bien un T tourné.
+    Fix retenu : --dec_w 96, zéro changement d'architecture."""
+    def __init__(s, H, K, D=64, **kw):
+        super().__init__(H, K, D, **kw)
+        s.film_g = nn.Linear(s.slot_dim, s.slot_dim); s.film_b = nn.Linear(s.slot_dim, s.slot_dim)
+    def decode_one(s, sl):                                                 # sl:(B,slot_dim)
+        B = sl.size(0)
+        g = s.pe_d.proj(s.pe_d.grid)                                       # (H,H,slot_dim) canaux positionnels
+        x = g.unsqueeze(0) * s.film_g(sl).reshape(B, 1, 1, -1) + s.film_b(sl).reshape(B, 1, 1, -1)
+        out = s.dec(x.permute(0, 3, 1, 2))
+        return out[:, :3], out[:, 3:4]
 
 def default_path(name):
     if os.path.isdir("/content/drive/MyDrive"): return f"/content/drive/MyDrive/{name}"
@@ -42,7 +59,7 @@ def get_args():
     p.add_argument("--data", type=str, default=""); p.add_argument("--ckpt", type=str, default="")
     p.add_argument("--load", type=int, default=0)
     p.add_argument("--K", type=int, default=5); p.add_argument("--D", type=int, default=64)
-    p.add_argument("--slot_dim", type=int, default=16); p.add_argument("--dec_w", type=int, default=32)
+    p.add_argument("--slot_dim", type=int, default=16); p.add_argument("--dec_w", type=int, default=96)
     p.add_argument("--iters", type=int, default=3)
     p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32)
     p.add_argument("--lr", type=float, default=4e-4); p.add_argument("--sig", type=float, default=0.1)
