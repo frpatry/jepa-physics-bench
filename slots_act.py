@@ -272,6 +272,70 @@ def run_diagnostics(m, a, dev):
                     f"/{match_error(tm1[:, :, 0], Pl[:, 2 + h], H, Cl):.3f}" for h in range(8))
     print(f"  imaginé/copie : {line}", flush=True)
 
+    # ---- D/E : le seul chemin non testé par A-C = le coût sur latents IMAGINÉS sous les actions
+    # de l'optimiseur. D : classer 3 plans CONNUS (oracle qui réussit / fuite au coin / immobile)
+    # par le coût imaginé — s'il classe la fuite devant l'oracle, le bug est reproduit en éprouvette.
+    # E : sous le plan oracle, coût imaginé vs coût sur les VRAIES frames ré-encodées, pas à pas.
+    def plan_terms(x0, x1, A):
+        with torch.no_grad():
+            _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+            prev, cur, gs, ap = S0, S1, [], []
+            for h in range(A.shape[0]):
+                nxt = m.step_a(cur, prev, torch.tensor(A[h:h + 1]).to(dev)); prev, cur = cur, nxt
+                z = m.down(cur)
+                gs.append(float(torch.cdist(z, gz).min())); ap.append(float((z[:, 0] - z[:, 1]).norm()))
+        return gs, ap
+    def enc_goal_dist(img):
+        x = torch.tensor(img.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        with torch.no_grad():
+            _, _, S = m.peel(m.feats(x))
+            return float(torch.cdist(m.down(S), gz).min())
+    print("\n=== DIAG D : le coût imaginé classe-t-il bien 3 plans connus ? (+ E : dérive sous l'oracle)", flush=True)
+    Hp = 8
+    for k in range(4):
+        rng = np.random.default_rng(1000 + k)
+        col = COLS[rng.integers(0, len(COLS))]
+        pa = rng.uniform(ra, 1 - ra, 2).astype(np.float32)
+        for _ in range(50):
+            po = rng.uniform(r, 1 - r, 2).astype(np.float32)
+            if np.linalg.norm(po - pa) > 1.2 * (r + ra): break
+        for _ in range(50):
+            tg = rng.uniform(1.5 * r, 1 - 1.5 * r, 2).astype(np.float32)
+            if np.linalg.norm(tg - po) > 0.25: break
+        gimg = render(None, tg, col, H, r, ra)
+        gx = torch.tensor(gimg.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        with torch.no_grad():
+            gm, _, gS = m.peel(m.feats(gx))
+            j = int(gm[0, :-1, 0].sum((-1, -2)).argmax()); gz = m.down(gS)[:, j:j + 1]
+        vo = np.zeros(2, np.float32)
+        pa1, po1, vo1, _ = sim_step(pa, po, vo, np.zeros(2, np.float32), r, ra)
+        f0 = render(pa, po, col, H, r, ra); f1 = render(pa1, po1, col, H, r, ra)
+        x0 = torch.tensor(f0.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        x1 = torch.tensor(f1.transpose(2, 0, 1)).unsqueeze(0).to(dev)
+        plans = {}
+        plans["oracle"] = oracle_plan(pa1, po1, vo1, tg, r, ra, np.random.default_rng(5), Hp=Hp,
+                                      pop=192, iters=5, amax=a.amax)
+        away = (pa1 - po1) / (np.linalg.norm(pa1 - po1) + 1e-8)
+        plans["fuite"] = np.repeat((0.1 * away)[None], Hp, 0).astype(np.float32)
+        plans["immobile"] = np.zeros((Hp, 2), np.float32)
+        out = []
+        for nom, A_ in plans.items():
+            gs, ap = plan_terms(x0, x1, A_)
+            cost = gs[-1] + gs[-2] + 0.25 * (ap[-1] + ap[-2])              # le coût exact du CEM
+            paa, poo, voo = pa1.copy(), po1.copy(), vo1.copy()
+            for h in range(Hp): paa, poo, voo, _ = sim_step(paa, poo, voo, A_[h], r, ra)
+            out.append(f"{nom}: coût imaginé {cost:.2f} (but {gs[-1]:.2f} appr {ap[-1]:.2f})"
+                       f" | vraie dist finale {np.linalg.norm(poo - tg):.3f}")
+        print(f"  tâche {k} (dist initiale {np.linalg.norm(po - tg):.3f}) :  " + "  ||  ".join(out), flush=True)
+        # E : dérive pas à pas sous l'oracle
+        gs, _ = plan_terms(x0, x1, plans["oracle"])
+        paa, poo, voo = pa1.copy(), po1.copy(), vo1.copy(); enc = []
+        for h in range(Hp):
+            paa, poo, voo, _ = sim_step(paa, poo, voo, plans["oracle"][h], r, ra)
+            enc.append(enc_goal_dist(render(paa, poo, col, H, r, ra)))
+        print("     E (oracle, coût but par pas)  imaginé : " + " ".join(f"{g:.2f}" for g in gs)
+              + "   encodé réel : " + " ".join(f"{e:.2f}" for e in enc), flush=True)
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=5000); p.add_argument("--H", type=int, default=48)
