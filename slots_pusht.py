@@ -114,7 +114,7 @@ def main():
     if a.diag:                                                             # QUI capture QUOI ? (la figure qui
         try:                                                               #  a tout appris aux runs 3-12)
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-            ids = np.array([ntr, ntr + 5, ntr + 11])
+            ids = np.unique(np.clip(np.array([ntr, ntr + 5, ntr + 11]), 0, n - 1))
             xv = to_batch(X, ids, dev)
             with torch.no_grad():
                 mk, rgb, _ = m.peel(m.feats(xv[:, 0]))
