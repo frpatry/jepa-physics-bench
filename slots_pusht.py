@@ -54,6 +54,19 @@ def load_data(path):
 def to_batch(X, ids, dev):
     return torch.tensor(X[ids]).to(dev).permute(0, 1, 4, 2, 3).float().div(255.0)
 
+def wmix(img, rgbs, masks, w, sig):
+    """Loss de mélange PONDÉRÉE PAR PIXEL. Leçon du run 2 : l'agent fait 0,3% de l'image (25 px
+    sur 9216) — la moyenne uniforme le rend invisible à la loss, il disparaît de l'imagination.
+    Pondération par le MOUVEMENT (w = 1 + λ·|Δframe|) : ce qui bouge est important — le common
+    fate recyclé en poids. Prior générique, aucune info d'objet."""
+    d2 = ((img.unsqueeze(1) - rgbs) ** 2).sum(2)
+    logp = (masks + 1e-8).log() - d2 / (2 * sig * sig)
+    nll = -torch.logsumexp(logp, 1)                                        # (B,H,W)
+    return (nll * w).sum() / w.sum()
+
+def motion_w(x_t, x_prev, lam):
+    return 1.0 + lam * (x_t - x_prev).abs().mean(1)                        # (B,H,W)
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=str, default=""); p.add_argument("--ckpt", type=str, default="")
@@ -65,6 +78,7 @@ def get_args():
     p.add_argument("--lr", type=float, default=4e-4); p.add_argument("--sig", type=float, default=0.1)
     p.add_argument("--n_eval", type=int, default=150); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--diag", type=int, default=0)                          # 1 = figure des masques par slot
+    p.add_argument("--wmotion", type=float, default=30.0)                  # poids du mouvement dans la loss
     return p.parse_args()
 
 def main():
@@ -92,9 +106,11 @@ def main():
             bi = np.random.randint(0, ntr, a.bs)
             x = to_batch(X, bi, dev); acts = torch.tensor(dA[bi]).to(dev)
             (m0, r0), (m1, r1), outs = m.rollout(x[:, 0], x[:, 1], acts[:, 1:])
-            loss = mixture_nll(x[:, 0], r0, m0[:, :, 0], a.sig) + mixture_nll(x[:, 1], r1, m1[:, :, 0], a.sig)
+            w01 = motion_w(x[:, 1], x[:, 0], a.wmotion)                    # ce qui bouge pèse plus
+            loss = wmix(x[:, 0], r0, m0[:, :, 0], w01, a.sig) + wmix(x[:, 1], r1, m1[:, :, 0], w01, a.sig)
             for h, (mh, rh) in enumerate(outs):
-                loss = loss + mixture_nll(x[:, 2 + h], rh, mh[:, :, 0], a.sig)
+                wh = motion_w(x[:, 2 + h], x[:, 1 + h], a.wmotion)
+                loss = loss + wmix(x[:, 2 + h], rh, mh[:, :, 0], wh, a.sig)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
             opt.step(); sched.step()
             if st % 500 == 0:
