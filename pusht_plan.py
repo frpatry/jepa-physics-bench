@@ -75,7 +75,7 @@ def t_stats(canvas, dev=None):
     d2 = (gx.unsqueeze(0) - cA[:, 0].reshape(-1, 1, 1)) ** 2 + (gy.unsqueeze(0) - cA[:, 1].reshape(-1, 1, 1)) ** 2
     wG = wG * (d2 > 0.07 ** 2).float()                                     # exclusion autour de l'agent
     cT, CT_ = mask_stats(wG)
-    return cT, CT_, cA
+    return cT, CT_, cA, wG.sum((-1, -2))                                   # + masse grise (conservation)
 
 def mask_stats(w, eps=1e-8):
     """Centroïde (x,y) et covariance 2x2 d'un masque-poids (B,H,W) -> (B,2), (B,2,2)."""
@@ -119,6 +119,11 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev=
     with torch.no_grad():
         _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
         S0 = S0.expand(pop, -1, -1); S1 = S1.expand(pop, -1, -1)
+        # masse grise de référence (canvas à +1 pas, action nulle) : CONSERVATION DE LA MASSE —
+        # l'exploit ultime faisait DISPARAÎTRE le T du canvas (fading par dérive), les résidus
+        # verdâtres du marqueur (situé AU but) dominaient alors la carte grise -> 'T au but' gratuit
+        mm0, rr0 = m.imagine(m.step_a(S1[:1], S0[:1], torch.zeros(1, 2, device=dev)))
+        _, _, _, mass_ref = t_stats((rr0 * mm0).sum(1))
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.30, device=dev)
         for _ in range(iters):
@@ -132,9 +137,10 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev=
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur)                                # décodage POST-g (calibré)
                     canvas = (rr * mm).sum(1)                              # (pop,3,H,W) : le canvas imaginé
-                    cT, CT_, cA = t_stats(canvas)                          # stats T avec exclusion agent
+                    cT, CT_, cA, mass = t_stats(canvas)                    # stats T avec exclusion agent
                     cost = cost + pose_cost(cT, CT_, cg, Cg)
                     cost = cost + 0.25 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
+                    cost = cost + 1.0 * (0.7 - mass / (mass_ref + 1e-8)).clamp_min(0.)  # conservation
                     # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
                     # le bloc HORS de la cible est rentable quand il démarre dessus (toy v2 bis)
             el = A[cost.argsort()[:elite]]
@@ -275,7 +281,7 @@ def diag_plans(m, hin, dev, scratch, seed=3000):
                 nxt = m.step_a(cur, prev, torch.tensor(A_[h:h + 1]).to(dev)); prev, cur = cur, nxt
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
-                    cT, CT_, _ = t_stats(canvas)
+                    cT, CT_, _, _ = t_stats(canvas)
                     gs.append(float(pose_cost(cT, CT_, cg, Cg)[0]))
         o2, i2 = reset_faithful(scratch, st0)
         a2 = np.array(o2["agent_pos"], np.float32)
@@ -308,7 +314,7 @@ def diag_plans(m, hin, dev, scratch, seed=3000):
                 nxt = m.step_a(cur, prev, torch.tensor(np.clip(A_[h:h+1], -0.8, 0.8)).to(dev)); prev, cur = cur, nxt
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
-                    cT, CT_, _ = t_stats(canvas)
+                    cT, CT_, _, _ = t_stats(canvas)
                     gs.append(float(pose_cost(cT, CT_, cg, Cg)[0]))
         print(f"  {nom:17s} coût-but imaginé {np.mean(gs):.3f}", flush=True)
     env.close()
@@ -333,7 +339,7 @@ def diag_episode(m, hin, dev, scratch, seed=3000, steps=12):
                 nxt = m.step_a(cur, prev, A[h:h + 1].to(dev)); prev, cur = cur, nxt
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
-                    cT, CT_, cA = t_stats(canvas)
+                    cT, CT_, cA, _ = t_stats(canvas)
                     c = c + float(pose_cost(cT, CT_, cg, Cg)[0]) + 0.25 * max(float((cA - cT).norm()) - 0.12, 0.)
         return c
     for t in range(steps):
