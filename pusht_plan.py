@@ -168,12 +168,49 @@ def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, ite
     env.close()
     return success, best_cov
 
+def diag(m, hin, dev, scratch, seed=3000):
+    """Les yeux du MPC : image but + gray_mask + couleurs décodées des slots + masques jT/jA
+    (peel) + masque jT imaginé après 2 pas. Sauve pusht_plan_diag.png."""
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    env = make_env(); obs, info = env.reset(seed=seed)
+    gp = np.array(info["goal_pose"], np.float32)
+    far = np.array([40.0, 40.0], np.float32)
+    gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
+    g64 = to64(gob["pixels"], hin, dev); gm = gray_mask(g64)
+    cg, _ = mask_stats(gm.unsqueeze(0))
+    ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+    obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]
+    x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
+    with torch.no_grad():
+        _, _, S0 = m.peel(m.feats(x0))
+        mk, rgb, S1 = m.peel(m.feats(x1), init=S0)
+        col = (rgb * mk).sum((-1, -2)) / (mk.sum((-1, -2)) + 1e-8)
+        print("couleurs décodées des prises :", np.round(col[0, :-1].cpu().numpy(), 2).tolist(), flush=True)
+        jT, jA, _, _ = slot_ids(m, x0, x1, dev)
+        print(f"jT={jT} jA={jA}  |  cg (but, décodé)={np.round(cg[0].cpu().numpy(),3)}"
+              f"  vs goal vrai/512={np.round(gp[:2]/512.,3)}", flush=True)
+        prev, cur = S0, S1
+        for _ in range(2): nxt = m.step_a(cur, prev, torch.zeros(1, 2, device=dev)); prev, cur = cur, nxt
+        mi, _ = m.imagine(cur)
+    fig, ax = plt.subplots(1, 6, figsize=(18, 3))
+    ax[0].imshow(g64[0].permute(1, 2, 0).cpu()); ax[0].set_title("image BUT")
+    ax[1].imshow(gm.cpu()); ax[1].set_title("gray_mask (cible)")
+    ax[2].imshow(x1[0].permute(1, 2, 0).cpu()); ax[2].set_title("frame courante")
+    ax[3].imshow(mk[0, jT, 0].cpu()); ax[3].set_title(f"peel slot jT={jT}")
+    ax[4].imshow(mk[0, jA, 0].cpu()); ax[4].set_title(f"peel slot jA={jA}")
+    ax[5].imshow(mi[0, jT, 0].cpu()); ax[5].set_title("jT imaginé (+2 pas)")
+    for a_ in ax: a_.axis("off")
+    out = "/content/pusht_plan_diag.png" if os.path.isdir("/content") else "pusht_plan_diag.png"
+    plt.tight_layout(); plt.savefig(out); print(f"diag -> {out}", flush=True)
+    env.close()
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=""); p.add_argument("--tasks", type=int, default=10)
     p.add_argument("--plan_h", type=int, default=8); p.add_argument("--plan_pop", type=int, default=192)
     p.add_argument("--plan_iters", type=int, default=5); p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
+    p.add_argument("--diag", type=int, default=0)
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = a.ckpt or default_path("pusht_wm.pt")
@@ -183,6 +220,8 @@ def main():
     m.load_state_dict(ck["model"]); m.eval()
     print(f"modèle chargé <- {ckpt} (hin {sa['hin']}, slot_dim {sa['slot_dim']})", flush=True)
     scratch = make_env(); scratch.reset(seed=0)
+    if a.diag:
+        diag(m, sa["hin"], dev, scratch); scratch.close(); return
     pols = a.policies.split(",")
     scores = {q: [] for q in pols}; covs = {q: [] for q in pols}
     for k in range(a.tasks):
