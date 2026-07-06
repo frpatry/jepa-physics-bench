@@ -51,8 +51,13 @@ def load_data(path):
     P = np.stack([AG / 512.0, BP[:, :, :2] / 512.0], 2).astype(np.float32) # (n,T,2,2) : agent, bloc
     return X, dA, P, CT
 
-def to_batch(X, ids, dev):
-    return torch.tensor(X[ids]).to(dev).permute(0, 1, 4, 2, 3).float().div(255.0)
+def to_batch(X, ids, dev, hin=None):
+    x = torch.tensor(X[ids]).to(dev).permute(0, 1, 4, 2, 3).float().div(255.0)
+    if hin and hin != x.shape[-1]:                                         # redescendre en résolution :
+        B, T = x.shape[:2]                                                 # la FRACTION de l'agent est
+        x = F.interpolate(x.reshape(B * T, 3, x.shape[-2], x.shape[-1]),   # invariante à l'échelle, mais
+                          size=hin, mode="area").reshape(B, T, 3, hin, hin)  # les tokens passent de 2304
+    return x                                                               # à ~1024 (régime validé)
 
 def wmix(img, rgbs, masks, w, sig):
     """Loss de mélange PONDÉRÉE PAR PIXEL. Leçon du run 2 : l'agent fait 0,3% de l'image (25 px
@@ -77,6 +82,7 @@ def get_args():
     p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32)
     p.add_argument("--lr", type=float, default=4e-4); p.add_argument("--sig", type=float, default=0.1)
     p.add_argument("--n_eval", type=int, default=150); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--hin", type=int, default=64)                         # résolution d'entrée du modèle
     p.add_argument("--diag", type=int, default=0)                          # 1 = figure des masques par slot
     p.add_argument("--wmotion", type=float, default=30.0)                  # poids du mouvement dans la loss
     return p.parse_args()
@@ -86,10 +92,10 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     data = a.data or default_path("pusht_data.npz"); ckpt = a.ckpt or default_path("pusht_wm.pt")
     X, dA, P, CT = load_data(data)
-    n, T, H = X.shape[0], X.shape[1], X.shape[2]; HOR = T - 2
+    n, T = X.shape[0], X.shape[1]; H = a.hin; HOR = T - 2
     ne = min(a.n_eval, n // 10); ntr = n - ne                              # éval = dernières séquences
-    print(f"device={dev}  {n} séquences de {T} frames {H}x{H} (jeu aléatoire, vrai gym-pusht)"
-          f"  K={a.K}  train {ntr} / éval {ne}", flush=True)
+    print(f"device={dev}  {n} séquences de {T} frames (entrée {H}x{H}, source {X.shape[2]})"
+          f"  K={a.K}  sig={a.sig}  train {ntr} / éval {ne}", flush=True)
     m = ActModel(H, a.K, a.D, res=H // 2, slot_dim=a.slot_dim, dec_w=a.dec_w, iters=a.iters).to(dev)
     if a.load:
         m.load_state_dict(torch.load(ckpt, map_location=dev)["model"]); m.eval()
@@ -99,12 +105,12 @@ def main():
         warm = max(1, a.steps // 20)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
                                                   0.5 * (1 + math.cos(math.pi * max(0, st - warm) / max(1, a.steps - warm))))
-        xe = to_batch(X, np.arange(ntr, n), dev); ae = torch.tensor(dA[ntr:]).to(dev)
+        xe = to_batch(X, np.arange(ntr, n), dev, H); ae = torch.tensor(dA[ntr:]).to(dev)
         Pe = P[ntr:]; Ce = np.full(ne, 2, np.int64); hid = np.where(CT[ntr:].any(1))[0]
         print(f"éval : {ne} séquences dont {len(hid)} avec contact", flush=True)
         for st in range(a.steps):
             bi = np.random.randint(0, ntr, a.bs)
-            x = to_batch(X, bi, dev); acts = torch.tensor(dA[bi]).to(dev)
+            x = to_batch(X, bi, dev, H); acts = torch.tensor(dA[bi]).to(dev)
             (m0, r0), (m1, r1), outs = m.rollout(x[:, 0], x[:, 1], acts[:, 1:])
             w01 = motion_w(x[:, 1], x[:, 0], a.wmotion)                    # ce qui bouge pèse plus
             loss = wmix(x[:, 0], r0, m0[:, :, 0], w01, a.sig) + wmix(x[:, 1], r1, m1[:, :, 0], w01, a.sig)
@@ -131,7 +137,7 @@ def main():
         try:                                                               #  a tout appris aux runs 3-12)
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
             ids = np.unique(np.clip(np.array([ntr, ntr + 5, ntr + 11]), 0, n - 1))
-            xv = to_batch(X, ids, dev)
+            xv = to_batch(X, ids, dev, H)
             with torch.no_grad():
                 mk, rgb, _ = m.peel(m.feats(xv[:, 0]))
             fig, ax = plt.subplots(len(ids), a.K + 2, figsize=(2 * (a.K + 2), 2.2 * len(ids)))
@@ -152,7 +158,7 @@ def main():
     try:
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         hid_all = np.where(CT.any(1))[0]; ids = list(hid_all[hid_all >= ntr][:3]) + [n - 1]
-        xv = to_batch(X, np.array(ids), dev); av = torch.tensor(dA[np.array(ids)]).to(dev)
+        xv = to_batch(X, np.array(ids), dev, H); av = torch.tensor(dA[np.array(ids)]).to(dev)
         with torch.no_grad():
             _, _, outs = m.rollout(xv[:, 0], xv[:, 1], av[:, 1:])
         ncol = 2 + 2 * HOR
