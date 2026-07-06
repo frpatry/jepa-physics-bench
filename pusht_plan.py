@@ -373,6 +373,7 @@ def main():
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     p.add_argument("--diag", type=int, default=0)
+    p.add_argument("--readout", type=str, default="")                      # ckpt du peintre de lecture ('auto' = défaut)
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = a.ckpt or default_path("pusht_wm.pt")
@@ -381,6 +382,15 @@ def main():
            dec_w=sa["dec_w"], iters=sa["iters"]).to(dev)
     m.load_state_dict(ck["model"]); m.eval()
     print(f"modèle chargé <- {ckpt} (hin {sa['hin']}, slot_dim {sa['slot_dim']})", flush=True)
+    if a.readout:
+        from pusht_readout import ReadOut
+        rop = default_path("pusht_ro.pt") if a.readout == "auto" else a.readout
+        rck = torch.load(rop, map_location=dev)
+        ro = ReadOut(sa["hin"], sa["D"], rck["args"]["w"]).to(dev)
+        ro.load_state_dict(rck["model"]); ro.eval()
+        m.imagine = ro.imagine                                             # le planner décode via le
+        print(f"peintre de lecture branché <- {rop}", flush=True)          # peintre RICHE (représentation
+                                                                           # gelée inchangée)
     scratch = make_env(); scratch.reset(seed=0)
     if a.diag:
         diag(m, sa["hin"], dev, scratch)
