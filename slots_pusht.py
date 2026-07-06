@@ -139,6 +139,22 @@ def main():
                       f"  |  AVEC CONTACT : {cont}", flush=True)
         torch.save({"model": m.state_dict(), "args": vars(a)}, ckpt)
         print(f"modèle sauvegardé -> {ckpt}", flush=True)
+    if a.diag:                                                             # où se perd l'erreur ?
+        with torch.no_grad():                                              # peel(t1) vs imagine(S1) = MÊMES slots,
+            xe2 = to_batch(X, np.arange(ntr, n), dev, H)                   # décodage différent ; vs imagine(Ŝ2)
+            ae2 = torch.tensor(dA[ntr:]).to(dev); Pe2 = P[ntr:]            # = +1 pas de dynamique
+            Ce2 = np.full(n - ntr, 2, np.int64)
+            _, _, S0 = m.peel(m.feats(xe2[:, 0]))
+            mk1, _, S1 = m.peel(m.feats(xe2[:, 1]), init=S0)
+            e_peel = match_error(mk1[:, :, 0], Pe2[:, 1], H, Ce2)
+            mi1, _ = m.imagine(S1)
+            e_idec = match_error(mi1[:, :, 0], Pe2[:, 1], H, Ce2)
+            nxt = m.step_a(S1, S0, ae2[:, 1])
+            mi2, _ = m.imagine(nxt)
+            e_dyn = match_error(mi2[:, :, 0], Pe2[:, 2], H, Ce2)
+        print(f"\n=== DIAG PIPELINE : peel(t1) {e_peel:.3f}  |  imagine(S1, mêmes slots) {e_idec:.3f}"
+              f"  |  imagine(Ŝ2, +1 pas de dynamique) {e_dyn:.3f}", flush=True)
+        print("    si imagine(S1) >> peel(t1) : le déficit est le DÉCODAGE de l'imagination, pas g", flush=True)
     if a.diag:                                                             # QUI capture QUOI ? (la figure qui
         try:                                                               #  a tout appris aux runs 3-12)
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
