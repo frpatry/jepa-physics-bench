@@ -86,7 +86,21 @@ def cem_pose(dyn, blk0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax=0.5, d
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.05)
     return mu.clamp(-amax, amax)
 
-def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None):
+def calib_offset(X, BP, ns=400):
+    """Décalage CONSTANT (repère du bloc) entre centroïde visuel et référence BP (pose pymunk).
+    Mesuré ~(0,41)px, écart-type ~2.5 -> le convertir permet à la perception de viser la même
+    référence que la dynamique et le but."""
+    loc = []
+    n, T = X.shape[0], X.shape[1]
+    for i in range(min(ns, n)):
+        for t in range(T):
+            p = pose_from_image(X[i, t])
+            if p is None: continue
+            dx = p[0] - BP[i, t, 0]; dy = p[1] - BP[i, t, 1]; th = BP[i, t, 2]
+            loc.append([dx * np.cos(-th) - dy * np.sin(-th), dx * np.sin(-th) + dy * np.cos(-th)])
+    return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
+
+def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2)):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -96,7 +110,11 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None):
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
             if pose is None: bp = np.array([*info["block_pose"]], np.float32)  # secours si masque perdu
-            else: bp = np.array([pose[0], pose[1], pose[2]], np.float32)
+            else:
+                th = pose[2]; ox, oy = offset                            # centroïde -> référence BP (calibré)
+                bx = pose[0] - (ox * np.cos(th) - oy * np.sin(th))
+                by = pose[1] - (ox * np.sin(th) + oy * np.cos(th))
+                bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
             plan = cem_pose(dyn, blk, agn, gblk, Hp=plan_h, dev=dev, mu0=mu)
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
@@ -139,8 +157,9 @@ def main():
         pr.append(p[2]); tr.append(BP[i, 0, 2])
     pr, tr = np.array(pr), np.array(tr); off = np.angle(np.mean(np.exp(1j * (pr - tr))))
     eang = np.degrees(np.abs(np.angle(np.exp(1j * (pr - tr - off)))))
+    offset = calib_offset(X, BP)
     print(f"device={dev}  PERCEPTION géométrique : agent {np.mean(ea):.1f}px  bloc {np.mean(eb):.1f}px"
-          f"  angle méd {np.median(eang):.0f}°  (échec masque {100*(1-len(eb)/min(200,n)):.0f}%)", flush=True)
+          f"  angle méd {np.median(eang):.0f}°  |  décalage calibré ({offset[0]:.0f},{offset[1]:.0f})px", flush=True)
     # BRIQUE 2 : entraîner la dynamique sur les vraies poses (perception validée ≈ vérité)
     blk, ag = to_state(BP, AG)                                            # (n,T,4),(n,T,2)
     dA = np.clip((A - AG[:, :-1]) / 512.0, -1, 1).astype(np.float32)      # action normalisée
@@ -168,7 +187,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, plan_h=a.plan_h, scratch=scratch)
+                cov = run_episode(dyn, 3000 + k, dev, q, plan_h=a.plan_h, scratch=scratch, offset=offset)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nCOVERAGE MAX MOYENNE : " + "  |  ".join(
