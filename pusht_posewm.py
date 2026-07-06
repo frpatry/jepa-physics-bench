@@ -45,21 +45,22 @@ def pose_from_image(img, S=512):
 
 # ---------- BRIQUE 2 : dynamique apprise sur les poses ----------
 class PoseDyn(nn.Module):
-    """LEVIER 3 : GÉOMÉTRIE RELATIVE. Pousser un T est le même problème quelle que soit son
-    orientation — seule compte la position de l'agent DANS LE REPÈRE DU BLOC. On ajoute donc en
-    entrée l'agent et l'action vus depuis ce repère (tournés de −θ) : le contact devient facile à
-    apprendre (plus besoin de le réapprendre pour chaque angle)."""
+    """LEVIER 3 : géométrie RELATIVE (agent vu depuis le repère du bloc — le contact devient le même
+    quel que soit l'angle) + LEVIER 3b : VITESSE (2 poses en entrée). Le bloc a de l'élan : sans sa
+    vitesse, impossible de distinguer 'à l'arrêt' de 'glisse encore'. On passe donc la pose courante
+    ET la précédente ; leur différence (en repère bloc) = la vitesse."""
     def __init__(s, hid=256):
         super().__init__()
-        s.net = nn.Sequential(nn.Linear(12, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU(),
+        s.net = nn.Sequential(nn.Linear(14, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU(),
                               nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 6))
-    def forward(s, blk, ag, act):                                        # blk:(B,4) ag:(B,2) act:(B,2)
+    def forward(s, blk, blkp, ag, act):                                  # blk,blkp:(B,4) ag,act:(B,2)
         bx, by, si, co = blk[:, 0:1], blk[:, 1:2], blk[:, 2:3], blk[:, 3:4]
-        rx = ag[:, 0:1] - bx; ry = ag[:, 1:2] - by
-        rel = torch.cat([rx * co + ry * si, -rx * si + ry * co], -1)       # agent dans le repère du bloc
-        actl = torch.cat([act[:, 0:1] * co + act[:, 1:2] * si,
-                          -act[:, 0:1] * si + act[:, 1:2] * co], -1)        # action dans le repère du bloc
-        d = s.net(torch.cat([blk, ag, act, rel, actl], -1))
+        def to_local(vx, vy): return torch.cat([vx * co + vy * si, -vx * si + vy * co], -1)
+        rel = to_local(ag[:, 0:1] - bx, ag[:, 1:2] - by)                  # agent dans le repère du bloc
+        actl = to_local(act[:, 0:1], act[:, 1:2])                         # action dans le repère du bloc
+        vloc = to_local(blk[:, 0:1] - blkp[:, 0:1], blk[:, 1:2] - blkp[:, 1:2])  # vitesse pos (repère bloc)
+        dang = torch.cat([si - blkp[:, 2:3], co - blkp[:, 3:4]], -1)       # vitesse angulaire (Δsin,Δcos)
+        d = s.net(torch.cat([blk, act, rel, actl, vloc, dang], -1))
         nb = blk + d[:, :4]
         nb = torch.cat([nb[:, :2], nb[:, 2:4] / (nb[:, 2:4].norm(dim=-1, keepdim=True) + 1e-8)], -1)
         return nb, ag + d[:, 4:6]
@@ -75,18 +76,18 @@ def pose_cost(blk, gblk, w_ang=0.3):
     ang = (blk[:, 2:4] - gblk[2:4]).norm(dim=-1)                          # distance (sinθ,cosθ)
     return pos + w_ang * ang
 
-def cem_pose(dyn, blk0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax=0.5, dev="cpu", mu0=None):
+def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax=0.5, dev="cpu", mu0=None):
     with torch.no_grad():
-        blk = blk0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
+        blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.25, device=dev)
         for _ in range(iters):
             eps = torch.randn(pop, Hp, 2, device=dev)
             eps[: pop // 2] = torch.randn(pop // 2, 1, 2, device=dev)      # bruit corrélé (iCEM)
             A = (mu + sg * eps).clamp(-amax, amax)
-            b, a, cost = blk, ag, 0.
+            b, bp, a, cost = blk, blkp, ag, 0.
             for h in range(Hp):
-                b, a = dyn(b, a, A[:, h])
+                nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
                 if h >= Hp - 2:
                     cost = cost + pose_cost(b, gblk)
                     cost = cost + 0.2 * (a - b[:, :2]).norm(dim=-1)        # approche (agent près du bloc)
@@ -113,7 +114,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
     gblk = torch.tensor(np.concatenate([gp[:2] / 512, [np.sin(gp[2]), np.cos(gp[2])]]), dtype=torch.float32, device=dev)
-    ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; mu_np = None
+    ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; blk_prev = None
     for _ in range(max_steps):
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
@@ -124,14 +125,14 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 by = pose[1] - (ox * np.sin(th) + oy * np.cos(th))
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
-            plan = cem_pose(dyn, blk, agn, gblk, Hp=plan_h, dev=dev, mu0=mu)
+            if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
+            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu)
+            blk_prev = blk
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
-        elif policy == "oracle":
-            if mu_np is not None and len(mu_np): d0 = mu_np[0]; mu_np = None
-            else:
-                st = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
-                pl = oracle_plan(scratch, st, gp, rng, Hp=plan_h, pop=32, iters=2); d0 = pl[0]; mu_np = pl[1:2]
+        elif policy == "oracle":                                         # ORACLE correct : replanifie chaque pas
+            st = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
+            pl = oracle_plan(scratch, st, gp, rng, Hp=5, pop=40, iters=2); d0 = pl[0]
             act = np.clip(ag + d0 * 256.0, 0, 512).astype(np.float32)
         else:
             th = rng.uniform(0, 2 * np.pi); act = np.clip(ag + rng.uniform(0.2, 1.0) * 256 *
@@ -176,17 +177,16 @@ def main():
     ne = min(300, max(1, n // 10)); ntr = n - ne
     print("--- dynamique (pose,action)->pose ---", flush=True)
     for st in range(a.steps):
-        bi = np.random.randint(0, ntr, a.bs); ti = np.random.randint(0, T - 1, a.bs)
-        b0 = blk[bi, ti]; a0 = ag[bi, ti]; ac = act[bi, ti]
-        nb, na = dyn(b0, a0, ac)
+        bi = np.random.randint(0, ntr, a.bs); ti = np.random.randint(1, T - 1, a.bs)  # t-1 et t+1 existent
+        nb, na = dyn(blk[bi, ti], blk[bi, ti - 1], ag[bi, ti], act[bi, ti])
         loss = ((nb - blk[bi, ti + 1]) ** 2).sum(-1).mean() + ((na - ag[bi, ti + 1]) ** 2).sum(-1).mean()
         opt.zero_grad(); loss.backward(); opt.step()
         if st % 1000 == 0:
             with torch.no_grad():
-                bv, tv = blk[ntr:], ag[ntr:]
-                nb, _ = dyn(bv[:, 0], tv[:, 0], act[ntr:, 0])
-                ep = (nb[:, :2] - bv[:, 1, :2]).norm(dim=-1).mean().item() * 512
-                ec = (bv[:, 0, :2] - bv[:, 1, :2]).norm(dim=-1).mean().item() * 512   # copie (bloc statique)
+                bv = blk[ntr:]
+                nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])   # t=1 (prev=0) -> prédit t=2
+                ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
+                ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512   # copie (bloc statique)
             print(f"  step {st:5d}  bloc t+1 : imaginé {ep:.1f}px  vs copie {ec:.1f}px", flush=True)
     # BRIQUE 3 : planification
     if a.tasks > 0:
@@ -198,8 +198,19 @@ def main():
                 cov = run_episode(dyn, 3000 + k, dev, q, plan_h=a.plan_h, scratch=scratch, offset=offset)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
-        print("\nCOVERAGE MAX MOYENNE : " + "  |  ".join(
-            f"{q} {np.mean(sc[q]):.2f} (succès>0.95 {sum(v>0.95 for v in sc[q])}/{a.tasks})" for q in pols), flush=True)
+        print("\nTOUTES tâches : " + "  |  ".join(
+            f"{q} {np.mean(sc[q]):.2f} (succès {sum(v>0.95 for v in sc[q])}/{a.tasks})" for q in pols), flush=True)
+        # ÉVAL JUSTE : seulement les tâches FAISABLES (celles où l'oracle atteint >0.5)
+        if "oracle" in sc and "mpc" in sc:
+            feas = [k for k in range(a.tasks) if sc["oracle"][k] > 0.5]
+            if feas:
+                mo = np.mean([sc["mpc"][k] for k in feas]); oo = np.mean([sc["oracle"][k] for k in feas])
+                rr = np.mean([sc["random"][k] for k in feas]) if "random" in sc else 0
+                print(f"FAISABLES (oracle>0.5, {len(feas)}/{a.tasks} tâches) : "
+                      f"MPC {mo:.2f}  |  oracle {oo:.2f}  |  aléatoire {rr:.2f}"
+                      f"   [MPC/oracle = {100*mo/oo:.0f}% du plafond]", flush=True)
+            else:
+                print("FAISABLES : aucune tâche où l'oracle dépasse 0.5 (oracle trop faible ou tâches dures)", flush=True)
         scratch.close()
 
 if __name__ == "__main__":
