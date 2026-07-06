@@ -222,6 +222,52 @@ def diag(m, hin, dev, scratch, seed=3000):
     plt.tight_layout(); plt.savefig(out); print(f"diag -> {out}", flush=True)
     env.close()
 
+def diag_plans(m, hin, dev, scratch, seed=3000):
+    """DIAG D pusht : 3 plans connus (pousser VERS le but / À L'ENVERS / S'ÉLOIGNER), notés par
+    le coût imaginé ET par le vrai simulateur. Si le coût ne classe pas 'vers' devant les autres,
+    l'imagination ne crédite pas les poussées dans l'espace couleur-canvas."""
+    env = make_env(); obs, info = env.reset(seed=seed)
+    gp = np.array(info["goal_pose"], np.float32)
+    bp = np.array(info["block_pose"], np.float32)
+    u = (gp[:2] - bp[:2]) / (np.linalg.norm(gp[:2] - bp[:2]) + 1e-8)
+    # téléporter l'agent au point de poussée (derrière le bloc par rapport au but)
+    pa = np.clip(bp[:2] - u * 60.0, 15, 497)
+    obs, info = reset_faithful(env, np.array([pa[0], pa[1], bp[0], bp[1], bp[2]], np.float32))
+    ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+    obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
+    # but (image -> stats)
+    far = np.array([40.0, 40.0], np.float32)
+    gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
+    cg, Cg = mask_stats(soft_color_w(to64(gob["pixels"], hin, dev), "gris")); cg, Cg = cg[0], Cg[0]
+    Hp = 8
+    plans = {"vers": np.repeat((u * 0.3)[None], Hp, 0).astype(np.float32),
+             "envers": np.repeat((-u * 0.3)[None], Hp, 0).astype(np.float32),
+             "s_eloigner": np.repeat((np.array([-u[1], u[0]]) * 0.5)[None], Hp, 0).astype(np.float32)}
+    x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
+    with torch.no_grad():
+        _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+    st0 = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
+    for nom, A_ in plans.items():
+        with torch.no_grad():
+            prev, cur = S0, S1
+            gs = []
+            for h in range(Hp):
+                nxt = m.step_a(cur, prev, torch.tensor(A_[h:h + 1]).to(dev)); prev, cur = cur, nxt
+                if h >= Hp - 2:
+                    mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
+                    cT, CT_ = mask_stats(soft_color_w(canvas, "gris"))
+                    gs.append(float(pose_cost(cT, CT_, cg, Cg)[0]))
+        o2, i2 = reset_faithful(scratch, st0)
+        a2 = np.array(o2["agent_pos"], np.float32)
+        for h in range(Hp):
+            o2, _, te, tr, i2 = scratch.step(np.clip(a2 + A_[h] * 256.0, 0, 512).astype(np.float32))
+            a2 = np.array(o2["agent_pos"], np.float32)
+            if te or tr: break
+        bp2 = np.array(i2["block_pose"], np.float32)
+        print(f"  {nom:11s} coût imaginé {np.mean(gs):.3f}  |  vraie dist bloc-but {np.linalg.norm(bp2[:2]-gp[:2])/512.:.3f}"
+              f"  (départ {np.linalg.norm(bp[:2]-gp[:2])/512.:.3f})", flush=True)
+    env.close()
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=""); p.add_argument("--tasks", type=int, default=10)
@@ -239,7 +285,9 @@ def main():
     print(f"modèle chargé <- {ckpt} (hin {sa['hin']}, slot_dim {sa['slot_dim']})", flush=True)
     scratch = make_env(); scratch.reset(seed=0)
     if a.diag:
-        diag(m, sa["hin"], dev, scratch); scratch.close(); return
+        diag(m, sa["hin"], dev, scratch)
+        if a.diag >= 2: diag_plans(m, sa["hin"], dev, scratch)
+        scratch.close(); return
     pols = a.policies.split(",")
     scores = {q: [] for q in pols}; covs = {q: [] for q in pols}
     for k in range(a.tasks):
