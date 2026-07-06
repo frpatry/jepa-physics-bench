@@ -39,6 +39,25 @@ class PushTModel(ActModel):
         out = s.dec(x.permute(0, 3, 1, 2))
         return out[:, :3], out[:, 3:4]
 
+class WM(ActModel):
+    """imagine() SÉQUENTIEL. Verdict DIAG PIPELINE (run 6) : sur les MÊMES slots, peel 0.136 vs
+    imagine 0.211 — le déficit d'imagination de TOUS les runs Push-T était le compositing
+    (softmax contre un logit de fond scalaire = famille faible, masques qui bavent), pas g
+    (0.211 -> 0.209 avec un pas de dynamique : g ≈ innocent). Fix : le même explaining-away
+    que le peel — chaque slot réclame σ(alpha), le reste passe au suivant, reliquat = fond
+    const. Zéro paramètre nouveau (checkpoint rechargeable tel quel, resume recalibre)."""
+    def imagine(s, S):
+        B, Km1, _ = S.shape; H = s.H
+        rgb, alog = s.decode_one(s.down(S).reshape(B * Km1, s.slot_dim))
+        rgb = rgb.reshape(B, Km1, 3, H, H); alog = alog.reshape(B, Km1, 1, H, H)
+        scope = torch.ones(B, 1, H, H, device=S.device)
+        masks, rgbs = [], []
+        for j in range(Km1):
+            mj = torch.sigmoid(alog[:, j])
+            masks.append(scope * mj); rgbs.append(rgb[:, j]); scope = scope * (1 - mj)
+        masks.append(scope); rgbs.append(s.bg.expand(B, 3, H, H))
+        return torch.stack(masks, 1), torch.stack(rgbs, 1)
+
 def default_path(name):
     if os.path.isdir("/content/drive/MyDrive"): return f"/content/drive/MyDrive/{name}"
     if os.path.isdir("/content"): return f"/content/{name}"
@@ -94,12 +113,16 @@ def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     data = a.data or default_path("pusht_data.npz"); ckpt = a.ckpt or default_path("pusht_wm.pt")
+    if (a.load or a.resume) and os.path.exists(ckpt):                     # auto-config : l'architecture
+        sa_ = torch.load(ckpt, map_location="cpu").get("args", {})        # vient du checkpoint
+        for k_ in ["K", "D", "slot_dim", "dec_w", "iters", "hin"]:
+            if k_ in sa_: setattr(a, k_, sa_[k_])
     X, dA, P, CT = load_data(data)
     n, T = X.shape[0], X.shape[1]; H = a.hin; HOR = T - 2
     ne = min(a.n_eval, n // 10); ntr = n - ne                              # éval = dernières séquences
     print(f"device={dev}  {n} séquences de {T} frames (entrée {H}x{H}, source {X.shape[2]})"
           f"  K={a.K}  sig={a.sig}  train {ntr} / éval {ne}", flush=True)
-    m = ActModel(H, a.K, a.D, res=H // 2, slot_dim=a.slot_dim, dec_w=a.dec_w, iters=a.iters).to(dev)
+    m = WM(H, a.K, a.D, res=H // 2, slot_dim=a.slot_dim, dec_w=a.dec_w, iters=a.iters).to(dev)
     if a.load:
         m.load_state_dict(torch.load(ckpt, map_location=dev)["model"]); m.eval()
         print(f"modèle chargé <- {ckpt}", flush=True)
