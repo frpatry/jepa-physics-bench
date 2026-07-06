@@ -27,6 +27,15 @@ def to64(img, hin, dev):
     x = torch.tensor(img).to(dev).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
     return F.interpolate(x, size=hin, mode="area")
 
+def reset_faithful(env, state):
+    """reset_to_state place le bloc avec un décalage dépendant de l'angle (référence de pose
+    différente entre l'API et info['block_pose'] — mesuré ~20-50px). Calibration par DOUBLE
+    reset : on mesure l'erreur du premier, on compense au second. Exact, sans constante magique."""
+    obs, info = env.reset(options={"reset_to_state": state.copy()})
+    err = np.array(info["block_pose"], np.float32)[:2] - state[2:4]
+    fixed = state.copy(); fixed[2:4] = state[2:4] - err
+    return env.reset(options={"reset_to_state": fixed})
+
 def gray_mask(img64):
     """Pixels du bloc T dans une image (1,3,H,W) : gris = canaux proches, luminance moyenne.
     Prétraitement de la SPÉCIFICATION du but (l'image but est donnée), pas de la perception."""
@@ -88,7 +97,9 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev=
                     cT, CT_ = mask_stats(mm[:, jT, 0])
                     cA, _ = mask_stats(mm[:, jA, 0])
                     cost = cost + pose_cost(cT, CT_, cg, Cg)
-                    cost = cost + 0.3 * (cA - cT).norm(dim=-1)             # approche
+                    cost = cost + 0.15 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
+                    # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
+                    # le bloc HORS de la cible est rentable quand il démarre dessus (toy v2 bis)
             el = A[cost.argsort()[:elite]]
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.08)       # plancher de bruit (iCEM)
     return mu.clamp(-amax, amax)
@@ -102,7 +113,7 @@ def oracle_plan(scratch, state, gp, rng, Hp=8, pop=48, iters=3, elite=8, amax=0.
         A = np.clip(mu + sg * eps, -amax, amax)
         cost = np.zeros(pop, np.float32)
         for i in range(pop):
-            obs, info = scratch.reset(options={"reset_to_state": state.copy()})
+            obs, info = reset_faithful(scratch, state)
             ag = np.array(obs["agent_pos"], np.float32)
             for h in range(Hp):
                 obs, _, term, trunc, info = scratch.step(np.clip(ag + A[i, h] * 256.0, 0, 512).astype(np.float32))
@@ -110,7 +121,8 @@ def oracle_plan(scratch, state, gp, rng, Hp=8, pop=48, iters=3, elite=8, amax=0.
                 if term or trunc: break
             bp = np.array(info["block_pose"], np.float32)
             dang = abs((bp[2] - gp[2] + np.pi) % (2 * np.pi) - np.pi)
-            cost[i] = np.linalg.norm(bp[:2] - gp[:2]) / 512.0 + 0.10 * dang + 0.3 * np.linalg.norm(ag - bp[:2]) / 512.0
+            cost[i] = (np.linalg.norm(bp[:2] - gp[:2]) / 512.0 + 0.10 * dang
+                       + 0.10 * max(np.linalg.norm(ag - bp[:2]) / 512.0 - 0.10, 0.0))  # approche saturante
         el = A[np.argsort(cost)[:elite]]
         mu = el.mean(0); sg = np.maximum(el.std(0) + 1e-4, 0.08)
     return np.clip(mu, -amax, amax)
@@ -122,7 +134,7 @@ def run_episode(m, hin, seed, dev, policy, max_steps=25, plan_h=8, pop=192, iter
     gp = np.array(info["goal_pose"], np.float32)
     # image BUT : le T posé sur la cible, agent parqué loin (via un env scratch)
     far = np.array([40.0, 40.0], np.float32) if np.linalg.norm(gp[:2] - 40) > 120 else np.array([470.0, 470.0], np.float32)
-    gob, _ = scratch.reset(options={"reset_to_state": np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32)})
+    gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
     g64 = to64(gob["pixels"], hin, dev)
     gm = gray_mask(g64)
     cg, Cg = mask_stats(gm.unsqueeze(0)); cg, Cg = cg[0], Cg[0]
