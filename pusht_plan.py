@@ -36,15 +36,21 @@ def reset_faithful(env, state):
     fixed = state.copy(); fixed[2:4] = state[2:4] - err
     return env.reset(options={"reset_to_state": fixed})
 
-def soft_color_w(img, ref, tau=0.08):
-    """Carte de poids par similarité de couleur DOUCE (robuste au flou du canvas imaginé et à
-    l'anti-aliasing) : w = exp(-||img-ref||²/2τ²). img (B,3,H,W) -> (B,H,W). Lecture du canvas
-    décodé (l'espace certifié) par couleur — aucune dépendance à l'identité des slots (plan B :
-    la décomposition est grossière, T+agent fusionnés dans une prise)."""
-    d2 = ((img - ref.to(img.device).reshape(1, 3, 1, 1)) ** 2).sum(1)
-    w = torch.exp(-d2 / (2 * tau * tau))
-    w[..., :2, :] = 0; w[..., -2:, :] = 0; w[..., :, :2] = 0; w[..., :, -2:] = 0
-    return w
+BLANC = torch.tensor([0.97, 0.97, 0.97]); VERT = torch.tensor([0.70, 0.90, 0.70])
+
+def soft_color_w(img, ref, tau=0.15):
+    """Assignation COMPÉTITIVE : chaque pixel du canvas est réparti par softmax entre les 4
+    couleurs de la scène (blanc/gris/bleu/vert) — un pixel mi-bleu mi-gris va au plus proche,
+    les cartes gris et bleu ne peuvent plus co-brûler sur le même mélange (leçon diag : avec
+    des similarités indépendantes, le flou faisait cT≈cA -> coût dégénéré). Lecture du canvas
+    décodé, aucune dépendance à l'identité des slots."""
+    refs = torch.stack([BLANC, GRIS, BLEU, VERT]).to(img.device)           # (4,3)
+    d2 = ((img.unsqueeze(1) - refs.reshape(1, 4, 3, 1, 1)) ** 2).sum(2)    # (B,4,H,W)
+    w = torch.softmax(-d2 / (2 * tau * tau), dim=1)
+    idx = {"blanc": 0, "gris": 1, "bleu": 2, "vert": 3}[ref]
+    out = w[:, idx] * (1.0 - w[:, 0])                                      # atténuer ce qui est surtout blanc
+    out[..., :2, :] = 0; out[..., -2:, :] = 0; out[..., :, :2] = 0; out[..., :, -2:] = 0
+    return out
 
 def gray_mask(img64):
     """Pixels du bloc T dans une image (1,3,H,W) : gris = canaux proches, luminance moyenne.
@@ -105,8 +111,8 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev=
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur)                                # décodage POST-g (calibré)
                     canvas = (rr * mm).sum(1)                              # (pop,3,H,W) : le canvas imaginé
-                    cT, CT_ = mask_stats(soft_color_w(canvas, GRIS))       # le T = pixels gris du canvas
-                    cA, _ = mask_stats(soft_color_w(canvas, BLEU))         # l'agent = pixels bleus
+                    cT, CT_ = mask_stats(soft_color_w(canvas, "gris"))       # le T = pixels gris du canvas
+                    cA, _ = mask_stats(soft_color_w(canvas, "bleu"))         # l'agent = pixels bleus
                     cost = cost + pose_cost(cT, CT_, cg, Cg)
                     cost = cost + 0.15 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
                     # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
@@ -147,7 +153,7 @@ def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, ite
     far = np.array([40.0, 40.0], np.float32) if np.linalg.norm(gp[:2] - 40) > 120 else np.array([470.0, 470.0], np.float32)
     gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
     g64 = to64(gob["pixels"], hin, dev)
-    cg, Cg = mask_stats(soft_color_w(g64, GRIS)); cg, Cg = cg[0], Cg[0]
+    cg, Cg = mask_stats(soft_color_w(g64, "gris")); cg, Cg = cg[0], Cg[0]
     # 2 frames de contexte (un pas immobile)
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy())
@@ -187,7 +193,7 @@ def diag(m, hin, dev, scratch, seed=3000):
     far = np.array([40.0, 40.0], np.float32)
     gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
     g64 = to64(gob["pixels"], hin, dev)
-    cg, _ = mask_stats(soft_color_w(g64, GRIS))
+    cg, _ = mask_stats(soft_color_w(g64, "gris"))
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]
     x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
@@ -206,11 +212,11 @@ def diag(m, hin, dev, scratch, seed=3000):
         mi_m, mi_r = m.imagine(cur); canvas = (mi_r * mi_m).sum(1)
     fig, ax = plt.subplots(1, 6, figsize=(18, 3))
     ax[0].imshow(g64[0].permute(1, 2, 0).cpu()); ax[0].set_title("image BUT")
-    ax[1].imshow(soft_color_w(g64, GRIS)[0].cpu()); ax[1].set_title("poids gris (cible)")
+    ax[1].imshow(soft_color_w(g64, "gris")[0].cpu()); ax[1].set_title("poids gris (cible)")
     ax[2].imshow(x1[0].permute(1, 2, 0).cpu()); ax[2].set_title("frame courante")
     ax[3].imshow(canvas[0].permute(1, 2, 0).cpu().clip(0, 1)); ax[3].set_title("canvas imaginé (+2)")
-    ax[4].imshow(soft_color_w(canvas, GRIS)[0].cpu()); ax[4].set_title("poids gris (canvas)")
-    ax[5].imshow(soft_color_w(canvas, BLEU)[0].cpu()); ax[5].set_title("poids bleu (canvas)")
+    ax[4].imshow(soft_color_w(canvas, "gris")[0].cpu()); ax[4].set_title("poids gris (canvas)")
+    ax[5].imshow(soft_color_w(canvas, "bleu")[0].cpu()); ax[5].set_title("poids bleu (canvas)")
     for a_ in ax: a_.axis("off")
     out = "/content/pusht_plan_diag.png" if os.path.isdir("/content") else "pusht_plan_diag.png"
     plt.tight_layout(); plt.savefig(out); print(f"diag -> {out}", flush=True)
