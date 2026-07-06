@@ -41,6 +41,43 @@ def perceive(m, img):
         scope = scope * a[:, 1]
     return torch.stack(S, 1)                                              # (B,K-1,D)
 
+class SharpModel(Model):
+    """ROUTE B — fix 1 : CRAYON À VOCABULAIRE RICHE. Le décodeur reçoit une position FOURIER
+    (sin/cos de plusieurs fréquences) au lieu de (x,y) linéaire, pour POUVOIR calculer 'suis-je
+    sur une branche du T ?'. Reste POINTWISE (convs 1×1) -> toujours trop faible pour cramer
+    plusieurs objets dans un slot -> l'émergence (peel) survit."""
+    def __init__(s, H, K, D=64, res=24, slot_dim=12, dec_w=48, iters=3, freqs=(1, 2, 4, 8, 16)):
+        super().__init__(H, K, D, res=res, slot_dim=slot_dim, dec="sbd", dec_w=dec_w,
+                         iters=iters, init="learned", mode="peel", bg="const")
+        r = torch.linspace(0, 1, H)
+        gy = r.reshape(H, 1).expand(H, H); gx = r.reshape(1, H).expand(H, H)
+        feats = []
+        for k in freqs:
+            feats += [torch.sin(2 * math.pi * k * gx), torch.cos(2 * math.pi * k * gx),
+                      torch.sin(2 * math.pi * k * gy), torch.cos(2 * math.pi * k * gy)]
+        s.register_buffer("fpos", torch.stack(feats, 0))                  # (F,H,H) fixe
+        Fn = s.fpos.size(0)
+        s.dec = nn.Sequential(nn.Conv2d(slot_dim + Fn, dec_w, 1), nn.ReLU(),
+                              nn.Conv2d(dec_w, dec_w, 1), nn.ReLU(), nn.Conv2d(dec_w, 4, 1))
+    def decode_one(s, sl, H):
+        B = sl.size(0)
+        xb = sl.reshape(B, s.slot_dim, 1, 1).expand(-1, -1, H, H)
+        x = torch.cat([xb, s.fpos.unsqueeze(0).expand(B, -1, -1, -1)], 1)
+        out = s.dec(x)
+        return out[:, :3], out[:, 3:4]
+
+def edge_loss(recon, true):
+    """ROUTE B — fix 2 : LA NOTE EXIGE LES CONTOURS. On compare les BORDS (gradients) du rendu et
+    du vrai : une boule floue a des bords mous -> forte pénalité. Force le rendu à reproduire la
+    forme franche (donc le slot à STOCKER la forme fine, donc l'orientation)."""
+    def grad(z):
+        gx = (z[..., 1:, :] - z[..., :-1, :]).abs().sum(1)
+        gy = (z[..., :, 1:] - z[..., :, :-1]).abs().sum(1)
+        g = torch.zeros(z.size(0), z.size(2), z.size(3), device=z.device)
+        g[:, :-1, :] = g[:, :-1, :] + gx; g[:, :, :-1] = g[:, :, :-1] + gy
+        return g
+    return (grad(recon) - grad(true)).abs().mean()
+
 def gen_oriented(n, H, seed=0, shape="T", scale=0.16):
     """UNE forme par image, fond noir, position + couleur + angle au hasard.
     T : crossbar (haut) + tige (bas), orientation nette. cercle : témoin (angle ignoré)."""
@@ -84,6 +121,8 @@ def get_args():
     p.add_argument("--iters", type=int, default=3); p.add_argument("--sig", type=float, default=0.06)
     p.add_argument("--steps", type=int, default=12000); p.add_argument("--probe_steps", type=int, default=4000)
     p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=4e-4)
+    p.add_argument("--pos", choices=["linear", "fourier"], default="linear")  # crayon : vocabulaire de position
+    p.add_argument("--edge", type=float, default=0.0)                     # note : poids de la perte sur les contours
     p.add_argument("--seed", type=int, default=0)
     return p.parse_args()
 
@@ -92,9 +131,13 @@ def main():
     torch.manual_seed(a.seed); np.random.seed(a.seed)
     X, P, A = gen_oriented(a.n, a.H, shape=a.shape)
     Xt = torch.tensor(X.transpose(0, 3, 1, 2))
-    print(f"device={dev}  forme={a.shape}  H={a.H} (grille {a.H//2})  K={a.K}  sig={a.sig}  {a.n} images", flush=True)
-    m = Model(a.H, a.K, a.D, res=a.H // 2, slot_dim=a.slot_dim, dec="sbd", dec_w=a.dec_w,
-              iters=a.iters, init="learned", mode="peel", bg="const").to(dev)
+    print(f"device={dev}  forme={a.shape}  H={a.H}  K={a.K}  sig={a.sig}  pos={a.pos}  edge={a.edge}"
+          f"  {a.n} images", flush=True)
+    if a.pos == "fourier":
+        m = SharpModel(a.H, a.K, a.D, res=a.H // 2, slot_dim=a.slot_dim, dec_w=a.dec_w, iters=a.iters).to(dev)
+    else:
+        m = Model(a.H, a.K, a.D, res=a.H // 2, slot_dim=a.slot_dim, dec="sbd", dec_w=a.dec_w,
+                  iters=a.iters, init="learned", mode="peel", bg="const").to(dev)
     opt = torch.optim.Adam(m.parameters(), a.lr)
     warm = max(1, a.steps // 20)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
@@ -105,6 +148,7 @@ def main():
         bi = np.random.randint(0, a.n, a.bs); img = Xt[bi].to(dev)
         recon, masks, _, rgbs = m(img)
         loss = mixture_nll(img, rgbs, masks, a.sig)
+        if a.edge > 0: loss = loss + a.edge * edge_loss(recon, img)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0)
         opt.step(); sched.step()
         if st % 2000 == 0:
