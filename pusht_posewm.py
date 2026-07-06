@@ -45,13 +45,21 @@ def pose_from_image(img, S=512):
 
 # ---------- BRIQUE 2 : dynamique apprise sur les poses ----------
 class PoseDyn(nn.Module):
-    """(bloc x,y,sinθ,cosθ ; agent x,y ; action cible dx,dy) -> Δ(bloc 4 ; agent 2). Résiduel."""
+    """LEVIER 3 : GÉOMÉTRIE RELATIVE. Pousser un T est le même problème quelle que soit son
+    orientation — seule compte la position de l'agent DANS LE REPÈRE DU BLOC. On ajoute donc en
+    entrée l'agent et l'action vus depuis ce repère (tournés de −θ) : le contact devient facile à
+    apprendre (plus besoin de le réapprendre pour chaque angle)."""
     def __init__(s, hid=256):
         super().__init__()
-        s.net = nn.Sequential(nn.Linear(8, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU(),
+        s.net = nn.Sequential(nn.Linear(12, hid), nn.ReLU(), nn.Linear(hid, hid), nn.ReLU(),
                               nn.Linear(hid, hid), nn.ReLU(), nn.Linear(hid, 6))
     def forward(s, blk, ag, act):                                        # blk:(B,4) ag:(B,2) act:(B,2)
-        d = s.net(torch.cat([blk, ag, act], -1))
+        bx, by, si, co = blk[:, 0:1], blk[:, 1:2], blk[:, 2:3], blk[:, 3:4]
+        rx = ag[:, 0:1] - bx; ry = ag[:, 1:2] - by
+        rel = torch.cat([rx * co + ry * si, -rx * si + ry * co], -1)       # agent dans le repère du bloc
+        actl = torch.cat([act[:, 0:1] * co + act[:, 1:2] * si,
+                          -act[:, 0:1] * si + act[:, 1:2] * co], -1)        # action dans le repère du bloc
+        d = s.net(torch.cat([blk, ag, act, rel, actl], -1))
         nb = blk + d[:, :4]
         nb = torch.cat([nb[:, :2], nb[:, 2:4] / (nb[:, 2:4].norm(dim=-1, keepdim=True) + 1e-8)], -1)
         return nb, ag + d[:, 4:6]
