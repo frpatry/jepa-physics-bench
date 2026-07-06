@@ -127,7 +127,7 @@ def oracle_plan(scratch, state, gp, rng, Hp=8, pop=48, iters=3, elite=8, amax=0.
         mu = el.mean(0); sg = np.maximum(el.std(0) + 1e-4, 0.08)
     return np.clip(mu, -amax, amax)
 
-def run_episode(m, hin, seed, dev, policy, max_steps=25, plan_h=8, pop=192, iters=5, scratch=None):
+def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, iters=5, scratch=None):
     env = make_env()
     rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
@@ -149,9 +149,12 @@ def run_episode(m, hin, seed, dev, policy, max_steps=25, plan_h=8, pop=192, iter
             plan = cem_plan(m, x0, x1, cg, Cg, Hp=plan_h, pop=pop, iters=iters, dev=dev, mu0=mu)
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
         elif policy == "oracle":
-            state = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
-            plan = oracle_plan(scratch, state, gp, rng, Hp=plan_h)
-            delta = plan[0]; mu_np = np.concatenate([plan[1:], np.zeros((1, 2), np.float32)])
+            if mu_np is not None and len(mu_np):                           # exécuter 2 actions par plan
+                delta = mu_np[0]; mu_np = None
+            else:
+                state = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
+                plan = oracle_plan(scratch, state, gp, rng, Hp=plan_h, pop=32, iters=2)
+                delta = plan[0]; mu_np = plan[1:2]
         else:
             th = rng.uniform(0, 2 * np.pi); delta = (rng.uniform(0.2, 1.0) * 0.8 *
                                                      np.array([np.cos(th), np.sin(th)], np.float32))
@@ -169,7 +172,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=""); p.add_argument("--tasks", type=int, default=10)
     p.add_argument("--plan_h", type=int, default=8); p.add_argument("--plan_pop", type=int, default=192)
-    p.add_argument("--plan_iters", type=int, default=5); p.add_argument("--max_steps", type=int, default=25)
+    p.add_argument("--plan_iters", type=int, default=5); p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
