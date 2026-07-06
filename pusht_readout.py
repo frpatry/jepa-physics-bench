@@ -120,8 +120,13 @@ def main():
                 mmr, rrr = ro.imagine(cur); can_r = (rrr * mmr).sum(1)
                 mmw, rrw = m.imagine(cur); can_w = (rrw * mmw).sum(1)
                 eR = gray_centroid_err(can_r, Pe[:, 3, 1]); eW = gray_centroid_err(can_w, Pe[:, 3, 1])
-            print(f"  step {st:5d}  lecture-T post-g(+2) : peintre RICHE {eR:.3f}  vs faible {eW:.3f}"
-                  f"  (pose vraie ; plus bas = mieux)", flush=True)
+                BLANC = torch.tensor([0.97, 0.97, 0.97]); BLEU_ = torch.tensor([0.35, 0.50, 0.90])
+                VERT_ = torch.tensor([0.70, 0.90, 0.70])
+                refs = torch.stack([BLANC, GRIS, BLEU_, VERT_]).to(dev)
+                d2r = ((can_r.unsqueeze(1) - refs.reshape(1, 4, 3, 1, 1)) ** 2).sum(2)
+                wgr = torch.softmax(-d2r / (2 * 0.15 ** 2), 1)[:, 1].sum((-1, -2)).mean().item()
+            print(f"  step {st:5d}  loss {float(loss):7.1f}  |  lecture-T RICHE {eR:.3f} vs faible {eW:.3f}"
+                  f"  |  masse grise du canvas riche {wgr:5.1f}px", flush=True)
     torch.save({"model": ro.state_dict(), "args": vars(a), "wm_args": sa}, out)
     print(f"peintre de lecture sauvegardé -> {out}", flush=True)
     try:
