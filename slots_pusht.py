@@ -76,6 +76,9 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=str, default=""); p.add_argument("--ckpt", type=str, default="")
     p.add_argument("--load", type=int, default=0)
+    p.add_argument("--resume", type=int, default=0)                       # 1 = repartir du ckpt et CONTINUER
+                                                                           # l'entraînement (cycle LR neuf —
+                                                                           # pour g affamé post-transition)
     p.add_argument("--K", type=int, default=5); p.add_argument("--D", type=int, default=64)
     p.add_argument("--slot_dim", type=int, default=16); p.add_argument("--dec_w", type=int, default=96)
     p.add_argument("--iters", type=int, default=3)
@@ -101,6 +104,9 @@ def main():
         m.load_state_dict(torch.load(ckpt, map_location=dev)["model"]); m.eval()
         print(f"modèle chargé <- {ckpt}", flush=True)
     else:
+        if a.resume:
+            m.load_state_dict(torch.load(ckpt, map_location=dev)["model"])
+            print(f"reprise de l'entraînement depuis {ckpt} (cycle LR neuf)", flush=True)
         opt = torch.optim.Adam(m.parameters(), a.lr)
         warm = max(1, a.steps // 20)
         sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda st: min(1.0, st / warm) *
