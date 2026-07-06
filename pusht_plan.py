@@ -110,15 +110,21 @@ def slot_ids(m, x0, x1, dev):
         jA = int((grabs - BLEU.to(dev)).norm(dim=-1).argmin())
     return jT, jA, S0, S1
 
-def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev="cpu", mu0=None):
+def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev="cpu", mu0=None):
+    """Leçon finale (trace diag 3) : élite CEM à 0.05 < meilleur plan honnête 0.079 = EXPLOITATION
+    adversariale — des séquences d'actions erratiques hors distribution font dériver l'imagination.
+    Parade : planifier DANS LE SUPPORT des données d'entraînement — horizon 4 (= horizon entraîné
+    de g, au-delà rien n'est certifié) et candidats PERSISTANTS PAR MORCEAUX (2 segments constants,
+    la forme exacte des actions de jeu), 3 itérations (l'over-optimization nuit)."""
     with torch.no_grad():
         _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
         S0 = S0.expand(pop, -1, -1); S1 = S1.expand(pop, -1, -1)
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.30, device=dev)
         for _ in range(iters):
-            eps = torch.randn(pop, Hp, 2, device=dev)
-            eps[: pop // 2] = torch.randn(pop // 2, 1, 2, device=dev)      # bruit corrélé (iCEM)
+            e1 = torch.randn(pop, 1, 2, device=dev).expand(-1, Hp, -1).clone()   # constant
+            e2 = torch.randn(pop, 2, 2, device=dev).repeat_interleave((Hp + 1) // 2, 1)[:, :Hp]  # 2 segments
+            eps = torch.where((torch.arange(pop, device=dev) % 2 == 0).reshape(-1, 1, 1), e1, e2)
             A = (mu + sg * eps).clamp(-amax, amax)
             prev, cur, cost = S0, S1, 0.
             for h in range(Hp):
@@ -318,7 +324,7 @@ def diag_episode(m, hin, dev, scratch, seed=3000, steps=12):
     cg, Cg = mask_stats(soft_color_w(g64, "gris")); cg, Cg = cg[0], Cg[0]
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
-    mu = None; Hp = 8
+    mu = None; Hp = 4
     def eval_plan(x0, x1, A):
         with torch.no_grad():
             _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
@@ -335,7 +341,7 @@ def diag_episode(m, hin, dev, scratch, seed=3000, steps=12):
         u = (gp[:2] - bp[:2]) / (np.linalg.norm(gp[:2] - bp[:2]) + 1e-8)
         push_pt = bp[:2] - u * 55.0
         x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
-        plan = cem_plan(m, x0, x1, cg, Cg, Hp=Hp, pop=192, iters=5, dev=dev, mu0=mu)
+        plan = cem_plan(m, x0, x1, cg, Cg, Hp=Hp, pop=192, iters=3, dev=dev, mu0=mu)
         c_cem = eval_plan(x0, x1, plan)
         # plan expert : moitié des pas vers le point de poussée, moitié à pousser
         exp = np.zeros((Hp, 2), np.float32)
@@ -357,8 +363,8 @@ def diag_episode(m, hin, dev, scratch, seed=3000, steps=12):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=""); p.add_argument("--tasks", type=int, default=10)
-    p.add_argument("--plan_h", type=int, default=8); p.add_argument("--plan_pop", type=int, default=192)
-    p.add_argument("--plan_iters", type=int, default=5); p.add_argument("--max_steps", type=int, default=100)
+    p.add_argument("--plan_h", type=int, default=4); p.add_argument("--plan_pop", type=int, default=192)
+    p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     p.add_argument("--diag", type=int, default=0)
     a = p.parse_args()
