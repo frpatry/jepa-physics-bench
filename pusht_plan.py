@@ -62,6 +62,21 @@ def gray_mask(img64):
     m[:2] = 0; m[-2:] = 0; m[:, :2] = 0; m[:, -2:] = 0                     # exclure la bordure
     return m                                                               # (H,W)
 
+def t_stats(canvas, dev=None):
+    """Stats du T dans un canvas, AVEC EXCLUSION d'un disque autour de l'agent (centroïde bleu) :
+    dans le flou, les pixels du mélange bleu-gris se répartissent entre les deux cartes -> la
+    carte grise gagne de la masse LÀ OÙ EST L'AGENT et son centroïde est tiré vers lui — 'se
+    garer entre le T et le but' ressemblait à du progrès (contamination, MPC figé à 0.11)."""
+    H = canvas.shape[-1]
+    wB = soft_color_w(canvas, "bleu"); cA, _ = mask_stats(wB)
+    wG = soft_color_w(canvas, "gris")
+    yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
+    gx = torch.tensor(xx).to(canvas.device); gy = torch.tensor(yy).to(canvas.device)
+    d2 = (gx.unsqueeze(0) - cA[:, 0].reshape(-1, 1, 1)) ** 2 + (gy.unsqueeze(0) - cA[:, 1].reshape(-1, 1, 1)) ** 2
+    wG = wG * (d2 > 0.07 ** 2).float()                                     # exclusion autour de l'agent
+    cT, CT_ = mask_stats(wG)
+    return cT, CT_, cA
+
 def mask_stats(w, eps=1e-8):
     """Centroïde (x,y) et covariance 2x2 d'un masque-poids (B,H,W) -> (B,2), (B,2,2)."""
     B, H, _ = w.shape
@@ -111,10 +126,9 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev=
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur)                                # décodage POST-g (calibré)
                     canvas = (rr * mm).sum(1)                              # (pop,3,H,W) : le canvas imaginé
-                    cT, CT_ = mask_stats(soft_color_w(canvas, "gris"))       # le T = pixels gris du canvas
-                    cA, _ = mask_stats(soft_color_w(canvas, "bleu"))         # l'agent = pixels bleus
+                    cT, CT_, cA = t_stats(canvas)                          # stats T avec exclusion agent
                     cost = cost + pose_cost(cT, CT_, cg, Cg)
-                    cost = cost + 0.15 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
+                    cost = cost + 0.25 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
                     # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
                     # le bloc HORS de la cible est rentable quand il démarre dessus (toy v2 bis)
             el = A[cost.argsort()[:elite]]
@@ -255,7 +269,7 @@ def diag_plans(m, hin, dev, scratch, seed=3000):
                 nxt = m.step_a(cur, prev, torch.tensor(A_[h:h + 1]).to(dev)); prev, cur = cur, nxt
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
-                    cT, CT_ = mask_stats(soft_color_w(canvas, "gris"))
+                    cT, CT_, _ = t_stats(canvas)
                     gs.append(float(pose_cost(cT, CT_, cg, Cg)[0]))
         o2, i2 = reset_faithful(scratch, st0)
         a2 = np.array(o2["agent_pos"], np.float32)
@@ -266,6 +280,31 @@ def diag_plans(m, hin, dev, scratch, seed=3000):
         bp2 = np.array(i2["block_pose"], np.float32)
         print(f"  {nom:11s} coût imaginé {np.mean(gs):.3f}  |  vraie dist bloc-but {np.linalg.norm(bp2[:2]-gp[:2])/512.:.3f}"
               f"  (départ {np.linalg.norm(bp[:2]-gp[:2])/512.:.3f})", flush=True)
+    # volet DÉPART LOINTAIN : le plan-exploit 'se placer côté but sans toucher' bat-il encore ?
+    pa2 = np.clip(bp[:2] - u * 180.0, 15, 497)
+    obs, info = reset_faithful(env, np.array([pa2[0], pa2[1], bp[0], bp[1], bp[2]], np.float32))
+    ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+    obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]
+    x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
+    with torch.no_grad():
+        _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+    v = (gp[:2] - bp[:2]); v = v / (np.linalg.norm(v) + 1e-8)
+    park = np.clip(bp[:2] + v * 80.0, 15, 497)                             # côté BUT, sans toucher
+    plans2 = {"approche+pousse": np.repeat((u * 0.35)[None], Hp, 0).astype(np.float32),
+              "parking_cote_but": np.repeat(((park - ag) / (256.0 * Hp) * Hp)[None] * 0 +
+                                            ((park - ag) / 256.0 / Hp)[None], Hp, 0).astype(np.float32),
+              "rester_loin": np.zeros((Hp, 2), np.float32)}
+    print("  --- départ lointain ---", flush=True)
+    for nom, A_ in plans2.items():
+        with torch.no_grad():
+            prev, cur = S0, S1; gs = []
+            for h in range(Hp):
+                nxt = m.step_a(cur, prev, torch.tensor(np.clip(A_[h:h+1], -0.8, 0.8)).to(dev)); prev, cur = cur, nxt
+                if h >= Hp - 2:
+                    mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
+                    cT, CT_, _ = t_stats(canvas)
+                    gs.append(float(pose_cost(cT, CT_, cg, Cg)[0]))
+        print(f"  {nom:17s} coût-but imaginé {np.mean(gs):.3f}", flush=True)
     env.close()
 
 def main():
