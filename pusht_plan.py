@@ -307,6 +307,53 @@ def diag_plans(m, hin, dev, scratch, seed=3000):
         print(f"  {nom:17s} coût-but imaginé {np.mean(gs):.3f}", flush=True)
     env.close()
 
+def diag_episode(m, hin, dev, scratch, seed=3000, steps=12):
+    """Trace d'épisode MPC : à chaque replan, coût de l'élite CEM vs coût d'un plan-EXPERT
+    injecté (aller derrière le bloc puis pousser vers le but), directions et progrès réels."""
+    env = make_env(); obs, info = env.reset(seed=seed)
+    gp = np.array(info["goal_pose"], np.float32)
+    far = np.array([40.0, 40.0], np.float32)
+    gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
+    g64 = to64(gob["pixels"], hin, dev)
+    cg, Cg = mask_stats(soft_color_w(g64, "gris")); cg, Cg = cg[0], Cg[0]
+    ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+    obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
+    mu = None; Hp = 8
+    def eval_plan(x0, x1, A):
+        with torch.no_grad():
+            _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
+            prev, cur, c = S0, S1, 0.
+            for h in range(Hp):
+                nxt = m.step_a(cur, prev, A[h:h + 1].to(dev)); prev, cur = cur, nxt
+                if h >= Hp - 2:
+                    mm, rr = m.imagine(cur); canvas = (rr * mm).sum(1)
+                    cT, CT_, cA = t_stats(canvas)
+                    c = c + float(pose_cost(cT, CT_, cg, Cg)[0]) + 0.25 * max(float((cA - cT).norm()) - 0.12, 0.)
+        return c
+    for t in range(steps):
+        bp = np.array(info["block_pose"], np.float32)
+        u = (gp[:2] - bp[:2]) / (np.linalg.norm(gp[:2] - bp[:2]) + 1e-8)
+        push_pt = bp[:2] - u * 55.0
+        x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
+        plan = cem_plan(m, x0, x1, cg, Cg, Hp=Hp, pop=192, iters=5, dev=dev, mu0=mu)
+        c_cem = eval_plan(x0, x1, plan)
+        # plan expert : moitié des pas vers le point de poussée, moitié à pousser
+        exp = np.zeros((Hp, 2), np.float32)
+        for h in range(Hp):
+            exp[h] = (push_pt - ag) / 256.0 / 3.0 if h < 4 else u * 0.3
+        exp = np.clip(exp, -0.8, 0.8)
+        c_exp = eval_plan(x0, x1, torch.tensor(exp))
+        d = plan[0].cpu().numpy()
+        to_block = (bp[:2] - ag) / (np.linalg.norm(bp[:2] - ag) + 1e-8)
+        print(f"  pas {t:2d}  cov {info.get('coverage',0):.2f}  d(ag,bloc) {np.linalg.norm(ag-bp[:2]):3.0f}px"
+              f"  |δ| {np.linalg.norm(d):.2f}  δ·versbloc {float(d @ to_block):+.2f}"
+              f"  |  coût élite {c_cem:.3f}  vs EXPERT {c_exp:.3f}", flush=True)
+        mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
+        obs, _, term, trunc, info = env.step(np.clip(ag + d * 256.0, 0, 512).astype(np.float32))
+        f0, f1 = f1, obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
+        if term or trunc: break
+    env.close()
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", type=str, default=""); p.add_argument("--tasks", type=int, default=10)
@@ -326,6 +373,7 @@ def main():
     if a.diag:
         diag(m, sa["hin"], dev, scratch)
         if a.diag >= 2: diag_plans(m, sa["hin"], dev, scratch)
+        if a.diag >= 3: diag_episode(m, sa["hin"], dev, scratch)
         scratch.close(); return
     pols = a.policies.split(",")
     scores = {q: [] for q in pols}; covs = {q: [] for q in pols}
