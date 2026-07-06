@@ -36,6 +36,16 @@ def reset_faithful(env, state):
     fixed = state.copy(); fixed[2:4] = state[2:4] - err
     return env.reset(options={"reset_to_state": fixed})
 
+def soft_color_w(img, ref, tau=0.08):
+    """Carte de poids par similarité de couleur DOUCE (robuste au flou du canvas imaginé et à
+    l'anti-aliasing) : w = exp(-||img-ref||²/2τ²). img (B,3,H,W) -> (B,H,W). Lecture du canvas
+    décodé (l'espace certifié) par couleur — aucune dépendance à l'identité des slots (plan B :
+    la décomposition est grossière, T+agent fusionnés dans une prise)."""
+    d2 = ((img - ref.to(img.device).reshape(1, 3, 1, 1)) ** 2).sum(1)
+    w = torch.exp(-d2 / (2 * tau * tau))
+    w[..., :2, :] = 0; w[..., -2:, :] = 0; w[..., :, :2] = 0; w[..., :, -2:] = 0
+    return w
+
 def gray_mask(img64):
     """Pixels du bloc T dans une image (1,3,H,W) : gris = canaux proches, luminance moyenne.
     Prétraitement de la SPÉCIFICATION du but (l'image but est donnée), pas de la perception."""
@@ -81,7 +91,7 @@ def slot_ids(m, x0, x1, dev):
 
 def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev="cpu", mu0=None):
     with torch.no_grad():
-        jT, jA, S0, S1 = slot_ids(m, x0, x1, dev)
+        _, _, S0 = m.peel(m.feats(x0)); _, _, S1 = m.peel(m.feats(x1), init=S0)
         S0 = S0.expand(pop, -1, -1); S1 = S1.expand(pop, -1, -1)
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.30, device=dev)
@@ -93,9 +103,10 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=8, pop=192, iters=5, elite=16, amax=0.8, dev=
             for h in range(Hp):
                 nxt = m.step_a(cur, prev, A[:, h]); prev, cur = cur, nxt
                 if h >= Hp - 2:
-                    mm, _ = m.imagine(cur)                                 # décodage POST-g (calibré)
-                    cT, CT_ = mask_stats(mm[:, jT, 0])
-                    cA, _ = mask_stats(mm[:, jA, 0])
+                    mm, rr = m.imagine(cur)                                # décodage POST-g (calibré)
+                    canvas = (rr * mm).sum(1)                              # (pop,3,H,W) : le canvas imaginé
+                    cT, CT_ = mask_stats(soft_color_w(canvas, GRIS))       # le T = pixels gris du canvas
+                    cA, _ = mask_stats(soft_color_w(canvas, BLEU))         # l'agent = pixels bleus
                     cost = cost + pose_cost(cT, CT_, cg, Cg)
                     cost = cost + 0.15 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
                     # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
@@ -136,8 +147,7 @@ def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, ite
     far = np.array([40.0, 40.0], np.float32) if np.linalg.norm(gp[:2] - 40) > 120 else np.array([470.0, 470.0], np.float32)
     gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
     g64 = to64(gob["pixels"], hin, dev)
-    gm = gray_mask(g64)
-    cg, Cg = mask_stats(gm.unsqueeze(0)); cg, Cg = cg[0], Cg[0]
+    cg, Cg = mask_stats(soft_color_w(g64, GRIS)); cg, Cg = cg[0], Cg[0]
     # 2 frames de contexte (un pas immobile)
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy())
@@ -176,8 +186,8 @@ def diag(m, hin, dev, scratch, seed=3000):
     gp = np.array(info["goal_pose"], np.float32)
     far = np.array([40.0, 40.0], np.float32)
     gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
-    g64 = to64(gob["pixels"], hin, dev); gm = gray_mask(g64)
-    cg, _ = mask_stats(gm.unsqueeze(0))
+    g64 = to64(gob["pixels"], hin, dev)
+    cg, _ = mask_stats(soft_color_w(g64, GRIS))
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]
     x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
@@ -192,13 +202,15 @@ def diag(m, hin, dev, scratch, seed=3000):
         prev, cur = S0, S1
         for _ in range(2): nxt = m.step_a(cur, prev, torch.zeros(1, 2, device=dev)); prev, cur = cur, nxt
         mi, _ = m.imagine(cur)
+    with torch.no_grad():
+        mi_m, mi_r = m.imagine(cur); canvas = (mi_r * mi_m).sum(1)
     fig, ax = plt.subplots(1, 6, figsize=(18, 3))
     ax[0].imshow(g64[0].permute(1, 2, 0).cpu()); ax[0].set_title("image BUT")
-    ax[1].imshow(gm.cpu()); ax[1].set_title("gray_mask (cible)")
+    ax[1].imshow(soft_color_w(g64, GRIS)[0].cpu()); ax[1].set_title("poids gris (cible)")
     ax[2].imshow(x1[0].permute(1, 2, 0).cpu()); ax[2].set_title("frame courante")
-    ax[3].imshow(mk[0, jT, 0].cpu()); ax[3].set_title(f"peel slot jT={jT}")
-    ax[4].imshow(mk[0, jA, 0].cpu()); ax[4].set_title(f"peel slot jA={jA}")
-    ax[5].imshow(mi[0, jT, 0].cpu()); ax[5].set_title("jT imaginé (+2 pas)")
+    ax[3].imshow(canvas[0].permute(1, 2, 0).cpu().clip(0, 1)); ax[3].set_title("canvas imaginé (+2)")
+    ax[4].imshow(soft_color_w(canvas, GRIS)[0].cpu()); ax[4].set_title("poids gris (canvas)")
+    ax[5].imshow(soft_color_w(canvas, BLEU)[0].cpu()); ax[5].set_title("poids bleu (canvas)")
     for a_ in ax: a_.axis("off")
     out = "/content/pusht_plan_diag.png" if os.path.isdir("/content") else "pusht_plan_diag.png"
     plt.tight_layout(); plt.savefig(out); print(f"diag -> {out}", flush=True)
