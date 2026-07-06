@@ -108,8 +108,12 @@ def main():
         loss = 0.
         for k, S in enumerate(states):                                     # cibles : frames 1..T-1
             mm, rr = ro.imagine(S.detach())
-            wq = motion_w(x[:, 1 + k], x[:, k], a.wmotion)
-            loss = loss + wmix(x[:, 1 + k], rr, mm[:, :, 0], wq, a.sig)
+            # pondération par CONTENU (tout ce qui n'est pas blanc) : le readout n'a aucune économie
+            # d'émergence à protéger (tout est gelé) — la pondération-mouvement du WM donnait tout à
+            # l'agent et presque rien au T statique -> le peintre écrivait 'tout blanc' (masse grise 0.4px)
+            tgt = x[:, 1 + k]
+            wq = 1.0 + a.wmotion * (tgt - x[:, k]).abs().mean(1) + 25.0 * (tgt - 0.97).abs().mean(1)
+            loss = loss + wmix(tgt, rr, mm[:, :, 0], wq, a.sig)
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(ro.parameters(), 1.0)
         opt.step(); sched.step()
         if st % 500 == 0:
