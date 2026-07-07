@@ -351,6 +351,20 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     if record_traj: return best, np.array(tbp), np.array(tag), np.array(tac)
     return (best, frames, covs, diag) if record else best
 
+def save_gif(frames, covs, path, scl=4):
+    """Animation de TOUS les pas d'un épisode (upscale + texte pas/cov)."""
+    try:
+        from PIL import Image, ImageDraw
+        ims = []
+        for i, f in enumerate(frames):
+            im = Image.fromarray(f.astype(np.uint8)).resize((f.shape[1] * scl, f.shape[0] * scl), Image.NEAREST)
+            ImageDraw.Draw(im).text((6, 6), f"pas {i}  cov {covs[i]:.2f}", fill=(200, 0, 0))
+            ims.append(im)
+        ims[0].save(path, save_all=True, append_images=ims[1:], duration=80, loop=0)
+        print(f"  animation -> {path} ({len(ims)} pas)", flush=True)
+    except Exception as e:
+        print("  gif skip:", str(e)[:70], flush=True)
+
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=str, default=""); p.add_argument("--steps", type=int, default=8000)
@@ -367,6 +381,7 @@ def get_args():
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
     p.add_argument("--escape_min", type=float, default=1.0)               # 1.0 = échappement OFF (basin-hopping testé, ne franchit pas le mur)
     p.add_argument("--escape_sigma", type=float, default=0.6)             # bruit CEM pendant l'échappement (recherche large = nouvelle stratégie)
+    p.add_argument("--gif_all", type=int, default=0)                      # 1 = un GIF par tâche (pusht_task00.gif ...) pour voir chaque épisode
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
@@ -500,28 +515,22 @@ def main():
             plt.tight_layout(); plt.savefig(out); print(f"figure -> {out}", flush=True)
         except Exception as e:
             print("plot skip:", str(e)[:70], flush=True)
-        try:                                                              # ANIMATION : TOUS les pas -> voir la manœuvre se dérouler
-            from PIL import Image, ImageDraw
-            scl = 4; ims = []
-            for i, f in enumerate(frames):
-                im = Image.fromarray(f.astype(np.uint8)).resize((f.shape[1] * scl, f.shape[0] * scl), Image.NEAREST)
-                ImageDraw.Draw(im).text((6, 6), f"pas {i}  cov {covs[i]:.2f}", fill=(200, 0, 0))
-                ims.append(im)
-            gif = "/content/pusht_posewm.gif" if os.path.isdir("/content") else "pusht_posewm.gif"
-            ims[0].save(gif, save_all=True, append_images=ims[1:], duration=80, loop=0)
-            print(f"animation -> {gif} ({len(ims)} pas)", flush=True)
-        except Exception as e:
-            print("gif skip:", str(e)[:70], flush=True)
+        gdir = "/content" if os.path.isdir("/content") else "."
+        save_gif(frames, covs, f"{gdir}/pusht_posewm.gif")                # ANIMATION : tous les pas
         if a.tasks == 0:
             return
     # BRIQUE 3 : planification
     if a.tasks > 0:
         scratch = make_env(); scratch.reset(seed=0)
         pols = a.policies.split(","); sc = {q: [] for q in pols}
+        gdir = "/content" if os.path.isdir("/content") else "."
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma)
+                rec = (a.gif_all and q == "mpc")                          # GIF par tâche : filmer le MPC de chaque tâche
+                r = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, record=rec)
+                if rec: cov = r[0]; save_gif(r[1], r[2], f"{gdir}/pusht_task{k:02d}.gif")
+                else: cov = r
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
