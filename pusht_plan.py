@@ -110,7 +110,22 @@ def slot_ids(m, x0, x1, dev):
         jA = int((grabs - BLEU.to(dev)).norm(dim=-1).argmin())
     return jT, jA, S0, S1
 
-def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev="cpu", mu0=None):
+def t_overlap(canvas, gmask):
+    """RECOUVREMENT PUR en pixels (idée utilisateur : image X sur image Y) : fraction du masque-BUT
+    (gmask, le T gris posé sur la cible) recouverte par le T gris IMAGINÉ (flou), avec EXCLUSION de
+    l'agent. canvas:(pop,3,H,W), gmask:(H,W). -> (cov_soft, cT, cA, mass)."""
+    H = canvas.shape[-1]
+    cA, _ = mask_stats(soft_color_w(canvas, "bleu"))
+    wG = soft_color_w(canvas, "gris")
+    yy, xx = np.mgrid[0:H, 0:H].astype(np.float32) / H
+    gx = torch.tensor(xx).to(canvas.device); gy = torch.tensor(yy).to(canvas.device)
+    d2 = (gx.unsqueeze(0) - cA[:, 0].reshape(-1, 1, 1)) ** 2 + (gy.unsqueeze(0) - cA[:, 1].reshape(-1, 1, 1)) ** 2
+    wG = wG * (d2 > 0.07 ** 2).float()                                    # exclusion agent (comme t_stats)
+    inter = torch.minimum(wG, gmask.unsqueeze(0)).sum((-1, -2))           # pixels communs T-imaginé ∩ T-but
+    cT, _ = mask_stats(wG)
+    return inter / (gmask.sum() + 1e-8), cT, cA, wG.sum((-1, -2))
+
+def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev="cpu", mu0=None, gmask=None):
     """Leçon finale (trace diag 3) : élite CEM à 0.05 < meilleur plan honnête 0.079 = EXPLOITATION
     adversariale — des séquences d'actions erratiques hors distribution font dériver l'imagination.
     Parade : planifier DANS LE SUPPORT des données d'entraînement — horizon 4 (= horizon entraîné
@@ -137,8 +152,12 @@ def cem_plan(m, x0, x1, cg, Cg, Hp=4, pop=192, iters=3, elite=16, amax=0.8, dev=
                 if h >= Hp - 2:
                     mm, rr = m.imagine(cur)                                # décodage POST-g (calibré)
                     canvas = (rr * mm).sum(1)                              # (pop,3,H,W) : le canvas imaginé
-                    cT, CT_, cA, mass = t_stats(canvas)                    # stats T avec exclusion agent
-                    cost = cost + pose_cost(cT, CT_, cg, Cg)
+                    if gmask is not None:                                  # RECOUVREMENT PUR : image X (T flou) sur Y (T but)
+                        cov_s, cT, cA, mass = t_overlap(canvas, gmask)
+                        cost = cost + (1.0 - cov_s)                        # maximiser le chevauchement des masques en pixels
+                    else:                                                  # ancien coût : centroïde + covariance
+                        cT, CT_, cA, mass = t_stats(canvas)
+                        cost = cost + pose_cost(cT, CT_, cg, Cg)
                     cost = cost + 0.25 * ((cA - cT).norm(dim=-1) - 0.12).clamp_min(0.)  # approche
                     cost = cost + 1.0 * (0.7 - mass / (mass_ref + 1e-8)).clamp_min(0.)  # conservation
                     # SATURANTE : récompense jusqu'au contact, puis plus rien — sinon percuter
@@ -170,7 +189,7 @@ def oracle_plan(scratch, state, gp, rng, Hp=8, pop=48, iters=3, elite=8, amax=0.
         mu = el.mean(0); sg = np.maximum(el.std(0) + 1e-4, 0.08)
     return np.clip(mu, -amax, amax)
 
-def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, iters=5, scratch=None):
+def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, iters=5, scratch=None, cost_mode="pose"):
     env = make_env()
     rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
@@ -180,6 +199,7 @@ def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, ite
     gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
     g64 = to64(gob["pixels"], hin, dev)
     cg, Cg = mask_stats(soft_color_w(g64, "gris")); cg, Cg = cg[0], Cg[0]
+    gmask = soft_color_w(g64, "gris")[0] if cost_mode == "overlap" else None  # masque BUT (T gris) pour recouvrement pur
     # 2 frames de contexte (un pas immobile)
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy())
@@ -188,7 +208,7 @@ def run_episode(m, hin, seed, dev, policy, max_steps=100, plan_h=8, pop=192, ite
     for _ in range(max_steps):
         if policy == "mpc":
             x0 = to64(f0, hin, dev); x1 = to64(f1, hin, dev)
-            plan = cem_plan(m, x0, x1, cg, Cg, Hp=plan_h, pop=pop, iters=iters, dev=dev, mu0=mu)
+            plan = cem_plan(m, x0, x1, cg, Cg, Hp=plan_h, pop=pop, iters=iters, dev=dev, mu0=mu, gmask=gmask)
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
         elif policy == "oracle":
             if mu_np is not None and len(mu_np):                           # exécuter 2 actions par plan
@@ -374,6 +394,7 @@ def main():
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     p.add_argument("--diag", type=int, default=0)
     p.add_argument("--readout", type=str, default="")                      # ckpt du peintre de lecture ('auto' = défaut)
+    p.add_argument("--cost", type=str, default="pose")                      # 'pose'=centroïde+cov | 'overlap'=RECOUVREMENT pixels pur
     a = p.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     ckpt = a.ckpt or default_path("pusht_wm.pt")
@@ -403,7 +424,7 @@ def main():
         line = []
         for q in pols:
             ok, cov = run_episode(m, sa["hin"], 3000 + k, dev, q, max_steps=a.max_steps,
-                                  plan_h=a.plan_h, pop=a.plan_pop, iters=a.plan_iters, scratch=scratch)
+                                  plan_h=a.plan_h, pop=a.plan_pop, iters=a.plan_iters, scratch=scratch, cost_mode=a.cost)
             scores[q].append(ok); covs[q].append(cov)
             line.append(f"{q} {'OK ' if ok else 'échec'} (cov max {cov:.2f})")
         print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
