@@ -446,9 +446,9 @@ def main():
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
-            ae = np.array([d[2] for d in diag])
+            ae = np.array([d[2] for d in diag]); pe = np.array([d[3] for d in diag])
             print(f"  perception sur l'épisode : angle err médian {np.median(ae):.0f}°  max {ae.max():.0f}°"
-                  f"  ({int((ae > 20).sum())} coups >20°)", flush=True)
+                  f"  ({int((ae > 20).sum())} coups >20°)  |  POSITION err médian {np.median(pe):.0f}px  max {pe.max():.0f}px", flush=True)
             print("  chutes de coverage (>0.12 en 1 coup) — perception AVANT le coup fatal :", flush=True)
             for i in range(1, len(diag)):
                 if diag[i - 1][1] - diag[i][1] > 0.12:                    # coverage a chuté
