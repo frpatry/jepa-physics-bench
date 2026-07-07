@@ -78,10 +78,11 @@ def surface_points(img, spacing_px=6.0, S=512.0):
         pts.append((x, y)); nls.append((nx, ny)); last = (x, y)
     return np.array(pts, np.float32), np.array(nls, np.float32)
 
-def collect_probe(n_poses, spacing, gap, push, dev, seed=7):
+def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7):
     """Pour chaque pose de départ : garer l'agent, PHOTO -> points de contact ; puis, point par point,
-    reset (T à la pose, agent devant le point) -> UNE poussée normale -> photo -> transition -> revenir.
-    Retourne un buffer de transitions au même format que l'offline (depuis l'arrêt : blk_prev=blk)."""
+    reset (T à la pose, agent devant le point) -> poussées de PLUSIEURS FORCES (cogne doux->fort) ->
+    photo -> transition -> revenir. Le modèle apprend la réponse comme FONCTION de la force -> il sait
+    doser (près du but il pourra choisir doux). Format identique à l'offline (depuis l'arrêt : blk_prev=blk)."""
     env = make_env(); rng = np.random.default_rng(seed)
     B0, AG0, AC, B1, AG1 = [], [], [], [], []
     for pi in range(n_poses):
@@ -91,12 +92,13 @@ def collect_probe(n_poses, spacing, gap, push, dev, seed=7):
         for (px, py), (nx, ny) in zip(pts, nls):
             ax = px + nx * gap; ay = py + ny * gap                       # agent juste devant la surface
             if not (8 < ax < 504 and 8 < ay < 504): continue
-            obs, info = reset_faithful(env, np.array([ax, ay, bx, by, ba], np.float32))
-            b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
-            tgt = np.clip([px - nx * push, py - ny * push], 0, 512).astype(np.float32)  # pousser DANS la surface
-            obs, _, term, trunc, info = env.step(tgt)
-            B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1))
-            B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
+            for push in pushes:                                          # MÊME point, MÊME côté, forces différentes
+                obs, info = reset_faithful(env, np.array([ax, ay, bx, by, ba], np.float32))
+                b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
+                tgt = np.clip([px - nx * push, py - ny * push], 0, 512).astype(np.float32)  # pousser DANS la surface
+                obs, _, term, trunc, info = env.step(tgt)
+                B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1))
+                B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
         if pi % 20 == 0: print(f"  sonde pose {pi:3d}/{n_poses}  ({len(B0)} transitions)", flush=True)
     env.close()
     B0, AG0, B1, AG1 = map(lambda z: np.array(z, np.float32), (B0, AG0, B1, AG1)); AC = np.array(AC, np.float32)
@@ -261,7 +263,7 @@ def get_args():
     p.add_argument("--probe_poses", type=int, default=0)                 # sonde de surface : nb de poses de départ (0=off)
     p.add_argument("--probe_spacing", type=float, default=6.0)           # espacement des points de contact (px @512)
     p.add_argument("--probe_gap", type=float, default=18.0)              # distance agent<->surface au départ (px)
-    p.add_argument("--probe_push", type=float, default=20.0)             # profondeur de la poussée fine (px)
+    p.add_argument("--probe_push", type=str, default="8,22,45,80")       # forces de poussée (px) : cogne doux->fort
     return p.parse_args()
 
 def main():
@@ -296,9 +298,10 @@ def main():
     # SONDE DE SURFACE (idée utilisateur) : balayage systématique de la réponse locale, mélangé à l'offline.
     pb_val = None
     if a.probe_poses > 0:
+        pushes = [float(x) for x in str(a.probe_push).split(",")]
         print(f"--- sonde de surface : {a.probe_poses} poses, espacement {a.probe_spacing:.0f}px, "
-              f"poussée {a.probe_push:.0f}px ---", flush=True)
-        pb = collect_probe(a.probe_poses, a.probe_spacing, a.probe_gap, a.probe_push, dev)
+              f"forces {pushes}px (cogne doux->fort) ---", flush=True)
+        pb = collect_probe(a.probe_poses, a.probe_spacing, a.probe_gap, pushes, dev)
         M = pb[0].shape[0]; nv = min(2000, M // 10)
         pb_val = [t[M - nv:] for t in pb]; pb_tr = [t[:M - nv] for t in pb]
         rep = max(1, off_buf[0].shape[0] // max(1, 2 * pb_tr[0].shape[0]))  # peser ~autant que l'offline
