@@ -84,7 +84,7 @@ def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7):
     photo -> transition -> revenir. Le modèle apprend la réponse comme FONCTION de la force -> il sait
     doser (près du but il pourra choisir doux). Format identique à l'offline (depuis l'arrêt : blk_prev=blk)."""
     env = make_env(); rng = np.random.default_rng(seed)
-    B0, AG0, AC, B1, AG1 = [], [], [], [], []
+    B0, AG0, AC, B1, AG1, PU = [], [], [], [], [], []
     for pi in range(n_poses):
         bx = rng.uniform(140, 372); by = rng.uniform(140, 372); ba = rng.uniform(0, 2 * np.pi)
         obs, info = reset_faithful(env, np.array([20.0, 20.0, bx, by, ba], np.float32))  # agent garé -> silhouette propre
@@ -97,11 +97,19 @@ def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7):
                 b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
                 tgt = np.clip([px - nx * push, py - ny * push], 0, 512).astype(np.float32)  # pousser DANS la surface
                 obs, _, term, trunc, info = env.step(tgt)
-                B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1))
+                B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1)); PU.append(push)
                 B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
         if pi % 20 == 0: print(f"  sonde pose {pi:3d}/{n_poses}  ({len(B0)} transitions)", flush=True)
     env.close()
     B0, AG0, B1, AG1 = map(lambda z: np.array(z, np.float32), (B0, AG0, B1, AG1)); AC = np.array(AC, np.float32)
+    # DIAGNOSTIC force -> déplacement du T : quelle poussée bouge le T de combien ? (choisir le régime fin)
+    PU = np.array(PU); disp = np.linalg.norm(B1[:, :2] - B0[:, :2], axis=1)
+    dang = np.abs(np.degrees(np.angle(np.exp(1j * (B1[:, 2] - B0[:, 2])))))
+    print("  force->mouvement du T (médiane sur tous les contacts) :", flush=True)
+    for f in sorted(set(PU.tolist())):
+        m = PU == f
+        print(f"    poussée {f:5.1f}px  ->  T bouge {np.median(disp[m]):5.1f}px  |  {np.median(dang[m]):4.1f}°"
+              f"  (p90 {np.percentile(disp[m], 90):5.1f}px)", flush=True)
     blk0, ag0 = to_state(B0, AG0); blk1, ag1 = to_state(B1, AG1)
     Tt = lambda z: torch.tensor(z, device=dev)
     # format buffer : [blk_prev, blk, ag, act, blk_next, ag_next] ; depuis l'arrêt -> blk_prev = blk
@@ -264,7 +272,7 @@ def get_args():
     p.add_argument("--probe_poses", type=int, default=0)                 # sonde de surface : nb de poses de départ (0=off)
     p.add_argument("--probe_spacing", type=float, default=6.0)           # espacement des points de contact (px @512)
     p.add_argument("--probe_gap", type=float, default=18.0)              # distance agent<->surface au départ (px)
-    p.add_argument("--probe_push", type=str, default="8,22,45,80")       # forces de poussée (px) : cogne doux->fort
+    p.add_argument("--probe_push", type=str, default="2,5,10,20,40,80")  # forces (px) : dense en bas (régime fin) -> fort
     return p.parse_args()
 
 def main():
