@@ -96,6 +96,36 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.05)
     return mu.clamp(-amax, amax)
 
+def seq_to_transitions(bp, ag, ac, dev):
+    """Une trajectoire (poses+actions) -> transitions (blk_prev, blk, ag, act) -> (blk_next, ag_next)."""
+    blk, ags = to_state(bp, ag)
+    blk = torch.tensor(blk, device=dev); ags = torch.tensor(ags, device=dev); ac = torch.tensor(ac, device=dev)
+    L = blk.shape[0]
+    if L < 3: return None
+    ii = torch.arange(1, L - 1)
+    return blk[ii - 1], blk[ii], ags[ii], ac[ii], blk[ii + 1], ags[ii + 1]
+
+def train_dyn(dyn, opt, buf, steps, bs, log_every=1000, eval_fn=None):
+    Bp, Bc, Ag, Ac, Bn, An = buf; M = Bp.shape[0]
+    for st in range(steps):
+        idx = torch.randint(0, M, (bs,), device=Bp.device)
+        nb, na = dyn(Bc[idx], Bp[idx], Ag[idx], Ac[idx])
+        loss = ((nb - Bn[idx]) ** 2).sum(-1).mean() + ((na - An[idx]) ** 2).sum(-1).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        if eval_fn and st % log_every == 0: eval_fn(st)
+
+def collect_onpolicy(dyn, n_ep, dev, offset, w_ang, w_app, plan_h, max_steps=60):
+    """Le PLANIFICATEUR joue avec le world model actuel ; on enregistre ses VRAIES trajectoires
+    (y compris ses gestes fins d'endgame) -> transitions pour réentraîner (DAgger)."""
+    parts = []
+    for e in range(n_ep):
+        r = run_episode(dyn, 20000 + e, dev, "mpc", max_steps=max_steps, plan_h=plan_h,
+                        offset=offset, w_ang=w_ang, w_app=w_app, record_traj=True)
+        tr = seq_to_transitions(r[1], r[2], r[3], dev)
+        if tr is not None: parts.append(tr)
+    if not parts: return None
+    return [torch.cat([p[i] for p in parts], 0) for i in range(6)]
+
 def calib_offset(X, BP, ns=400):
     """Décalage CONSTANT (repère du bloc) entre centroïde visuel et référence BP (pose pymunk).
     Mesuré ~(0,41)px, écart-type ~2.5 -> le convertir permet à la perception de viser la même
@@ -111,13 +141,13 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
     gblk = torch.tensor(np.concatenate([gp[:2] / 512, [np.sin(gp[2]), np.cos(gp[2])]]), dtype=torch.float32, device=dev)
     ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; blk_prev = None
-    frames, covs = [], []
+    frames, covs = [], []; tbp, tag, tac = [], [], []                    # trajectoire VRAIE (pour on-policy)
     for _ in range(max_steps):
         if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
         if policy == "mpc":
@@ -141,11 +171,16 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
         else:
             th = rng.uniform(0, 2 * np.pi); act = np.clip(ag + rng.uniform(0.2, 1.0) * 256 *
                                                           np.array([np.cos(th), np.sin(th)]), 0, 512).astype(np.float32)
+        if record_traj:                                                  # VRAIE pose/action de CE pas
+            tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())
+            tac.append(np.clip((act - ag) / 512.0, -1, 1).astype(np.float32))
         obs, _, term, trunc, info = env.step(act); ag = np.array(obs["agent_pos"], np.float32)
         best = max(best, float(info.get("coverage", 0.0)))
         if info.get("is_success", False) or term or trunc: break
     if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
+    if record_traj: tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())  # pose finale
     env.close()
+    if record_traj: return best, np.array(tbp), np.array(tag), np.array(tac)
     return (best, frames, covs) if record else best
 
 def get_args():
@@ -157,6 +192,9 @@ def get_args():
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
     p.add_argument("--w_app", type=float, default=0.1)                    # poids de l'approche
+    p.add_argument("--dagger_rounds", type=int, default=0)               # rondes on-policy (0 = off)
+    p.add_argument("--dagger_eps", type=int, default=20)                 # épisodes collectés par ronde
+    p.add_argument("--dagger_steps", type=int, default=3000)             # réentraînement par ronde
     return p.parse_args()
 
 def main():
@@ -184,19 +222,29 @@ def main():
     blk = torch.tensor(blk).to(dev); ag = torch.tensor(ag).to(dev); act = torch.tensor(dA).to(dev)
     dyn = PoseDyn().to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
     ne = min(300, max(1, n // 10)); ntr = n - ne
-    print("--- dynamique (pose,action)->pose ---", flush=True)
-    for st in range(a.steps):
-        bi = np.random.randint(0, ntr, a.bs); ti = np.random.randint(1, T - 1, a.bs)  # t-1 et t+1 existent
-        nb, na = dyn(blk[bi, ti], blk[bi, ti - 1], ag[bi, ti], act[bi, ti])
-        loss = ((nb - blk[bi, ti + 1]) ** 2).sum(-1).mean() + ((na - ag[bi, ti + 1]) ** 2).sum(-1).mean()
-        opt.zero_grad(); loss.backward(); opt.step()
-        if st % 1000 == 0:
-            with torch.no_grad():
-                bv = blk[ntr:]
-                nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])   # t=1 (prev=0) -> prédit t=2
-                ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
-                ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512   # copie (bloc statique)
-            print(f"  step {st:5d}  bloc t+1 : imaginé {ep:.1f}px  vs copie {ec:.1f}px", flush=True)
+    # buffer OFFLINE (jeu aléatoire) : transitions (blk_prev, blk, ag, act) -> (blk_next, ag_next)
+    off_buf = [blk[:ntr, 0:T - 2].reshape(-1, 4), blk[:ntr, 1:T - 1].reshape(-1, 4), ag[:ntr, 1:T - 1].reshape(-1, 2),
+               act[:ntr, 1:T - 1].reshape(-1, 2), blk[:ntr, 2:T].reshape(-1, 4), ag[:ntr, 2:T].reshape(-1, 2)]
+    bv = blk[ntr:]
+    def dyn_eval(st):
+        with torch.no_grad():
+            nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])
+            ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
+            ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
+        print(f"  step {st:5d}  bloc t+1 : imaginé {ep:.1f}px  vs copie {ec:.1f}px", flush=True)
+    print("--- dynamique (jeu aléatoire) ---", flush=True)
+    train_dyn(dyn, opt, off_buf, a.steps, a.bs, eval_fn=dyn_eval)
+    # DAgger : le planificateur joue -> on réentraîne sur SES gestes (endgame fin, hors distribution du jeu)
+    buf = off_buf
+    for r in range(a.dagger_rounds):
+        print(f"--- DAgger ronde {r+1}/{a.dagger_rounds} : collecte on-policy ({a.dagger_eps} épisodes) ---", flush=True)
+        op = collect_onpolicy(dyn, a.dagger_eps, dev, offset, a.w_ang, a.w_app, a.plan_h)
+        if op is None: print("  (aucune trajectoire)"); continue
+        # on répète les transitions on-policy pour qu'elles PÈSENT autant que l'offline (sinon noyées)
+        rep = max(1, off_buf[0].shape[0] // (2 * op[0].shape[0]))
+        buf = [torch.cat([buf[i], op[i].repeat(rep, *[1] * (op[i].dim() - 1))], 0) for i in range(6)]
+        print(f"  {op[0].shape[0]} transitions on-policy (×{rep}) ; réentraînement", flush=True)
+        train_dyn(dyn, opt, buf, a.dagger_steps, a.bs, eval_fn=dyn_eval)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
         best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app)
