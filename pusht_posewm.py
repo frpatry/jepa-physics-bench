@@ -226,8 +226,10 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
                 nb, a = dyn(b, (b if rest else bp), a, A[:, h]); bp = b; b = nb  # rest : chaque coup depuis l'arrêt (frameskip)
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
                 if cover is not None:                                      # CHEVAUCHEMENT (transport+position) + CHASSE D'ANGLE
-                    ang = (b[:, 2:4] - gblk[2:4]).norm(dim=-1)            # distance à l'angle but : gradient vers l'alignement FIN
-                    cost = cost + wt * (cover.cost(b, gblk) + w_ang * ang)  # (sinon il se cale à un optimum local de coverage)
+                    cc = cover.cost(b, gblk)                              # 1 - coverage
+                    ang = (b[:, 2:4] - gblk[2:4]).norm(dim=-1)            # distance à l'angle but
+                    gate = (cc < 0.6).float()                            # chasse d'angle SEULEMENT en endgame (coverage>0.4) :
+                    cost = cost + wt * (cc + w_ang * ang * gate)         # transport = pur chevauchement (pas de catapulte)
                 else:
                     cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)
                 leash = (a - b[:, :2]).norm(dim=-1) - leash_r              # LAISSE : libre d'orbiter le T (rayon leash_r),
