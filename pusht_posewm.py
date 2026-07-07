@@ -253,6 +253,7 @@ def get_args():
     p.add_argument("--data", type=str, default=""); p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--bs", type=int, default=128); p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--tasks", type=int, default=10); p.add_argument("--plan_h", type=int, default=7)
+    p.add_argument("--max_steps", type=int, default=100)                  # budget de pas par épisode (100 trop court)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
@@ -334,7 +335,7 @@ def main():
         train_dyn(dyn, opt, buf, a.dagger_steps, a.bs, eval_fn=dyn_eval)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app)
+        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -361,22 +362,22 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
             f"{q} {np.mean(sc[q]):.2f} (succès {sum(v>0.95 for v in sc[q])}/{a.tasks})" for q in pols), flush=True)
-        # ÉVAL JUSTE : seulement les tâches FAISABLES (celles où l'oracle atteint >0.5)
-        if "oracle" in sc and "mpc" in sc:
-            feas = [k for k in range(a.tasks) if sc["oracle"][k] > 0.5]
-            if feas:
-                mo = np.mean([sc["mpc"][k] for k in feas]); oo = np.mean([sc["oracle"][k] for k in feas])
-                rr = np.mean([sc["random"][k] for k in feas]) if "random" in sc else 0
-                print(f"FAISABLES (oracle>0.5, {len(feas)}/{a.tasks} tâches) : "
-                      f"MPC {mo:.2f}  |  oracle {oo:.2f}  |  aléatoire {rr:.2f}"
-                      f"   [MPC/oracle = {100*mo/oo:.0f}% du plafond]", flush=True)
+        # ÉVAL HONNÊTE sans oracle : jeter les tâches DÉGÉNÉRÉES (rien ne bouge, <0.1 partout = impossibles)
+        if "mpc" in sc and "random" in sc:
+            nd = [k for k in range(a.tasks) if max(sc[q][k] for q in pols) > 0.1]
+            if nd:
+                mo = np.mean([sc["mpc"][k] for k in nd]); rr = np.mean([sc["random"][k] for k in nd])
+                wins = sum(sc["mpc"][k] > sc["random"][k] + 0.02 for k in nd)
+                print(f"NON-DÉGÉNÉRÉES ({len(nd)}/{a.tasks} tâches, qqch bouge) : "
+                      f"MPC {mo:.2f}  vs  aléatoire {rr:.2f}   [MPC gagne {wins}/{len(nd)}, "
+                      f"MPC/aléatoire = {mo/max(rr,1e-6):.1f}×]", flush=True)
             else:
-                print("FAISABLES : aucune tâche où l'oracle dépasse 0.5 (oracle trop faible ou tâches dures)", flush=True)
+                print("NON-DÉGÉNÉRÉES : aucune (toutes les tâches sont plates -> budget/poses trop durs)", flush=True)
         scratch.close()
 
 if __name__ == "__main__":
