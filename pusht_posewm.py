@@ -225,8 +225,11 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
             for h in range(Hp):
                 nb, a = dyn(b, (b if rest else bp), a, A[:, h]); bp = b; b = nb  # rest : chaque coup depuis l'arrêt (frameskip)
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
-                cost = cost + wt * (cover.cost(b, gblk) if cover is not None  # CHEVAUCHEMENT (vrai but, sature -> tient)
-                                    else pose_cost(b, gblk, w_ang, pos_dz, ang_dz))
+                if cover is not None:                                      # CHEVAUCHEMENT (transport+position) + CHASSE D'ANGLE
+                    ang = (b[:, 2:4] - gblk[2:4]).norm(dim=-1)            # distance à l'angle but : gradient vers l'alignement FIN
+                    cost = cost + wt * (cover.cost(b, gblk) + w_ang * ang)  # (sinon il se cale à un optimum local de coverage)
+                else:
+                    cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)
                 leash = (a - b[:, :2]).norm(dim=-1) - leash_r              # LAISSE : libre d'orbiter le T (rayon leash_r),
                 cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité ferme au-delà -> reste près, pousse tout côté
             el = A[cost.argsort()[:elite]]
@@ -338,7 +341,7 @@ def get_args():
     p.add_argument("--max_steps", type=int, default=100)                  # budget de pas par épisode (100 trop court)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
-    p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
+    p.add_argument("--w_ang", type=float, default=0.3)                    # poids de la CHASSE D'ANGLE (chevauchement + w_ang*dist_angle)
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
