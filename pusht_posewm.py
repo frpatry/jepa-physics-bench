@@ -212,11 +212,11 @@ class TCover:
         return 1.0 - occv.mean(1)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13, ang_gate=True):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13, ang_gate=True, sigma0=0.25):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
-        sg = torch.full((Hp, 2), 0.25, device=dev)
+        sg = torch.full((Hp, 2), sigma0, device=dev)                      # sigma0 large = recherche large (échappement basin-hopping)
         for _ in range(iters):
             eps = torch.randn(pop, Hp, 2, device=dev)
             eps[: pop // 2] = torch.randn(pop // 2, 1, 2, device=dev)      # bruit corrélé (iCEM)
@@ -284,7 +284,7 @@ def calib_offset(X, BP, ns=400):
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
                 record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0,
-                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0, escape_min=0.5):
+                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0, escape_min=0.15, escape_sigma=0.6):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -320,9 +320,10 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 esc = escaping > 0
                 bprev = blk if fs > 1 else blk_prev
                 plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev,
-                                mu0=(None if esc else mu), w_ang=(w_ang_escape if esc else w_ang), w_app=w_app,
-                                pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r, ang_gate=(not esc))
-                blk_prev = blk                                           # esc : chasse d'angle forte, sans gate, recherche large (mu=None)
+                                mu0=(None if esc else mu), w_ang=w_ang, w_app=w_app,   # MÊME objectif (chevauchement) en échappement
+                                pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r,
+                                ang_gate=True, sigma0=(escape_sigma if esc else 0.25))  # esc : recherche LARGE (warm-start jeté) -> nouvelle stratégie
+                blk_prev = blk
                 k = min(commit, plan.shape[0])
                 plan_seq = [plan[i] for i in range(k)]                   # s'ENGAGER sur k actions avant de reconsidérer
                 mu = torch.cat([plan[k:], torch.zeros(k, 2, device=dev)])
@@ -364,7 +365,8 @@ def get_args():
     p.add_argument("--stuck_eps", type=float, default=0.02)               # amplitude de coverage sous laquelle = coincé
     p.add_argument("--escape_steps", type=int, default=8)                 # durée de la rafale d'échappement
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
-    p.add_argument("--escape_min", type=float, default=0.5)               # n'échapper QUE si coverage>ce seuil (bien posé -> parfaire l'angle)
+    p.add_argument("--escape_min", type=float, default=0.15)              # échapper dès qu'il y a CHEVAUCHEMENT (>seuil) mais stagnation
+    p.add_argument("--escape_sigma", type=float, default=0.6)             # bruit CEM pendant l'échappement (recherche large = nouvelle stratégie)
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
@@ -468,7 +470,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -519,7 +521,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
