@@ -138,7 +138,7 @@ def pose_cost(blk, gblk, w_ang=1.0):
     ang = (blk[:, 2:4] - gblk[2:4]).norm(dim=-1)                          # distance (sinθ,cosθ)
     return pos + w_ang * ang
 
-def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax=0.5, dev="cpu",
+def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax=0.5, dev="cpu",
              mu0=None, w_ang=1.0, w_app=0.1):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
@@ -151,9 +151,9 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=4, pop=192, iters=3, elite=16, amax
             b, bp, a, cost = blk, blkp, ag, 0.
             for h in range(Hp):
                 nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
-                if h >= Hp - 2:
-                    cost = cost + pose_cost(b, gblk, w_ang)
-                    cost = cost + w_app * (a - b[:, :2]).norm(dim=-1)      # approche (agent près du bloc)
+                wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
+                cost = cost + wt * pose_cost(b, gblk, w_ang)               # -> pente même quand le but est LOIN (anti-dithering)
+                cost = cost + wt * w_app * (a - b[:, :2]).norm(dim=-1)     # rester au contact pour pousser
             el = A[cost.argsort()[:elite]]
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.05)
     return mu.clamp(-amax, amax)
@@ -249,7 +249,7 @@ def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--data", type=str, default=""); p.add_argument("--steps", type=int, default=8000)
     p.add_argument("--bs", type=int, default=128); p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--tasks", type=int, default=10); p.add_argument("--plan_h", type=int, default=4)
+    p.add_argument("--tasks", type=int, default=10); p.add_argument("--plan_h", type=int, default=7)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
