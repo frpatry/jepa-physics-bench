@@ -453,6 +453,18 @@ def main():
             plt.tight_layout(); plt.savefig(out); print(f"figure -> {out}", flush=True)
         except Exception as e:
             print("plot skip:", str(e)[:70], flush=True)
+        try:                                                              # ANIMATION : TOUS les pas -> voir la manœuvre se dérouler
+            from PIL import Image, ImageDraw
+            scl = 4; ims = []
+            for i, f in enumerate(frames):
+                im = Image.fromarray(f.astype(np.uint8)).resize((f.shape[1] * scl, f.shape[0] * scl), Image.NEAREST)
+                ImageDraw.Draw(im).text((6, 6), f"pas {i}  cov {covs[i]:.2f}", fill=(200, 0, 0))
+                ims.append(im)
+            gif = "/content/pusht_posewm.gif" if os.path.isdir("/content") else "pusht_posewm.gif"
+            ims[0].save(gif, save_all=True, append_images=ims[1:], duration=80, loop=0)
+            print(f"animation -> {gif} ({len(ims)} pas)", flush=True)
+        except Exception as e:
+            print("gif skip:", str(e)[:70], flush=True)
         if a.tasks == 0:
             return
     # BRIQUE 3 : planification
