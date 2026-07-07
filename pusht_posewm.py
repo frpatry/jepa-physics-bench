@@ -168,12 +168,12 @@ def to_state(bp, ag, S=512.0):
     return blk.astype(np.float32), (ag / S).astype(np.float32)
 
 # ---------- BRIQUE 3 : planification dans l'espace des poses ----------
-def pose_cost(blk, gblk, w_ang=1.0, pos_dz=0.0, ang_dz=0.0):
-    """ZONE MORTE : sous pos_dz (position) et ang_dz (angle), le coût tombe à 0 -> le planificateur
-    devient indifférent une fois 'assez bon' et TIENT, au lieu de raffiner sans fin et cogner le T dehors."""
+def pose_cost(blk, gblk, w_ang=1.0, pos_dz=0.0, ang_dz=0.0, w_pos=1.0):
+    """Distance de pose = w_pos·|position| + w_ang·|angle|. La position est en unités /512 (30px=0.06,
+    minuscule vs angle ~0.5) -> w_pos>1 rééquilibre pour que le T bien orienté soit TIRÉ sur le but."""
     pos = (blk[:, :2] - gblk[:2]).norm(dim=-1)
     ang = (blk[:, 2:4] - gblk[2:4]).norm(dim=-1)                          # distance (sinθ,cosθ)
-    return (pos - pos_dz).clamp_min(0.0) + w_ang * (ang - ang_dz).clamp_min(0.0)
+    return w_pos * (pos - pos_dz).clamp_min(0.0) + w_ang * (ang - ang_dz).clamp_min(0.0)
 
 def build_template(dev, npts=600):
     """Empreinte du T en repère LOCAL du bloc (normalisée /512), lue UNE fois depuis une photo (aucune
@@ -212,7 +212,7 @@ class TCover:
         return 1.0 - occv.mean(1)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13, ang_gate=True, sigma0=0.25):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13, ang_gate=True, sigma0=0.25, w_pos=1.0):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -231,7 +231,7 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
                     gate = (cc < 0.6).float() if ang_gate else torch.ones_like(cc)  # gate: chasse d'angle endgame seulement (off pdt échappement)
                     cost = cost + wt * (cc + w_ang * ang * gate)         # transport = pur chevauchement (pas de catapulte)
                 else:
-                    cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)
+                    cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz, w_pos)
                 leash = (a - b[:, :2]).norm(dim=-1) - leash_r              # LAISSE : libre d'orbiter le T (rayon leash_r),
                 cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité ferme au-delà -> reste près, pousse tout côté
             el = A[cost.argsort()[:elite]]
@@ -284,7 +284,7 @@ def calib_offset(X, BP, ns=400):
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
                 record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0,
-                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0, escape_min=0.15, escape_sigma=0.6):
+                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0, escape_min=0.15, escape_sigma=0.6, w_pos=1.0):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -322,7 +322,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev,
                                 mu0=(None if esc else mu), w_ang=w_ang, w_app=w_app,   # MÊME objectif (chevauchement) en échappement
                                 pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r,
-                                ang_gate=True, sigma0=(escape_sigma if esc else 0.25))  # esc : recherche LARGE (warm-start jeté) -> nouvelle stratégie
+                                ang_gate=True, sigma0=(escape_sigma if esc else 0.25), w_pos=w_pos)  # esc : recherche LARGE (warm-start jeté) -> nouvelle stratégie
                 blk_prev = blk
                 k = min(commit, plan.shape[0])
                 plan_seq = [plan[i] for i in range(k)]                   # s'ENGAGER sur k actions avant de reconsidérer
@@ -381,6 +381,7 @@ def get_args():
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
     p.add_argument("--escape_min", type=float, default=1.0)               # 1.0 = échappement OFF (basin-hopping testé, ne franchit pas le mur)
     p.add_argument("--escape_sigma", type=float, default=0.6)             # bruit CEM pendant l'échappement (recherche large = nouvelle stratégie)
+    p.add_argument("--w_pos", type=float, default=1.0)                   # poids POSITION dans pose_cost (rééquilibre : /512 rend la position minuscule)
     p.add_argument("--gif_all", type=int, default=0)                      # 1 = un GIF par tâche (pusht_task00.gif ...) pour voir chaque épisode
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
@@ -485,7 +486,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -528,7 +529,7 @@ def main():
             line = []
             for q in pols:
                 rec = (a.gif_all and q == "mpc")                          # GIF par tâche : filmer le MPC de chaque tâche
-                r = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, record=rec)
+                r = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos, record=rec)
                 if rec: cov = r[0]; save_gif(r[1], r[2], f"{gdir}/pusht_task{k:02d}.gif")
                 else: cov = r
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
