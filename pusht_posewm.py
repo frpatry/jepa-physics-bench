@@ -293,7 +293,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     frames, covs = [], []; tbp, tag, tac = [], [], []                    # trajectoire VRAIE (pour on-policy)
     diag = []                                                            # (pas, cov, erreur angle perçu-vs-vrai °, erreur pos px)
     steps_done = 0; done = False
-    plan_seq = []; recent_cov = []; escaping = 0                          # anti-hésitation (commit) + détecteur de blocage (escape)
+    plan_seq = []; escaping = 0; best_seen = best; last_improve = 0       # anti-hésitation (commit) + détecteur de blocage (escape)
     while steps_done < max_steps and not done:                           # 1 tour = 1 COUP = fs pas d'env
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
@@ -311,12 +311,10 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 aerr = float(np.degrees(np.abs(np.angle(np.exp(1j * (bp[2] - tp[2])))))) if pose is not None else 999.0
                 diag.append((steps_done, cur_cov, aerr, float(np.linalg.norm(bp[:2] - tp[:2]))))
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
-            # DÉTECTEUR DE BLOCAGE : coverage plat depuis stuck_w coups (et pas déjà bon) -> ÉCHAPPEMENT
-            recent_cov.append(cur_cov)
-            if len(recent_cov) > stuck_w: recent_cov.pop(0)
-            if (escaping == 0 and cur_cov < 0.9 and len(recent_cov) >= stuck_w
-                    and max(recent_cov) - min(recent_cov) < stuck_eps):
-                escaping = escape_steps; plan_seq = []                   # forcer un re-plan d'échappement
+            # DÉTECTEUR DE BLOCAGE : pas de NOUVEAU record de coverage depuis stuck_w coups -> ÉCHAPPEMENT
+            if cur_cov > best_seen + 0.01: best_seen = cur_cov; last_improve = steps_done  # (robuste au jitter, vs 'plat')
+            if escaping == 0 and cur_cov < 0.9 and steps_done - last_improve >= stuck_w:
+                escaping = escape_steps; plan_seq = []; last_improve = steps_done  # rafale + reset (pas de re-trigger immédiat)
                 if record: print(f"  [ÉCHAPPEMENT @pas {steps_done}, coincé à cov {cur_cov:.2f}]", flush=True)
             if not plan_seq:                                             # (RE)PLANIFIER — sinon on SUIT le plan engagé (anti-hésitation)
                 esc = escaping > 0
@@ -360,7 +358,7 @@ def get_args():
     p.add_argument("--max_steps", type=int, default=100)                  # budget de pas par épisode (100 trop court)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
-    p.add_argument("--w_ang", type=float, default=0.0)                    # chasse d'angle en régime normal (0 = pur chevauchement, base stable)
+    p.add_argument("--w_ang", type=float, default=0.3)                    # chasse d'angle GATÉE (endgame) — marche (A : 3 tâches à 0.92)
     p.add_argument("--commit", type=int, default=4)                       # anti-hésitation : nb d'actions exécutées avant de re-planifier
     p.add_argument("--stuck_w", type=int, default=12)                     # fenêtre de détection de blocage (coups)
     p.add_argument("--stuck_eps", type=float, default=0.02)               # amplitude de coverage sous laquelle = coincé
