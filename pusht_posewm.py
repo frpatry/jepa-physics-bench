@@ -143,13 +143,15 @@ def to_state(bp, ag, S=512.0):
     return blk.astype(np.float32), (ag / S).astype(np.float32)
 
 # ---------- BRIQUE 3 : planification dans l'espace des poses ----------
-def pose_cost(blk, gblk, w_ang=1.0):
+def pose_cost(blk, gblk, w_ang=1.0, pos_dz=0.0, ang_dz=0.0):
+    """ZONE MORTE : sous pos_dz (position) et ang_dz (angle), le coût tombe à 0 -> le planificateur
+    devient indifférent une fois 'assez bon' et TIENT, au lieu de raffiner sans fin et cogner le T dehors."""
     pos = (blk[:, :2] - gblk[:2]).norm(dim=-1)
     ang = (blk[:, 2:4] - gblk[2:4]).norm(dim=-1)                          # distance (sinθ,cosθ)
-    return pos + w_ang * ang
+    return (pos - pos_dz).clamp_min(0.0) + w_ang * (ang - ang_dz).clamp_min(0.0)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -162,7 +164,7 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax
             for h in range(Hp):
                 nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
-                cost = cost + wt * pose_cost(b, gblk, w_ang)               # -> pente même quand le but est LOIN (anti-dithering)
+                cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)  # -> pente si but LOIN (anti-dithering) ; 0 si assez bon (tient)
                 leash = (a - b[:, :2]).norm(dim=-1) - 0.16                 # LAISSE LÂCHE : libre d'orbiter le T (~80px),
                 cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité SEULEMENT au-delà -> peut pousser tout côté
             el = A[cost.argsort()[:elite]]
@@ -214,7 +216,7 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -233,7 +235,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
-            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app)
+            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app, pos_dz=pos_dz, ang_dz=ang_dz)
             blk_prev = blk
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
@@ -266,6 +268,8 @@ def get_args():
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
     p.add_argument("--w_app", type=float, default=0.1)                    # poids de l'approche
+    p.add_argument("--pos_dz", type=float, default=0.02)                  # zone morte position (norm. ; 0.02=~10px) -> tenir
+    p.add_argument("--ang_dz", type=float, default=0.08)                  # zone morte angle (dist sin/cos ; 0.08=~5°) -> tenir
     p.add_argument("--dagger_rounds", type=int, default=0)               # rondes on-policy (0 = off)
     p.add_argument("--dagger_eps", type=int, default=20)                 # épisodes collectés par ronde
     p.add_argument("--dagger_steps", type=int, default=3000)             # réentraînement par ronde
@@ -343,7 +347,7 @@ def main():
         train_dyn(dyn, opt, buf, a.dagger_steps, a.bs, eval_fn=dyn_eval)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app)
+        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -370,7 +374,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
