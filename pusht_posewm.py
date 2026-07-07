@@ -150,8 +150,44 @@ def pose_cost(blk, gblk, w_ang=1.0, pos_dz=0.0, ang_dz=0.0):
     ang = (blk[:, 2:4] - gblk[2:4]).norm(dim=-1)                          # distance (sinθ,cosθ)
     return (pos - pos_dz).clamp_min(0.0) + w_ang * (ang - ang_dz).clamp_min(0.0)
 
+def build_template(dev, npts=600):
+    """Empreinte du T en repère LOCAL du bloc (normalisée /512), lue UNE fois depuis une photo (aucune
+    géométrie codée en dur). Sert à mesurer le CHEVAUCHEMENT géométrique imaginé-vs-but = le VRAI objectif."""
+    env = make_env()
+    obs, info = reset_faithful(env, np.array([20., 20., 256., 256., 0.6], np.float32))
+    _, mask = _masks(obs["pixels"]); H = obs["pixels"].shape[0]; k = 512.0 / H
+    b = np.array(info["block_pose"], np.float32); th = b[2]
+    ys, xs = np.nonzero(mask); wx = xs * k - b[0]; wy = ys * k - b[1]
+    lx = np.cos(th) * wx + np.sin(th) * wy                                # R(-θ)·(monde - centre)
+    ly = -np.sin(th) * wx + np.cos(th) * wy
+    env.close()
+    tl = np.stack([lx, ly], 1) / 512.0
+    if len(tl) > npts: tl = tl[np.random.default_rng(0).choice(len(tl), npts, replace=False)]
+    return tl.astype(np.float32)
+
+class TCover:
+    """Chevauchement de deux T en espace de poses. cost = 1 - fraction du T-BUT recouverte par le
+    T-IMAGINÉ. SATURE à recouvrement max -> le planificateur tient tout seul ET cherche la vraie
+    rotation d'alignement (le proxy de pose, lui, se figeait à mi-chemin). Vectorisé GPU."""
+    def __init__(s, tl, dev, G=48):
+        s.tl = torch.tensor(tl, device=dev); s.G = G
+        lo = s.tl.min(0).values - 0.02; s.lo = lo; s.span = (s.tl.max(0).values + 0.02 - lo).clamp_min(1e-6)
+        ix = ((s.tl - lo) / s.span * G).long().clamp(0, G - 1)
+        occ = torch.zeros(G, G, device=dev); occ[ix[:, 1], ix[:, 0]] = 1.0
+        s.occ = torch.nn.functional.max_pool2d(occ[None, None], 3, 1, 1)[0, 0]  # combler les trous du masque
+    def cost(s, blk, gblk):                                               # blk (P,4), gblk (4,) -> (P,)
+        gpx = gblk[0] + gblk[3] * s.tl[:, 0] - gblk[2] * s.tl[:, 1]       # points du T-but (monde norm.)
+        gpy = gblk[1] + gblk[2] * s.tl[:, 0] + gblk[3] * s.tl[:, 1]
+        relx = gpx.unsqueeze(0) - blk[:, 0:1]; rely = gpy.unsqueeze(0) - blk[:, 1:2]   # (P,M)
+        lx = blk[:, 3:4] * relx + blk[:, 2:3] * rely                      # R(-θ) dans le repère du bloc imaginé
+        ly = -blk[:, 2:3] * relx + blk[:, 3:4] * rely
+        ix = ((lx - s.lo[0]) / s.span[0] * s.G).long(); iy = ((ly - s.lo[1]) / s.span[1] * s.G).long()
+        inb = (ix >= 0) & (ix < s.G) & (iy >= 0) & (iy < s.G)
+        occv = s.occ[iy.clamp(0, s.G - 1), ix.clamp(0, s.G - 1)] * inb.float()
+        return 1.0 - occv.mean(1)
+
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -164,7 +200,8 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax
             for h in range(Hp):
                 nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
-                cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)  # -> pente si but LOIN (anti-dithering) ; 0 si assez bon (tient)
+                cost = cost + wt * (cover.cost(b, gblk) if cover is not None  # CHEVAUCHEMENT (vrai but, sature -> tient)
+                                    else pose_cost(b, gblk, w_ang, pos_dz, ang_dz))
                 leash = (a - b[:, :2]).norm(dim=-1) - 0.16                 # LAISSE LÂCHE : libre d'orbiter le T (~80px),
                 cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité SEULEMENT au-delà -> peut pousser tout côté
             el = A[cost.argsort()[:elite]]
@@ -216,7 +253,7 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -235,7 +272,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
-            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app, pos_dz=pos_dz, ang_dz=ang_dz)
+            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app, pos_dz=pos_dz, ang_dz=ang_dz, cover=cover)
             blk_prev = blk
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
@@ -268,8 +305,9 @@ def get_args():
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
     p.add_argument("--w_app", type=float, default=0.1)                    # poids de l'approche
-    p.add_argument("--pos_dz", type=float, default=0.02)                  # zone morte position (norm. ; 0.02=~10px) -> tenir
-    p.add_argument("--ang_dz", type=float, default=0.08)                  # zone morte angle (dist sin/cos ; 0.08=~5°) -> tenir
+    p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
+    p.add_argument("--ang_dz", type=float, default=0.0)                   # zone morte angle (proxy pose ; désactivée)
+    p.add_argument("--cover", type=int, default=1)                        # coût = CHEVAUCHEMENT géométrique (vrai but) vs proxy pose
     p.add_argument("--dagger_rounds", type=int, default=0)               # rondes on-policy (0 = off)
     p.add_argument("--dagger_eps", type=int, default=20)                 # épisodes collectés par ronde
     p.add_argument("--dagger_steps", type=int, default=3000)             # réentraînement par ronde
@@ -345,9 +383,19 @@ def main():
         buf = [torch.cat([buf[i], op[i].repeat(rep, *[1] * (op[i].dim() - 1))], 0) for i in range(6)]
         print(f"  {op[0].shape[0]} transitions on-policy (×{rep}) ; réentraînement", flush=True)
         train_dyn(dyn, opt, buf, a.dagger_steps, a.bs, eval_fn=dyn_eval)
+    # BRIQUE 3 : coût = CHEVAUCHEMENT géométrique (vrai objectif), empreinte du T lue une fois
+    cover = None
+    if a.cover:
+        tl = build_template(dev); cover = TCover(tl, dev)
+        g = torch.tensor([0.5, 0.5, math.sin(0.6), math.cos(0.6)], dtype=torch.float32, device=dev)
+        shift = g.clone(); shift[0] += 0.06                              # +30px
+        rot = torch.tensor([0.5, 0.5, math.sin(1.4), math.cos(1.4)], dtype=torch.float32, device=dev)  # +46°
+        print(f"CHEVAUCHEMENT auto-test : au but {1-cover.cost(g[None],g).item():.2f} (~1) | "
+              f"décalé 30px {1-cover.cost(shift[None],g).item():.2f} | tourné 46° {1-cover.cost(rot[None],g).item():.2f}"
+              f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz)
+        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -374,7 +422,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
