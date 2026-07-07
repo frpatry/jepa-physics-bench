@@ -31,17 +31,79 @@ def _moment_pose(m):
     if (u ** 3).mean() < 0: phi += np.pi                                  # 3e moment : sens de la tige (360°)
     return xs.mean(), ys.mean(), phi
 
-def pose_from_image(img, S=512):
-    """img HxHx3 (float 0..1 ou uint8). -> (bx, by, bangle, ax, ay) en unités env [0,S], ou None."""
+def _masks(img):
+    """(agent, bloc) masques booléens. Source unique des seuils couleur."""
     if img.dtype == np.uint8: img = img.astype(np.float32) / 255
-    H = img.shape[0]; R, G, Bl = img[..., 0], img[..., 1], img[..., 2]
+    R, G, Bl = img[..., 0], img[..., 1], img[..., 2]
     agent = (Bl > 0.8) & (R < 0.55) & (G < 0.75)
     green = (G > 0.75) & (R < 0.75) & (Bl < 0.75)
     block = (R > 0.35) & (R < 0.72) & (np.abs(R - G) < 0.12) & (Bl - R > 0.02) & (Bl - R < 0.30) & (~green)
+    return agent, block
+
+def pose_from_image(img, S=512):
+    """img HxHx3 (float 0..1 ou uint8). -> (bx, by, bangle, ax, ay) en unités env [0,S], ou None."""
+    H = img.shape[0]; agent, block = _masks(img)
     pa = _moment_pose(agent); pb = _moment_pose(block)
     if pa is None or pb is None: return None
     k = S / H
     return np.array([pb[0] * k, pb[1] * k, pb[2], pa[0] * k, pa[1] * k], np.float32)
+
+# ---------- SONDE DE SURFACE : balayer les points de contact du T (idée utilisateur) ----------
+def _smooth(m, it=3):
+    m = m.astype(np.float32)
+    for _ in range(it):
+        s = m.copy(); s[1:] += m[:-1]; s[:-1] += m[1:]; s[:, 1:] += m[:, :-1]; s[:, :-1] += m[:, 1:]
+        m = s / 5.0
+    return m
+
+def surface_points(img, spacing_px=6.0, S=512.0):
+    """Depuis la PHOTO : contour du T (silhouette rendue) + normale SORTANTE par point, espacés
+    ~spacing_px @S. Aucun apprentissage, aucune géométrie codée en dur — on lit les pixels."""
+    _, mask = _masks(img); H = img.shape[0]; k = S / H
+    er = mask.copy()
+    er[1:] &= mask[:-1]; er[:-1] &= mask[1:]; er[:, 1:] &= mask[:, :-1]; er[:, :-1] &= mask[:, 1:]
+    bnd = mask & ~er                                                      # pixels de bord
+    sm = _smooth(mask); gy, gx = np.gradient(sm)                          # grad pointe vers l'INTÉRIEUR
+    ys, xs = np.nonzero(bnd)
+    if len(xs) < 5: return np.zeros((0, 2), np.float32), np.zeros((0, 2), np.float32)
+    order = np.argsort(np.arctan2(ys - ys.mean(), xs - xs.mean()))        # tour du contour, espacement régulier
+    pts, nls, last = [], [], None
+    for i in order:
+        x, y = xs[i] * k, ys[i] * k
+        nx, ny = -gx[ys[i], xs[i]], -gy[ys[i], xs[i]]                     # normale sortante = -grad
+        nn = math.hypot(nx, ny)
+        if nn < 1e-6: continue
+        nx, ny = nx / nn, ny / nn
+        if last is not None and math.hypot(x - last[0], y - last[1]) < spacing_px: continue
+        pts.append((x, y)); nls.append((nx, ny)); last = (x, y)
+    return np.array(pts, np.float32), np.array(nls, np.float32)
+
+def collect_probe(n_poses, spacing, gap, push, dev, seed=7):
+    """Pour chaque pose de départ : garer l'agent, PHOTO -> points de contact ; puis, point par point,
+    reset (T à la pose, agent devant le point) -> UNE poussée normale -> photo -> transition -> revenir.
+    Retourne un buffer de transitions au même format que l'offline (depuis l'arrêt : blk_prev=blk)."""
+    env = make_env(); rng = np.random.default_rng(seed)
+    B0, AG0, AC, B1, AG1 = [], [], [], [], []
+    for pi in range(n_poses):
+        bx = rng.uniform(140, 372); by = rng.uniform(140, 372); ba = rng.uniform(0, 2 * np.pi)
+        obs, info = reset_faithful(env, np.array([20.0, 20.0, bx, by, ba], np.float32))  # agent garé -> silhouette propre
+        pts, nls = surface_points(obs["pixels"])
+        for (px, py), (nx, ny) in zip(pts, nls):
+            ax = px + nx * gap; ay = py + ny * gap                       # agent juste devant la surface
+            if not (8 < ax < 504 and 8 < ay < 504): continue
+            obs, info = reset_faithful(env, np.array([ax, ay, bx, by, ba], np.float32))
+            b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
+            tgt = np.clip([px - nx * push, py - ny * push], 0, 512).astype(np.float32)  # pousser DANS la surface
+            obs, _, term, trunc, info = env.step(tgt)
+            B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1))
+            B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
+        if pi % 20 == 0: print(f"  sonde pose {pi:3d}/{n_poses}  ({len(B0)} transitions)", flush=True)
+    env.close()
+    B0, AG0, B1, AG1 = map(lambda z: np.array(z, np.float32), (B0, AG0, B1, AG1)); AC = np.array(AC, np.float32)
+    blk0, ag0 = to_state(B0, AG0); blk1, ag1 = to_state(B1, AG1)
+    Tt = lambda z: torch.tensor(z, device=dev)
+    # format buffer : [blk_prev, blk, ag, act, blk_next, ag_next] ; depuis l'arrêt -> blk_prev = blk
+    return [Tt(blk0), Tt(blk0), Tt(ag0), Tt(AC), Tt(blk1), Tt(ag1)]
 
 # ---------- BRIQUE 2 : dynamique apprise sur les poses ----------
 class PoseDyn(nn.Module):
@@ -195,6 +257,10 @@ def get_args():
     p.add_argument("--dagger_rounds", type=int, default=0)               # rondes on-policy (0 = off)
     p.add_argument("--dagger_eps", type=int, default=20)                 # épisodes collectés par ronde
     p.add_argument("--dagger_steps", type=int, default=3000)             # réentraînement par ronde
+    p.add_argument("--probe_poses", type=int, default=0)                 # sonde de surface : nb de poses de départ (0=off)
+    p.add_argument("--probe_spacing", type=float, default=6.0)           # espacement des points de contact (px @512)
+    p.add_argument("--probe_gap", type=float, default=18.0)              # distance agent<->surface au départ (px)
+    p.add_argument("--probe_push", type=float, default=20.0)             # profondeur de la poussée fine (px)
     return p.parse_args()
 
 def main():
@@ -226,13 +292,30 @@ def main():
     off_buf = [blk[:ntr, 0:T - 2].reshape(-1, 4), blk[:ntr, 1:T - 1].reshape(-1, 4), ag[:ntr, 1:T - 1].reshape(-1, 2),
                act[:ntr, 1:T - 1].reshape(-1, 2), blk[:ntr, 2:T].reshape(-1, 4), ag[:ntr, 2:T].reshape(-1, 2)]
     bv = blk[ntr:]
+    # SONDE DE SURFACE (idée utilisateur) : balayage systématique de la réponse locale, mélangé à l'offline.
+    pb_val = None
+    if a.probe_poses > 0:
+        print(f"--- sonde de surface : {a.probe_poses} poses, espacement {a.probe_spacing:.0f}px, "
+              f"poussée {a.probe_push:.0f}px ---", flush=True)
+        pb = collect_probe(a.probe_poses, a.probe_spacing, a.probe_gap, a.probe_push, dev)
+        M = pb[0].shape[0]; nv = min(2000, M // 10)
+        pb_val = [t[M - nv:] for t in pb]; pb_tr = [t[:M - nv] for t in pb]
+        rep = max(1, off_buf[0].shape[0] // max(1, 2 * pb_tr[0].shape[0]))  # peser ~autant que l'offline
+        off_buf = [torch.cat([off_buf[i], pb_tr[i].repeat(rep, *[1] * (pb_tr[i].dim() - 1))], 0) for i in range(6)]
+        print(f"  {M} transitions de sonde ({nv} tenues à l'écart) ; ×{rep} mélangées à l'offline", flush=True)
     def dyn_eval(st):
         with torch.no_grad():
             nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])
             ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
             ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
-        print(f"  step {st:5d}  bloc t+1 : imaginé {ep:.1f}px  vs copie {ec:.1f}px", flush=True)
-    print("--- dynamique (jeu aléatoire) ---", flush=True)
+            msg = f"  step {st:5d}  bloc t+1 alÉatoire : imaginé {ep:.1f}px vs copie {ec:.1f}px"
+            if pb_val is not None:                                        # réponse locale FINE (sonde)
+                nbp, _ = dyn(pb_val[1], pb_val[0], pb_val[2], pb_val[3])
+                ip = (nbp[:, :2] - pb_val[4][:, :2]).norm(dim=-1).mean().item() * 512
+                cp = (pb_val[1][:, :2] - pb_val[4][:, :2]).norm(dim=-1).mean().item() * 512
+                msg += f"  |  sonde fine : imaginé {ip:.1f}px vs copie {cp:.1f}px"
+        print(msg, flush=True)
+    print("--- dynamique ---", flush=True)
     train_dyn(dyn, opt, off_buf, a.steps, a.bs, eval_fn=dyn_eval)
     # DAgger : le planificateur joue -> on réentraîne sur SES gestes (endgame fin, hors distribution du jeu)
     buf = off_buf
