@@ -186,7 +186,7 @@ class TCover:
         occv = s.occ[iy.clamp(0, s.G - 1), ix.clamp(0, s.G - 1)] * inb.float()
         return 1.0 - occv.mean(1)
 
-def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax=0.5, dev="cpu",
+def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
              mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
