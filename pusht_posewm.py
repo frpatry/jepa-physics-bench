@@ -381,6 +381,7 @@ def get_args():
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
     p.add_argument("--escape_min", type=float, default=1.0)               # 1.0 = échappement OFF (basin-hopping testé, ne franchit pas le mur)
     p.add_argument("--escape_sigma", type=float, default=0.6)             # bruit CEM pendant l'échappement (recherche large = nouvelle stratégie)
+    p.add_argument("--task_seed", type=int, default=3000)                # seed de base des tâches d'éval (5000 = jeu FRAIS tenu à l'écart)
     p.add_argument("--w_pos", type=float, default=1.0)                   # poids POSITION dans pose_cost (rééquilibre : /512 rend la position minuscule)
     p.add_argument("--gif_all", type=int, default=0)                      # 1 = un GIF par tâche (pusht_task00.gif ...) pour voir chaque épisode
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
@@ -486,7 +487,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos)
+        best, frames, covs, diag = run_episode(dyn, a.task_seed + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -529,7 +530,7 @@ def main():
             line = []
             for q in pols:
                 rec = (a.gif_all and q == "mpc")                          # GIF par tâche : filmer le MPC de chaque tâche
-                r = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos, record=rec)
+                r = run_episode(dyn, a.task_seed + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min, escape_sigma=a.escape_sigma, w_pos=a.w_pos, record=rec)
                 if rec: cov = r[0]; save_gif(r[1], r[2], f"{gdir}/pusht_task{k:02d}.gif")
                 else: cov = r
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
