@@ -212,7 +212,7 @@ class TCover:
         return 1.0 - occv.mean(1)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -227,8 +227,8 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
                 cost = cost + wt * (cover.cost(b, gblk) if cover is not None  # CHEVAUCHEMENT (vrai but, sature -> tient)
                                     else pose_cost(b, gblk, w_ang, pos_dz, ang_dz))
-                leash = (a - b[:, :2]).norm(dim=-1) - 0.16                 # LAISSE LÂCHE : libre d'orbiter le T (~80px),
-                cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité SEULEMENT au-delà -> peut pousser tout côté
+                leash = (a - b[:, :2]).norm(dim=-1) - leash_r              # LAISSE : libre d'orbiter le T (rayon leash_r),
+                cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité ferme au-delà -> reste près, pousse tout côté
             el = A[cost.argsort()[:elite]]
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.05)
     return mu.clamp(-amax, amax)
@@ -278,7 +278,7 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -304,7 +304,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
             bprev = blk if fs > 1 else blk_prev                          # frameskip : modèle entraîné depuis l'arrêt (vit. nulle)
             plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app,
-                            pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1))
+                            pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r)
             blk_prev = blk
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
@@ -338,7 +338,8 @@ def get_args():
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     p.add_argument("--w_ang", type=float, default=1.0)                    # poids de l'angle dans le coût (endgame rotation)
-    p.add_argument("--w_app", type=float, default=0.1)                    # poids de l'approche
+    p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
+    p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
     p.add_argument("--ang_dz", type=float, default=0.0)                   # zone morte angle (proxy pose ; désactivée)
     p.add_argument("--cover", type=int, default=1)                        # coût = CHEVAUCHEMENT géométrique (vrai but) vs proxy pose
@@ -440,7 +441,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -491,7 +492,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
