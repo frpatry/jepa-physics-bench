@@ -78,7 +78,30 @@ def surface_points(img, spacing_px=6.0, S=512.0):
         pts.append((x, y)); nls.append((nx, ny)); last = (x, y)
     return np.array(pts, np.float32), np.array(nls, np.float32)
 
-def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7):
+def collect_free(n_tr, fs, dev, seed=11):
+    """Transitions LIBRES (agent n'importe où, cible aléatoire, TENUE fs pas) : couvre le hors-contact
+    (agent loin -> T immobile) et les approches variées — complément de la sonde en mode frameskip."""
+    env = make_env(); rng = np.random.default_rng(seed)
+    B0, AG0, AC, B1, AG1 = [], [], [], [], []
+    while len(B0) < n_tr:
+        bx = rng.uniform(140, 372); by = rng.uniform(140, 372); ba = rng.uniform(0, 2 * np.pi)
+        ax = rng.uniform(40, 472); ay = rng.uniform(40, 472)
+        obs, info = reset_faithful(env, np.array([ax, ay, bx, by, ba], np.float32))
+        b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
+        th = rng.uniform(0, 2 * np.pi); mag = rng.uniform(0.05, 0.5)
+        tgt = np.clip(a0 + mag * 512 * np.array([np.cos(th), np.sin(th)]), 0, 512).astype(np.float32)
+        for _ in range(fs):
+            obs, _, term, trunc, info = env.step(tgt)
+            if term or trunc: break
+        B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1))
+        B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
+        if len(B0) % 3000 == 0: print(f"  libre {len(B0)}/{n_tr}", flush=True)
+    env.close()
+    B0, AG0, B1, AG1 = map(lambda z: np.array(z, np.float32), (B0, AG0, B1, AG1)); AC = np.array(AC, np.float32)
+    blk0, ag0 = to_state(B0, AG0); blk1, ag1 = to_state(B1, AG1); Tt = lambda z: torch.tensor(z, device=dev)
+    return [Tt(blk0), Tt(blk0), Tt(ag0), Tt(AC), Tt(blk1), Tt(ag1)]
+
+def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7, fs=1):
     """Pour chaque pose de départ : garer l'agent, PHOTO -> points de contact ; puis, point par point,
     reset (T à la pose, agent devant le point) -> poussées de PLUSIEURS FORCES (cogne doux->fort) ->
     photo -> transition -> revenir. Le modèle apprend la réponse comme FONCTION de la force -> il sait
@@ -96,7 +119,9 @@ def collect_probe(n_poses, spacing, gap, pushes, dev, seed=7):
                 obs, info = reset_faithful(env, np.array([ax, ay, bx, by, ba], np.float32))
                 b0 = np.array(info["block_pose"], np.float32); a0 = np.array(obs["agent_pos"], np.float32)
                 tgt = np.clip([px - nx * push, py - ny * push], 0, 512).astype(np.float32)  # pousser DANS la surface
-                obs, _, term, trunc, info = env.step(tgt)
+                for _ in range(fs):                                       # tenir la poussée fs pas (frameskip)
+                    obs, _, term, trunc, info = env.step(tgt)
+                    if term or trunc: break
                 B0.append(b0); AG0.append(a0); AC.append(np.clip((tgt - a0) / 512.0, -1, 1)); PU.append(push)
                 B1.append(np.array(info["block_pose"], np.float32)); AG1.append(np.array(obs["agent_pos"], np.float32))
         if pi % 20 == 0: print(f"  sonde pose {pi:3d}/{n_poses}  ({len(B0)} transitions)", flush=True)
@@ -187,7 +212,7 @@ class TCover:
         return 1.0 - occv.mean(1)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -198,7 +223,7 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
             A = (mu + sg * eps).clamp(-amax, amax)
             b, bp, a, cost = blk, blkp, ag, 0.
             for h in range(Hp):
-                nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
+                nb, a = dyn(b, (b if rest else bp), a, A[:, h]); bp = b; b = nb  # rest : chaque coup depuis l'arrêt (frameskip)
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
                 cost = cost + wt * (cover.cost(b, gblk) if cover is not None  # CHEVAUCHEMENT (vrai but, sature -> tient)
                                     else pose_cost(b, gblk, w_ang, pos_dz, ang_dz))
@@ -253,15 +278,15 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
     gblk = torch.tensor(np.concatenate([gp[:2] / 512, [np.sin(gp[2]), np.cos(gp[2])]]), dtype=torch.float32, device=dev)
     ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; blk_prev = None
     frames, covs = [], []; tbp, tag, tac = [], [], []                    # trajectoire VRAIE (pour on-policy)
-    for _ in range(max_steps):
-        if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
+    steps_done = 0; done = False
+    while steps_done < max_steps and not done:                           # 1 tour = 1 COUP planifié = fs pas d'env (frameskip)
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
             if pose is None: bp = np.array([*info["block_pose"]], np.float32)  # secours si masque perdu
@@ -272,23 +297,27 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
-            plan = cem_pose(dyn, blk, blk_prev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app, pos_dz=pos_dz, ang_dz=ang_dz, cover=cover)
+            bprev = blk if fs > 1 else blk_prev                          # frameskip : modèle entraîné depuis l'arrêt (vit. nulle)
+            plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app,
+                            pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1))
             blk_prev = blk
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
-        elif policy == "oracle":                                         # ORACLE correct : replanifie chaque pas
+        elif policy == "oracle":                                         # ORACLE correct : replanifie chaque coup
             st = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
             pl = oracle_plan(scratch, st, gp, rng, Hp=5, pop=40, iters=2); d0 = pl[0]
             act = np.clip(ag + d0 * 256.0, 0, 512).astype(np.float32)
         else:
             th = rng.uniform(0, 2 * np.pi); act = np.clip(ag + rng.uniform(0.2, 1.0) * 256 *
                                                           np.array([np.cos(th), np.sin(th)]), 0, 512).astype(np.float32)
-        if record_traj:                                                  # VRAIE pose/action de CE pas
-            tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())
-            tac.append(np.clip((act - ag) / 512.0, -1, 1).astype(np.float32))
-        obs, _, term, trunc, info = env.step(act); ag = np.array(obs["agent_pos"], np.float32)
-        best = max(best, float(info.get("coverage", 0.0)))
-        if info.get("is_success", False) or term or trunc: break
+        for _ in range(fs):                                              # tenir l'action fs pas d'env
+            if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
+            if record_traj:
+                tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())
+                tac.append(np.clip((act - ag) / 512.0, -1, 1).astype(np.float32))
+            obs, _, term, trunc, info = env.step(act); ag = np.array(obs["agent_pos"], np.float32)
+            best = max(best, float(info.get("coverage", 0.0))); steps_done += 1
+            if info.get("is_success", False) or term or trunc or steps_done >= max_steps: done = info.get("is_success", False) or term or trunc; break
     if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
     if record_traj: tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())  # pose finale
     env.close()
@@ -308,6 +337,8 @@ def get_args():
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
     p.add_argument("--ang_dz", type=float, default=0.0)                   # zone morte angle (proxy pose ; désactivée)
     p.add_argument("--cover", type=int, default=1)                        # coût = CHEVAUCHEMENT géométrique (vrai but) vs proxy pose
+    p.add_argument("--frameskip", type=int, default=1)                    # tenir chaque action fs pas d'env (DINO-WM=5) : voir loin, peu de dérive
+    p.add_argument("--free_tr", type=int, default=12000)                  # transitions libres (hors-contact) en mode frameskip
     p.add_argument("--dagger_rounds", type=int, default=0)               # rondes on-policy (0 = off)
     p.add_argument("--dagger_eps", type=int, default=20)                 # épisodes collectés par ronde
     p.add_argument("--dagger_steps", type=int, default=3000)             # réentraînement par ronde
@@ -342,44 +373,53 @@ def main():
     blk = torch.tensor(blk).to(dev); ag = torch.tensor(ag).to(dev); act = torch.tensor(dA).to(dev)
     dyn = PoseDyn().to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
     ne = min(300, max(1, n // 10)); ntr = n - ne
-    # buffer OFFLINE (jeu aléatoire) : transitions (blk_prev, blk, ag, act) -> (blk_next, ag_next)
-    off_buf = [blk[:ntr, 0:T - 2].reshape(-1, 4), blk[:ntr, 1:T - 1].reshape(-1, 4), ag[:ntr, 1:T - 1].reshape(-1, 2),
-               act[:ntr, 1:T - 1].reshape(-1, 2), blk[:ntr, 2:T].reshape(-1, 4), ag[:ntr, 2:T].reshape(-1, 2)]
-    bv = blk[ntr:]
-    # SONDE DE SURFACE (idée utilisateur) : balayage systématique de la réponse locale, mélangé à l'offline.
-    pb_val = None
+    fs = a.frameskip; bv = blk[ntr:]
+    # buffer OFFLINE mono-pas (jeu aléatoire) : cohérent SEULEMENT si fs==1 (actions non tenues sinon)
+    off_buf = None
+    if fs == 1:
+        off_buf = [blk[:ntr, 0:T - 2].reshape(-1, 4), blk[:ntr, 1:T - 1].reshape(-1, 4), ag[:ntr, 1:T - 1].reshape(-1, 2),
+                   act[:ntr, 1:T - 1].reshape(-1, 2), blk[:ntr, 2:T].reshape(-1, 4), ag[:ntr, 2:T].reshape(-1, 2)]
+    # SONDE DE SURFACE (idée utilisateur) : réponse locale systématique, TENUE fs pas (frameskip).
+    pb_val = None; train_buf = off_buf
     if a.probe_poses > 0:
         pushes = [float(x) for x in str(a.probe_push).split(",")]
-        print(f"--- sonde de surface : {a.probe_poses} poses, espacement {a.probe_spacing:.0f}px, "
-              f"forces {pushes}px (cogne doux->fort) ---", flush=True)
-        pb = collect_probe(a.probe_poses, a.probe_spacing, a.probe_gap, pushes, dev)
+        print(f"--- sonde de surface : {a.probe_poses} poses, forces {pushes}px, frameskip {fs} ---", flush=True)
+        pb = collect_probe(a.probe_poses, a.probe_spacing, a.probe_gap, pushes, dev, fs=fs)
         M = pb[0].shape[0]; nv = min(2000, M // 10)
         pb_val = [t[M - nv:] for t in pb]; pb_tr = [t[:M - nv] for t in pb]
-        rep = max(1, off_buf[0].shape[0] // max(1, 2 * pb_tr[0].shape[0]))  # peser ~autant que l'offline
-        off_buf = [torch.cat([off_buf[i], pb_tr[i].repeat(rep, *[1] * (pb_tr[i].dim() - 1))], 0) for i in range(6)]
-        print(f"  {M} transitions de sonde ({nv} tenues à l'écart) ; ×{rep} mélangées à l'offline", flush=True)
+        if fs == 1:                                                       # mono-pas : sonde mélangée à l'offline
+            rep = max(1, off_buf[0].shape[0] // max(1, 2 * pb_tr[0].shape[0]))
+            train_buf = [torch.cat([off_buf[i], pb_tr[i].repeat(rep, *[1] * (pb_tr[i].dim() - 1))], 0) for i in range(6)]
+            print(f"  {M} sonde ({nv} à l'écart) ; ×{rep} mélangées à l'offline", flush=True)
+        else:                                                             # frameskip : sonde + libre (offline mono-pas ignoré)
+            print(f"  {M} sonde ({nv} à l'écart) ; buffer libre (agent n'importe où, tenu {fs} pas) :", flush=True)
+            free = collect_free(a.free_tr, fs, dev)
+            train_buf = [torch.cat([pb_tr[i], free[i]], 0) for i in range(6)]
+            print(f"  {free[0].shape[0]} libre + {pb_tr[0].shape[0]} sonde = {train_buf[0].shape[0]} transitions (tout en {fs} pas)", flush=True)
     def dyn_eval(st):
         with torch.no_grad():
-            nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])
-            ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
-            ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
-            msg = f"  step {st:5d}  bloc t+1 alÉatoire : imaginé {ep:.1f}px vs copie {ec:.1f}px"
-            if pb_val is not None:                                        # réponse locale FINE (sonde)
+            msg = f"  step {st:5d}"
+            if fs == 1:                                                   # métrique mono-pas (offline tenu à l'écart)
+                nb, _ = dyn(bv[:, 1], bv[:, 0], ag[ntr:, 1], act[ntr:, 1])
+                ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
+                ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
+                msg += f"  bloc alÉatoire : imaginé {ep:.1f}px vs copie {ec:.1f}px"
+            if pb_val is not None:                                        # réponse fine (sonde) — {fs} pas
                 nbp, _ = dyn(pb_val[1], pb_val[0], pb_val[2], pb_val[3])
                 ip = (nbp[:, :2] - pb_val[4][:, :2]).norm(dim=-1).mean().item() * 512
                 cp = (pb_val[1][:, :2] - pb_val[4][:, :2]).norm(dim=-1).mean().item() * 512
-                msg += f"  |  sonde fine : imaginé {ip:.1f}px vs copie {cp:.1f}px"
+                msg += f"  |  sonde ({fs}pas) : imaginé {ip:.1f}px vs copie {cp:.1f}px"
         print(msg, flush=True)
     print("--- dynamique ---", flush=True)
-    train_dyn(dyn, opt, off_buf, a.steps, a.bs, eval_fn=dyn_eval)
+    train_dyn(dyn, opt, train_buf, a.steps, a.bs, eval_fn=dyn_eval)
     # DAgger : le planificateur joue -> on réentraîne sur SES gestes (endgame fin, hors distribution du jeu)
-    buf = off_buf
+    buf = train_buf
     for r in range(a.dagger_rounds):
         print(f"--- DAgger ronde {r+1}/{a.dagger_rounds} : collecte on-policy ({a.dagger_eps} épisodes) ---", flush=True)
         op = collect_onpolicy(dyn, a.dagger_eps, dev, offset, a.w_ang, a.w_app, a.plan_h)
         if op is None: print("  (aucune trajectoire)"); continue
-        # on répète les transitions on-policy pour qu'elles PÈSENT autant que l'offline (sinon noyées)
-        rep = max(1, off_buf[0].shape[0] // (2 * op[0].shape[0]))
+        # on répète les transitions on-policy pour qu'elles PÈSENT autant que le buffer (sinon noyées)
+        rep = max(1, train_buf[0].shape[0] // (2 * op[0].shape[0]))
         buf = [torch.cat([buf[i], op[i].repeat(rep, *[1] * (op[i].dim() - 1))], 0) for i in range(6)]
         print(f"  {op[0].shape[0]} transitions on-policy (×{rep}) ; réentraînement", flush=True)
         train_dyn(dyn, opt, buf, a.dagger_steps, a.bs, eval_fn=dyn_eval)
@@ -395,7 +435,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover)
+        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
@@ -422,7 +462,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
