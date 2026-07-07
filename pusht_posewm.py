@@ -284,7 +284,7 @@ def calib_offset(X, BP, ns=400):
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
                 record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0,
-                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0):
+                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0, escape_min=0.5):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -313,7 +313,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
             # DÉTECTEUR DE BLOCAGE : pas de NOUVEAU record de coverage depuis stuck_w coups -> ÉCHAPPEMENT
             if cur_cov > best_seen + 0.01: best_seen = cur_cov; last_improve = steps_done  # (robuste au jitter, vs 'plat')
-            if escaping == 0 and cur_cov < 0.9 and steps_done - last_improve >= stuck_w:
+            if escaping == 0 and escape_min < cur_cov < 0.9 and steps_done - last_improve >= stuck_w:  # coincé HAUT seulement
                 escaping = escape_steps; plan_seq = []; last_improve = steps_done  # rafale + reset (pas de re-trigger immédiat)
                 if record: print(f"  [ÉCHAPPEMENT @pas {steps_done}, coincé à cov {cur_cov:.2f}]", flush=True)
             if not plan_seq:                                             # (RE)PLANIFIER — sinon on SUIT le plan engagé (anti-hésitation)
@@ -364,6 +364,7 @@ def get_args():
     p.add_argument("--stuck_eps", type=float, default=0.02)               # amplitude de coverage sous laquelle = coincé
     p.add_argument("--escape_steps", type=int, default=8)                 # durée de la rafale d'échappement
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
+    p.add_argument("--escape_min", type=float, default=0.5)               # n'échapper QUE si coverage>ce seuil (bien posé -> parfaire l'angle)
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
@@ -467,7 +468,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -518,7 +519,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape, escape_min=a.escape_min)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
