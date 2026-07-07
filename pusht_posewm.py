@@ -285,6 +285,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     gblk = torch.tensor(np.concatenate([gp[:2] / 512, [np.sin(gp[2]), np.cos(gp[2])]]), dtype=torch.float32, device=dev)
     ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; blk_prev = None
     frames, covs = [], []; tbp, tag, tac = [], [], []                    # trajectoire VRAIE (pour on-policy)
+    diag = []                                                            # (pas, cov, erreur angle perçu-vs-vrai °, erreur pos px)
     steps_done = 0; done = False
     while steps_done < max_steps and not done:                           # 1 tour = 1 COUP planifié = fs pas d'env (frameskip)
         if policy == "mpc":
@@ -296,6 +297,10 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
                 by = pose[1] - (ox * np.sin(th) + oy * np.cos(th))
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
+            if record:                                                   # diag "choix étrange" : perception perçue vs VRAIE (sim)
+                tp = np.array(info["block_pose"], np.float32)
+                aerr = float(np.degrees(np.abs(np.angle(np.exp(1j * (bp[2] - tp[2])))))) if pose is not None else 999.0
+                diag.append((steps_done, float(info.get("coverage", 0.0)), aerr, float(np.linalg.norm(bp[:2] - tp[:2]))))
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
             bprev = blk if fs > 1 else blk_prev                          # frameskip : modèle entraîné depuis l'arrêt (vit. nulle)
             plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app,
@@ -322,7 +327,7 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     if record_traj: tbp.append(np.array(info["block_pose"], np.float32)); tag.append(ag.copy())  # pose finale
     env.close()
     if record_traj: return best, np.array(tbp), np.array(tag), np.array(tac)
-    return (best, frames, covs) if record else best
+    return (best, frames, covs, diag) if record else best
 
 def get_args():
     p = argparse.ArgumentParser()
@@ -435,8 +440,20 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
+        # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
+        if diag:
+            ae = np.array([d[2] for d in diag])
+            print(f"  perception sur l'épisode : angle err médian {np.median(ae):.0f}°  max {ae.max():.0f}°"
+                  f"  ({int((ae > 20).sum())} coups >20°)", flush=True)
+            print("  chutes de coverage (>0.12 en 1 coup) — perception AVANT le coup fatal :", flush=True)
+            for i in range(1, len(diag)):
+                if diag[i - 1][1] - diag[i][1] > 0.12:                    # coverage a chuté
+                    p = diag[i - 1]                                       # perception qui a décidé le coup
+                    flag = " <-- PERCEPTION FAUSSE" if p[2] > 20 else " (perception OK -> modèle/élan)"
+                    print(f"    pas {p[0]:3d}->{diag[i][0]:3d}  cov {p[1]:.2f}->{diag[i][1]:.2f}  |  "
+                          f"angle perçu-vrai {p[2]:.0f}°  pos {p[3]:.0f}px{flag}", flush=True)
         try:
             import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
             idx = np.linspace(0, len(frames) - 1, min(8, len(frames))).astype(int)
