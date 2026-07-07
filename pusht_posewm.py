@@ -109,13 +109,15 @@ def calib_offset(X, BP, ns=400):
             loc.append([dx * np.cos(-th) - dy * np.sin(-th), dx * np.sin(-th) + dy * np.cos(-th)])
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
-def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2)):
+def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2), record=False):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
     gblk = torch.tensor(np.concatenate([gp[:2] / 512, [np.sin(gp[2]), np.cos(gp[2])]]), dtype=torch.float32, device=dev)
     ag = np.array(obs["agent_pos"], np.float32); best = float(info.get("coverage", 0.0)); mu = None; blk_prev = None
+    frames, covs = [], []
     for _ in range(max_steps):
+        if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
             if pose is None: bp = np.array([*info["block_pose"]], np.float32)  # secours si masque perdu
@@ -140,7 +142,9 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
         obs, _, term, trunc, info = env.step(act); ag = np.array(obs["agent_pos"], np.float32)
         best = max(best, float(info.get("coverage", 0.0)))
         if info.get("is_success", False) or term or trunc: break
-    env.close(); return best
+    if record: frames.append(obs["pixels"].copy()); covs.append(float(info.get("coverage", 0.0)))
+    env.close()
+    return (best, frames, covs) if record else best
 
 def get_args():
     p = argparse.ArgumentParser()
@@ -148,6 +152,7 @@ def get_args():
     p.add_argument("--bs", type=int, default=128); p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--tasks", type=int, default=10); p.add_argument("--plan_h", type=int, default=4)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
     return p.parse_args()
 
 def main():
@@ -188,6 +193,28 @@ def main():
                 ep = (nb[:, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512
                 ec = (bv[:, 1, :2] - bv[:, 2, :2]).norm(dim=-1).mean().item() * 512   # copie (bloc statique)
             print(f"  step {st:5d}  bloc t+1 : imaginé {ep:.1f}px  vs copie {ec:.1f}px", flush=True)
+    # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
+    if a.viz >= 0:
+        best, frames, covs = run_episode(dyn, 3000 + a.viz, dev, "mpc", plan_h=a.plan_h, offset=offset, record=True)
+        print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
+        try:
+            import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+            idx = np.linspace(0, len(frames) - 1, min(8, len(frames))).astype(int)
+            fig = plt.figure(figsize=(16, 5))
+            for j, i in enumerate(idx):
+                axf = fig.add_subplot(2, len(idx), j + 1); axf.imshow(frames[i])
+                axf.set_title(f"pas {i}  cov {covs[i]:.2f}", fontsize=9); axf.axis("off")
+            axc = fig.add_subplot(2, 1, 2)
+            axc.plot(covs, lw=2); axc.axhline(0.95, ls="--", c="g", label="succès (0.95)")
+            axc.axhline(best, ls=":", c="r", label=f"max atteint ({best:.2f})")
+            axc.set_xlabel("pas"); axc.set_ylabel("coverage"); axc.legend(); axc.set_ylim(0, 1)
+            axc.set_title("coverage dans le temps — monte puis plafonne ? oscille ? jamais proche ?")
+            out = "/content/pusht_posewm_viz.png" if os.path.isdir("/content") else "pusht_posewm_viz.png"
+            plt.tight_layout(); plt.savefig(out); print(f"figure -> {out}", flush=True)
+        except Exception as e:
+            print("plot skip:", str(e)[:70], flush=True)
+        if a.tasks == 0:
+            return
     # BRIQUE 3 : planification
     if a.tasks > 0:
         scratch = make_env(); scratch.reset(seed=0)
