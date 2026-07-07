@@ -212,7 +212,7 @@ class TCover:
         return 1.0 - occv.mean(1)
 
 def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax=0.5, dev="cpu",
-             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13):
+             mu0=None, w_ang=1.0, w_app=0.1, pos_dz=0.0, ang_dz=0.0, cover=None, rest=False, leash_r=0.13, ang_gate=True):
     with torch.no_grad():
         blk = blk0.expand(pop, -1).clone(); blkp = blkp0.expand(pop, -1).clone(); ag = ag0.expand(pop, -1).clone()
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
@@ -228,7 +228,7 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=384, iters=4, elite=24, amax
                 if cover is not None:                                      # CHEVAUCHEMENT (transport+position) + CHASSE D'ANGLE
                     cc = cover.cost(b, gblk)                              # 1 - coverage
                     ang = (b[:, 2:4] - gblk[2:4]).norm(dim=-1)            # distance à l'angle but
-                    gate = (cc < 0.6).float()                            # chasse d'angle SEULEMENT en endgame (coverage>0.4) :
+                    gate = (cc < 0.6).float() if ang_gate else torch.ones_like(cc)  # gate: chasse d'angle endgame seulement (off pdt échappement)
                     cost = cost + wt * (cc + w_ang * ang * gate)         # transport = pur chevauchement (pas de catapulte)
                 else:
                     cost = cost + wt * pose_cost(b, gblk, w_ang, pos_dz, ang_dz)
@@ -283,7 +283,8 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0,
+                commit=1, stuck_w=12, stuck_eps=0.02, escape_steps=8, w_ang_escape=1.0):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -292,27 +293,43 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
     frames, covs = [], []; tbp, tag, tac = [], [], []                    # trajectoire VRAIE (pour on-policy)
     diag = []                                                            # (pas, cov, erreur angle perçu-vs-vrai °, erreur pos px)
     steps_done = 0; done = False
-    while steps_done < max_steps and not done:                           # 1 tour = 1 COUP planifié = fs pas d'env (frameskip)
+    plan_seq = []; recent_cov = []; escaping = 0                          # anti-hésitation (commit) + détecteur de blocage (escape)
+    while steps_done < max_steps and not done:                           # 1 tour = 1 COUP = fs pas d'env
         if policy == "mpc":
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
             if pose is None: bp = np.array([*info["block_pose"]], np.float32)  # secours si masque perdu
             else:
-                th = float(np.angle(np.exp(1j * (pose[2] - ang_off))))   # ANGLE calibré : perception -> convention pymunk (bug: jamais appliqué avant)
+                th = float(np.angle(np.exp(1j * (pose[2] - ang_off))))   # ANGLE calibré : perception -> convention pymunk
                 ox, oy = offset                                          # centroïde -> référence BP (calibré)
                 bx = pose[0] - (ox * np.cos(th) - oy * np.sin(th))
                 by = pose[1] - (ox * np.sin(th) + oy * np.cos(th))
                 bp = np.array([bx, by, th], np.float32)
             blk, agn = to_state(bp[None], ag[None]); blk = torch.tensor(blk, device=dev); agn = torch.tensor(agn, device=dev)
+            cur_cov = float(info.get("coverage", 0.0))
             if record:                                                   # diag "choix étrange" : perception perçue vs VRAIE (sim)
                 tp = np.array(info["block_pose"], np.float32)
                 aerr = float(np.degrees(np.abs(np.angle(np.exp(1j * (bp[2] - tp[2])))))) if pose is not None else 999.0
-                diag.append((steps_done, float(info.get("coverage", 0.0)), aerr, float(np.linalg.norm(bp[:2] - tp[:2]))))
+                diag.append((steps_done, cur_cov, aerr, float(np.linalg.norm(bp[:2] - tp[:2]))))
             if blk_prev is None: blk_prev = blk                          # 1er pas : vitesse nulle
-            bprev = blk if fs > 1 else blk_prev                          # frameskip : modèle entraîné depuis l'arrêt (vit. nulle)
-            plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev, mu0=mu, w_ang=w_ang, w_app=w_app,
-                            pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r)
-            blk_prev = blk
-            delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
+            # DÉTECTEUR DE BLOCAGE : coverage plat depuis stuck_w coups (et pas déjà bon) -> ÉCHAPPEMENT
+            recent_cov.append(cur_cov)
+            if len(recent_cov) > stuck_w: recent_cov.pop(0)
+            if (escaping == 0 and cur_cov < 0.9 and len(recent_cov) >= stuck_w
+                    and max(recent_cov) - min(recent_cov) < stuck_eps):
+                escaping = escape_steps; plan_seq = []                   # forcer un re-plan d'échappement
+                if record: print(f"  [ÉCHAPPEMENT @pas {steps_done}, coincé à cov {cur_cov:.2f}]", flush=True)
+            if not plan_seq:                                             # (RE)PLANIFIER — sinon on SUIT le plan engagé (anti-hésitation)
+                esc = escaping > 0
+                bprev = blk if fs > 1 else blk_prev
+                plan = cem_pose(dyn, blk, bprev, agn, gblk, Hp=plan_h, dev=dev,
+                                mu0=(None if esc else mu), w_ang=(w_ang_escape if esc else w_ang), w_app=w_app,
+                                pos_dz=pos_dz, ang_dz=ang_dz, cover=cover, rest=(fs > 1), leash_r=leash_r, ang_gate=(not esc))
+                blk_prev = blk                                           # esc : chasse d'angle forte, sans gate, recherche large (mu=None)
+                k = min(commit, plan.shape[0])
+                plan_seq = [plan[i] for i in range(k)]                   # s'ENGAGER sur k actions avant de reconsidérer
+                mu = torch.cat([plan[k:], torch.zeros(k, 2, device=dev)])
+            delta = plan_seq.pop(0).cpu().numpy()
+            if escaping > 0: escaping -= 1
             act = np.clip(ag + delta * 512.0, 0, 512).astype(np.float32)
         elif policy == "oracle":                                         # ORACLE correct : replanifie chaque coup
             st = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
@@ -343,7 +360,12 @@ def get_args():
     p.add_argument("--max_steps", type=int, default=100)                  # budget de pas par épisode (100 trop court)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
-    p.add_argument("--w_ang", type=float, default=0.3)                    # poids de la CHASSE D'ANGLE (chevauchement + w_ang*dist_angle)
+    p.add_argument("--w_ang", type=float, default=0.0)                    # chasse d'angle en régime normal (0 = pur chevauchement, base stable)
+    p.add_argument("--commit", type=int, default=4)                       # anti-hésitation : nb d'actions exécutées avant de re-planifier
+    p.add_argument("--stuck_w", type=int, default=12)                     # fenêtre de détection de blocage (coups)
+    p.add_argument("--stuck_eps", type=float, default=0.02)               # amplitude de coverage sous laquelle = coincé
+    p.add_argument("--escape_steps", type=int, default=8)                 # durée de la rafale d'échappement
+    p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
     p.add_argument("--pos_dz", type=float, default=0.0)                   # zone morte position (proxy pose ; désactivée)
@@ -447,7 +469,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -498,7 +520,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off, commit=a.commit, stuck_w=a.stuck_w, stuck_eps=a.stuck_eps, escape_steps=a.escape_steps, w_ang_escape=a.w_ang_escape)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
