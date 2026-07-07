@@ -278,7 +278,7 @@ def calib_offset(X, BP, ns=400):
     return np.array(loc).mean(0)                                         # (ox, oy) en repère bloc
 
 def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, offset=np.zeros(2),
-                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13):
+                record=False, w_ang=1.0, w_app=0.1, record_traj=False, pos_dz=0.0, ang_dz=0.0, cover=None, fs=1, leash_r=0.13, ang_off=0.0):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -292,7 +292,8 @@ def run_episode(dyn, seed, dev, policy, max_steps=100, plan_h=4, scratch=None, o
             pose = pose_from_image(obs["pixels"])                        # perception géométrique
             if pose is None: bp = np.array([*info["block_pose"]], np.float32)  # secours si masque perdu
             else:
-                th = pose[2]; ox, oy = offset                            # centroïde -> référence BP (calibré)
+                th = float(np.angle(np.exp(1j * (pose[2] - ang_off))))   # ANGLE calibré : perception -> convention pymunk (bug: jamais appliqué avant)
+                ox, oy = offset                                          # centroïde -> référence BP (calibré)
                 bx = pose[0] - (ox * np.cos(th) - oy * np.sin(th))
                 by = pose[1] - (ox * np.sin(th) + oy * np.cos(th))
                 bp = np.array([bx, by, th], np.float32)
@@ -441,7 +442,7 @@ def main():
               f"  ({len(tl)} pts)", flush=True)
     # VISUALISATION d'un épisode (diagnostic : où ça coince ?)
     if a.viz >= 0:
-        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r)
+        best, frames, covs, diag = run_episode(dyn, 3000 + a.viz, dev, "mpc", max_steps=a.max_steps, plan_h=a.plan_h, offset=offset, record=True, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off)
         print(f"épisode viz (tâche {a.viz}) : coverage max {best:.2f} en {len(covs)} pas", flush=True)
         # DIAGNOSTIC "choix étrange" : la perception est-elle fausse juste avant les chutes de coverage ?
         if diag:
@@ -492,7 +493,7 @@ def main():
         for k in range(a.tasks):
             line = []
             for q in pols:
-                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r)
+                cov = run_episode(dyn, 3000 + k, dev, q, max_steps=a.max_steps, plan_h=a.plan_h, scratch=scratch, offset=offset, w_ang=a.w_ang, w_app=a.w_app, pos_dz=a.pos_dz, ang_dz=a.ang_dz, cover=cover, fs=a.frameskip, leash_r=a.leash_r, ang_off=off)
                 sc[q].append(cov); line.append(f"{q} {cov:.2f}")
             print(f"  tâche {k:2d}  " + "  |  ".join(line), flush=True)
         print("\nTOUTES tâches : " + "  |  ".join(
