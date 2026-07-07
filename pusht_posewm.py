@@ -153,7 +153,8 @@ def cem_pose(dyn, blk0, blkp0, ag0, gblk, Hp=7, pop=256, iters=3, elite=16, amax
                 nb, a = dyn(b, bp, a, A[:, h]); bp = b; b = nb
                 wt = (h + 1) / Hp                                          # coût DENSE : chaque pas compte, les tardifs plus
                 cost = cost + wt * pose_cost(b, gblk, w_ang)               # -> pente même quand le but est LOIN (anti-dithering)
-                cost = cost + wt * w_app * (a - b[:, :2]).norm(dim=-1)     # rester au contact pour pousser
+                leash = (a - b[:, :2]).norm(dim=-1) - 0.16                 # LAISSE LÂCHE : libre d'orbiter le T (~80px),
+                cost = cost + wt * w_app * leash.clamp_min(0.0)            # pénalité SEULEMENT au-delà -> peut pousser tout côté
             el = A[cost.argsort()[:elite]]
             mu = el.mean(0); sg = (el.std(0) + 1e-4).clamp_min(0.05)
     return mu.clamp(-amax, amax)
