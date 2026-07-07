@@ -359,13 +359,13 @@ def get_args():
     p.add_argument("--max_steps", type=int, default=100)                  # budget de pas par épisode (100 trop court)
     p.add_argument("--policies", type=str, default="mpc,oracle,random"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--viz", type=int, default=-1)                         # >=0 : filmer l'épisode MPC de cette tâche
-    p.add_argument("--w_ang", type=float, default=0.3)                    # chasse d'angle GATÉE (endgame) — marche (A : 3 tâches à 0.92)
-    p.add_argument("--commit", type=int, default=4)                       # anti-hésitation : nb d'actions exécutées avant de re-planifier
+    p.add_argument("--w_ang", type=float, default=0.0)                    # 0 = PUR CHEVAUCHEMENT (config robuste consolidée : 0.70, 5.1x)
+    p.add_argument("--commit", type=int, default=1)                       # 1 = MPC standard (le commit>1 n'a pas aidé, bruit)
     p.add_argument("--stuck_w", type=int, default=12)                     # fenêtre de détection de blocage (coups)
     p.add_argument("--stuck_eps", type=float, default=0.02)               # amplitude de coverage sous laquelle = coincé
     p.add_argument("--escape_steps", type=int, default=8)                 # durée de la rafale d'échappement
     p.add_argument("--w_ang_escape", type=float, default=1.0)             # chasse d'angle FORTE pendant l'échappement (rotation-sacrifice)
-    p.add_argument("--escape_min", type=float, default=0.15)              # échapper dès qu'il y a CHEVAUCHEMENT (>seuil) mais stagnation
+    p.add_argument("--escape_min", type=float, default=1.0)               # 1.0 = échappement OFF (basin-hopping testé, ne franchit pas le mur)
     p.add_argument("--escape_sigma", type=float, default=0.6)             # bruit CEM pendant l'échappement (recherche large = nouvelle stratégie)
     p.add_argument("--w_app", type=float, default=0.3)                    # poids de la laisse (rester près du T)
     p.add_argument("--leash_r", type=float, default=0.13)                 # rayon de laisse (norm. ; 0.13=~67px, juste autour du T)
