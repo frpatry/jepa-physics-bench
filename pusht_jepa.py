@@ -171,7 +171,7 @@ def cem_latent(m, z0, z1, zg, keep, Hp=4, pop=192, iters=3, elite=16, amax=0.8, 
 
 # ----------------------------------------------------------- un épisode d'évaluation
 def run_episode(m, hin, P, seed, dev, policy, cost_mode, scratch, max_steps=100, plan_h=4, pop=192, iters=3,
-                oracle_h=12, oracle_pop=128, oracle_iters=4):
+                oracle_h=10, oracle_pop=64, oracle_iters=3, oracle_exec=5):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -184,7 +184,7 @@ def run_episode(m, hin, P, seed, dev, policy, cost_mode, scratch, max_steps=100,
         keep = (~agent_token_mask(gtok, P)).float().to(dev)
     ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
     obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
-    best_cov, success, mu = float(info.get("coverage", 0.0)), False, None
+    best_cov, success, mu, oq = float(info.get("coverage", 0.0)), False, None, []
     for _ in range(max_steps):
         if policy == "mpc":
             with torch.no_grad():
@@ -193,8 +193,10 @@ def run_episode(m, hin, P, seed, dev, policy, cost_mode, scratch, max_steps=100,
             plan = cem_latent(m, z0, z1, zg, keep, Hp=plan_h, pop=pop, iters=iters, dev=dev, mu0=mu)
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
         elif policy == "oracle":
-            state = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
-            delta = oracle_plan(scratch, state, gp, rng, Hp=oracle_h, pop=oracle_pop, iters=oracle_iters)[0]
+            if not len(oq):                                 # re-planifie tous les oracle_exec pas (vrai sim = lent)
+                state = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
+                oq = list(oracle_plan(scratch, state, gp, rng, Hp=oracle_h, pop=oracle_pop, iters=oracle_iters)[:oracle_exec])
+            delta = oq.pop(0)
         else:
             th = rng.uniform(0, 2 * np.pi)
             delta = rng.uniform(0.2, 1.0) * 0.8 * np.array([np.cos(th), np.sin(th)], np.float32)
@@ -223,8 +225,10 @@ def get_args():
     p.add_argument("--cost", type=str, default="latent", choices=["latent", "latent_noagent"])
     p.add_argument("--plan_h", type=int, default=4); p.add_argument("--plan_pop", type=int, default=192)
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=100)
-    p.add_argument("--oracle_h", type=int, default=12, help="horizon oracle (vrai sim, non bridé par le modèle)")
-    p.add_argument("--oracle_pop", type=int, default=128); p.add_argument("--oracle_iters", type=int, default=4)
+    p.add_argument("--oracle_h", type=int, default=10, help="horizon oracle (vrai sim, non bridé par le modèle)")
+    p.add_argument("--oracle_pop", type=int, default=64); p.add_argument("--oracle_iters", type=int, default=3)
+    p.add_argument("--oracle_exec", type=int, default=5, help="actions exécutées par plan oracle (re-planif tous les N pas ; vrai sim lent)")
+    p.add_argument("--policies", type=str, default="mpc,oracle,random", help="sous-ensemble à évaluer, ex. 'oracle' seul")
     p.add_argument("--task_seed", type=int, default=9000, help="graine des tâches de test (tenues à l'écart)")
     return p.parse_args()
 
@@ -267,12 +271,13 @@ def main():
     if a.tasks > 0:
         m.eval(); scratch = make_env()
         print(f"\n=== PLANIFICATION (protocole DINO-WM, coût {a.cost}) — {a.tasks} tâches, ≤{a.max_steps} pas ===", flush=True)
-        for policy in ["mpc", "oracle", "random"]:
+        for policy in [p_ for p_ in a.policies.split(",") if p_]:
             succ, covs = [], []
             for k in range(a.tasks):
                 s_, c_ = run_episode(m, a.hin, P, a.task_seed + k, dev, policy, a.cost, scratch,
                                      max_steps=a.max_steps, plan_h=a.plan_h, pop=a.plan_pop, iters=a.plan_iters,
-                                     oracle_h=a.oracle_h, oracle_pop=a.oracle_pop, oracle_iters=a.oracle_iters)
+                                     oracle_h=a.oracle_h, oracle_pop=a.oracle_pop, oracle_iters=a.oracle_iters,
+                                     oracle_exec=a.oracle_exec)
                 succ.append(s_); covs.append(c_)
             print(f"  {policy:7s}  SR {np.mean(succ):.2f}  coverage moyen {np.mean(covs):.3f}"
                   f"  (max {np.max(covs):.2f})", flush=True)
