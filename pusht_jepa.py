@@ -232,6 +232,7 @@ def get_args():
     p.add_argument("--oracle_pop", type=int, default=64); p.add_argument("--oracle_iters", type=int, default=3)
     p.add_argument("--oracle_exec", type=int, default=5, help="actions exécutées par plan oracle (re-planif tous les N pas ; vrai sim lent)")
     p.add_argument("--policies", type=str, default="mpc,oracle,random", help="sous-ensemble à évaluer, ex. 'oracle' seul")
+    p.add_argument("--diag", type=int, default=0, help="1 = diagnostic du plancher cl (copy vs moyenne vs modèle)")
     p.add_argument("--task_seed", type=int, default=9000, help="graine des tâches de test (tenues à l'écart)")
     return p.parse_args()
 
@@ -271,6 +272,26 @@ def main():
                     "args": {"hin": a.hin, "patch": P, "d": a.d, "nl": a.nl, "nh": a.nh,
                              "dyn_layers": a.dyn_layers, "rw": a.rw}}, ckpt)
         print(f"modèle -> {ckpt}", flush=True)
+
+    if a.diag:                                          # DIAGNOSTIC : d'où vient le plancher cl ≈ 0.38 ?
+        m.eval(); X, act = load_data(data); n, T = X.shape[0], X.shape[1]
+        ids = torch.from_numpy(np.random.default_rng(1).integers(0, n, min(256, n)))
+        with torch.no_grad():
+            z = m.encode_clip(frames_to_tokens(X[ids], a.hin, P, dev)); A = act[ids].to(dev)
+            marg = F.smooth_l1_loss(z, z.mean((0, 1, 2), keepdim=True).expand_as(z)).item()  # prédire la moyenne
+            copy = F.smooth_l1_loss(z[:, 1:T - 1], z[:, 2:T]).item()                          # prédire = frame précédente
+            pred = m.rollout(z[:, 0], z[:, 1], A[:, 1:T - 1])
+            model = F.smooth_l1_loss(pred, z[:, 2:T]).item()                                  # le vrai modèle (boucle fermée)
+            zt = z[:, 1:T - 1].reshape(-1, m.d); zt1 = z[:, 2:T].reshape(-1, m.d)
+            cos = F.cosine_similarity(zt, zt1, -1).mean().item()                              # similarité temporelle
+            std = z.reshape(-1, m.d).std(0).mean().item()
+        print(f"\n=== DIAGNOSTIC (batch {len(ids)}) : d'où vient le plancher de cl ? ===", flush=True)
+        print(f"  prédire la MOYENNE globale (baseline trivial haut) : {marg:.4f}", flush=True)
+        print(f"  COPIER la frame précédente (z_t -> z_t+1)          : {copy:.4f}", flush=True)
+        print(f"  le MODÈLE appris (dynamique, boucle fermée)        : {model:.4f}", flush=True)
+        print(f"  cos(z_t, z_t+1) temporel : {cos:.3f}  |  std moyen par dim : {std:.3f}", flush=True)
+        print("  lecture : copy≈marg -> encodeur BROUILLE le temps (fondamental, encodeur gelé requis) ;", flush=True)
+        print("            copy<<marg mais model>>copy -> le PRÉDICTEUR échoue (réparable).", flush=True)
 
     if a.tasks > 0:
         m.eval(); scratch = make_env()
