@@ -107,6 +107,7 @@ def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.
     diff = F.smooth_l1_loss(zf, zg.unsqueeze(0).expand(K, -1, -1), reduction="none").mean(-1)
     cost_model = ((diff * keep).sum(-1) / keep.sum().clamp_min(1)).cpu().numpy()
     true_cov = np.zeros(K, np.float32); true_bd = np.zeros(K, np.float32)
+    ff = np.zeros((K, 96, 96, 3), np.uint8)                              # frame réellement atteinte (pour coût VRAI-latent)
     state0 = np.array([ag[0], ag[1], *bp0], np.float32)
     for k in range(K):
         obs2, info2 = reset_faithful(scratch, state0); agk = np.array(obs2["agent_pos"], np.float32); stop = False
@@ -116,10 +117,15 @@ def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.
                 obs2, _, term, trunc, info2 = scratch.step(act); agk = np.array(obs2["agent_pos"], np.float32)
                 if term or trunc: stop = True; break
             if stop: break
-        true_cov[k] = float(info2.get("coverage", 0.0))
+        true_cov[k] = float(info2.get("coverage", 0.0)); ff[k] = obs2["pixels"]
         true_bd[k] = np.linalg.norm(np.array(info2["block_pose"], np.float32)[:2] - gp[:2])
     env.close()
-    return _pearson(cost_model, true_bd), _pearson(cost_model, true_cov), float(true_bd.std()), float(cost_model.std())
+    # coût VRAI-latent : encoder la frame réellement atteinte -> teste la MÉTRIQUE de l'encodeur seule
+    zt = m.encode_clip(frames_to_tokens(torch.from_numpy(ff).unsqueeze(1), hin, P, dev))[:, 0]
+    difft = F.smooth_l1_loss(zt, zg.unsqueeze(0).expand(K, -1, -1), reduction="none").mean(-1)
+    cost_true = ((difft * keep).sum(-1) / keep.sum().clamp_min(1)).cpu().numpy()
+    return (_pearson(cost_model, true_bd), _pearson(cost_true, true_bd), _pearson(cost_model, true_cov),
+            float(true_bd.std()), float(cost_model.std()))
 
 # ----------------------------------------------------------- CLI
 def get_args():
@@ -223,17 +229,17 @@ def main():
     if a.stage == "probe":                              # le coût latent est-il corrélé au vrai progrès ?
         scratch = make_env()
         print(f"\n=== PROBE alignement coût-modèle vs vrai (coût {a.cost}, {a.probe_k} séq/tâche) ===", flush=True)
-        rbd, rcov = [], []
+        rbd, rtrue = [], []
         for k in range(a.probe_seeds):
-            r_bd, r_cov, bdstd, cstd = cost_alignment(m, a.hin, P, dev, scratch, a.task_seed + k, a.cost,
-                                                       K=a.probe_k, Hp=a.plan_h, frameskip=a.frameskip)
-            rbd.append(r_bd); rcov.append(r_cov)
-            print(f"  tâche {k}: r(coût, dist_bloc-but) {r_bd:+.2f}  r(coût, coverage) {r_cov:+.2f}"
-                  f"  (σ dist réelle {bdstd:.0f}px, σ coût {cstd:.3f})", flush=True)
+            r_bd, r_true, r_cov, bdstd, cstd = cost_alignment(m, a.hin, P, dev, scratch, a.task_seed + k, a.cost,
+                                                              K=a.probe_k, Hp=a.plan_h, frameskip=a.frameskip)
+            rbd.append(r_bd); rtrue.append(r_true)
+            print(f"  tâche {k}: r(MODÈLE, dist) {r_bd:+.2f}  |  r(VRAI-latent, dist) {r_true:+.2f}"
+                  f"  (σ dist {bdstd:.0f}px, σ coût-modèle {cstd:.3f})", flush=True)
         scratch.close()
-        print(f"  MOYENNE : r(coût,dist) {np.mean(rbd):+.2f}  r(coût,coverage) {np.mean(rcov):+.2f}", flush=True)
-        print("  lecture : |r|>0.5 -> coût FIABLE (réparer la recherche/horizon) ; |r|~0 -> coût PLAT "
-              "(le monde imaginé ne reflète pas le vrai progrès sur cet horizon).", flush=True)
+        print(f"  MOYENNE : r(MODÈLE) {np.mean(rbd):+.2f}  |  r(VRAI-latent) {np.mean(rtrue):+.2f}", flush=True)
+        print("  lecture : r(VRAI-latent) élevé mais r(MODÈLE)~0 -> DYNAMIQUE sous-réactive (pondérer le mouvement) ;", flush=True)
+        print("            r(VRAI-latent)~0 aussi -> la MÉTRIQUE de l'encodeur ne suit pas la position du bloc (autre readout).", flush=True)
         return
 
     if a.tasks > 0:
