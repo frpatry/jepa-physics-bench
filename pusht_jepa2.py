@@ -84,7 +84,7 @@ def _pearson(a, b):
     return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-8))
 
 @torch.no_grad()
-def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.8):
+def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.8, frameskip=1):
     """Depuis un état réel, tire K séquences d'actions au hasard ; compare le COÛT LATENT prédit par
     le modèle au VRAI résultat (coverage et distance bloc-but) en simulant ces mêmes actions.
     r_bd > 0 attendu (coût haut <-> bloc loin du but) ; r_cov < 0 (coût haut <-> peu de coverage)."""
@@ -109,11 +109,13 @@ def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.
     true_cov = np.zeros(K, np.float32); true_bd = np.zeros(K, np.float32)
     state0 = np.array([ag[0], ag[1], *bp0], np.float32)
     for k in range(K):
-        obs2, info2 = reset_faithful(scratch, state0); agk = np.array(obs2["agent_pos"], np.float32)
+        obs2, info2 = reset_faithful(scratch, state0); agk = np.array(obs2["agent_pos"], np.float32); stop = False
         for h in range(Hp):
             act = np.clip(agk + A[k, h] * 256.0, 0, 512).astype(np.float32)
-            obs2, _, term, trunc, info2 = scratch.step(act); agk = np.array(obs2["agent_pos"], np.float32)
-            if term or trunc: break
+            for _ in range(frameskip):                                   # action maintenue (comme l'entraînement)
+                obs2, _, term, trunc, info2 = scratch.step(act); agk = np.array(obs2["agent_pos"], np.float32)
+                if term or trunc: stop = True; break
+            if stop: break
         true_cov[k] = float(info2.get("coverage", 0.0))
         true_bd[k] = np.linalg.norm(np.array(info2["block_pose"], np.float32)[:2] - gp[:2])
     env.close()
@@ -141,6 +143,7 @@ def get_args():
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=100)
     p.add_argument("--oracle_h", type=int, default=10); p.add_argument("--oracle_pop", type=int, default=64)
     p.add_argument("--oracle_iters", type=int, default=3); p.add_argument("--oracle_exec", type=int, default=5)
+    p.add_argument("--frameskip", type=int, default=1, help="pas d'env par action (doit matcher les données d'entraînement)")
     p.add_argument("--task_seed", type=int, default=9000)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     p.add_argument("--probe_k", type=int, default=96, help="séquences tirées / tâche pour --stage probe")
@@ -223,7 +226,7 @@ def main():
         rbd, rcov = [], []
         for k in range(a.probe_seeds):
             r_bd, r_cov, bdstd, cstd = cost_alignment(m, a.hin, P, dev, scratch, a.task_seed + k, a.cost,
-                                                       K=a.probe_k, Hp=a.plan_h)
+                                                       K=a.probe_k, Hp=a.plan_h, frameskip=a.frameskip)
             rbd.append(r_bd); rcov.append(r_cov)
             print(f"  tâche {k}: r(coût, dist_bloc-but) {r_bd:+.2f}  r(coût, coverage) {r_cov:+.2f}"
                   f"  (σ dist réelle {bdstd:.0f}px, σ coût {cstd:.3f})", flush=True)
@@ -242,7 +245,7 @@ def main():
                 s_, c_ = run_episode(m, a.hin, P, a.task_seed + k, dev, policy, a.cost, scratch,
                                      max_steps=a.max_steps, plan_h=a.plan_h, pop=a.plan_pop, iters=a.plan_iters,
                                      oracle_h=a.oracle_h, oracle_pop=a.oracle_pop, oracle_iters=a.oracle_iters,
-                                     oracle_exec=a.oracle_exec)
+                                     oracle_exec=a.oracle_exec, frameskip=a.frameskip)
                 succ.append(s_); covs.append(c_)
             print(f"  {policy:7s}  SR {np.mean(succ):.2f}  coverage moyen {np.mean(covs):.3f}"
                   f"  (max {np.max(covs):.2f})", flush=True)

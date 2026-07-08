@@ -173,7 +173,7 @@ def cem_latent(m, z0, z1, zg, keep, Hp=4, pop=192, iters=3, elite=16, amax=0.8, 
 
 # ----------------------------------------------------------- un épisode d'évaluation
 def run_episode(m, hin, P, seed, dev, policy, cost_mode, scratch, max_steps=100, plan_h=4, pop=192, iters=3,
-                oracle_h=10, oracle_pop=64, oracle_iters=3, oracle_exec=5):
+                oracle_h=10, oracle_pop=64, oracle_iters=3, oracle_exec=5, frameskip=1):
     env = make_env(); rng = np.random.default_rng(seed)
     obs, info = env.reset(seed=seed)
     gp = np.array(info["goal_pose"], np.float32)
@@ -203,10 +203,14 @@ def run_episode(m, hin, P, seed, dev, policy, cost_mode, scratch, max_steps=100,
             th = rng.uniform(0, 2 * np.pi)
             delta = rng.uniform(0.2, 1.0) * 0.8 * np.array([np.cos(th), np.sin(th)], np.float32)
         act = np.clip(ag + delta * 256.0, 0, 512).astype(np.float32)
-        obs, _, term, trunc, info = env.step(act)
+        term = trunc = done = False
+        for _ in range(frameskip):                                         # action MAINTENUE (frameskip)
+            obs, _, term, trunc, info = env.step(act)
+            best_cov = max(best_cov, float(info.get("coverage", 0.0)))
+            if info.get("is_success", False) or term: done = True; break
+            if trunc: break
         f0, f1 = f1, obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
-        best_cov = max(best_cov, float(info.get("coverage", 0.0)))
-        if info.get("is_success", False) or term: success = True; break
+        if done: success = True; break
         if trunc: break
     env.close()
     return success, best_cov

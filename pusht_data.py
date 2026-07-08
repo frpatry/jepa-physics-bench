@@ -44,7 +44,9 @@ def play_policy(rng, agent, block, hold_left, target):
         hold_left = int(rng.integers(2, 5))
     return target, hold_left - 1
 
-def collect(n, T, seed=0, warmup_max=25):
+def collect(n, T, seed=0, warmup_max=25, frameskip=1):
+    """frameskip>1 : chaque transition ENREGISTRÉE = une action (cible) MAINTENUE frameskip pas
+    d'environnement -> frames voisines à gros effet (le bloc bouge franchement), horizon utile."""
     import gymnasium as gym, gym_pusht  # noqa: F401
     env = gym.make("gym_pusht/PushT-v0", obs_type="pixels_agent_pos", render_mode="rgb_array")
     rng = np.random.default_rng(seed)
@@ -68,10 +70,13 @@ def collect(n, T, seed=0, warmup_max=25):
             X[i, t] = obs["pixels"]; AG[i, t] = agent; BP[i, t] = block
             CT[i, t] = info.get("n_contacts", 0) > 0; CV[i, t] = float(info.get("coverage", 0.0))
             if t < T - 1:
-                target, hold = play_policy(rng, agent, block, hold, target)
+                target, _ = play_policy(rng, agent, block, 0, target)      # cible fraîche par transition
                 A[i, t] = target
-                obs, _, term, trunc, info = env.step(target.astype(np.float32))
-                agent = np.array(obs["agent_pos"], np.float32); block = np.array(info["block_pose"], np.float32)
+                term = trunc = False
+                for _ in range(frameskip):                                 # MAINTENUE frameskip pas
+                    obs, _, term, trunc, info = env.step(target.astype(np.float32))
+                    agent = np.array(obs["agent_pos"], np.float32); block = np.array(info["block_pose"], np.float32)
+                    if term or trunc: break
                 if term or trunc: ok = False; break                        # épisode fini avant la fin
         if ok: i += 1
         if i and i % 200 == 0: print(f"  {i}/{n} séquences", flush=True)
@@ -82,10 +87,12 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--n", type=int, default=3000); p.add_argument("--T", type=int, default=6)
     p.add_argument("--seed", type=int, default=0); p.add_argument("--out", type=str, default="")
+    p.add_argument("--frameskip", type=int, default=1, help=">1 : action maintenue K pas par transition (horizon utile)")
     a = p.parse_args()
-    out = a.out or default_out()
-    print(f"collecte gym-pusht : {a.n} séquences de {a.T} frames (politique de JEU, aucune démo)", flush=True)
-    X, A, AG, BP, GP, CT, CV = collect(a.n, a.T, a.seed)
+    out = a.out or (default_out() if a.frameskip == 1 else default_out().replace(".npz", f"_fs{a.frameskip}.npz"))
+    print(f"collecte gym-pusht : {a.n} séquences de {a.T} frames, frameskip {a.frameskip} "
+          f"(politique de JEU, aucune démo)", flush=True)
+    X, A, AG, BP, GP, CT, CV = collect(a.n, a.T, a.seed, frameskip=a.frameskip)
     hit = CT.any(1)
     print(f"contact agent-bloc : {100 * hit.mean():.0f}% des séquences  |  coverage moyen {CV.mean():.3f}"
           f"  |  bloc déplacé (>2px) : {100 * (np.linalg.norm(BP[:, -1, :2] - BP[:, 0, :2], axis=1) > 2).mean():.0f}%",
