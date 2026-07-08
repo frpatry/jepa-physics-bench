@@ -244,6 +244,7 @@ def main():
         P = sa["patch"]; npf = (sa["hin"] // P) ** 2; obs = P * P * 3
         m = JEPAWM(obs, sa["d"], npf, sa["nl"], sa["nh"], sa["dyn_layers"], sa["rw"]).to(dev)
         m.load_state_dict(blob["model"]); a.hin = sa["hin"]
+        m.rw = a.rw                                     # rw = KNOB d'entraînement (pas d'archi) -> valeur CLI, pas celle gelée du checkpoint
         print(f"checkpoint chargé : {ckpt}  (hin {a.hin}, d {sa['d']}, npf {npf})", flush=True)
     else:
         m = JEPAWM(obs, a.d, npf, a.nl, a.nh, a.dyn_layers, a.rw).to(dev)
