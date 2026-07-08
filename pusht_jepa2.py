@@ -25,8 +25,8 @@ import argparse, os
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from vjepa import VJEPA, sigreg, tube_masks
 from pusht_jepa import (Dynamics, frames_to_tokens, img_to_tokens, cem_latent,
-                        run_episode, load_data, default_path)
-from pusht_plan import make_env
+                        run_episode, load_data, default_path, agent_token_mask)
+from pusht_plan import make_env, reset_faithful, to64
 
 # ----------------------------------------------------------- world model : encodeur GELÉ + dynamique
 class WM2(nn.Module):
@@ -78,10 +78,51 @@ def latent_smoothness(z, d):
     cos = F.cosine_similarity(zt, zt1, -1).mean().item()
     return marg, copy, cos
 
+# ----------------------------------------------------------- alignement coût-modèle vs vrai progrès
+def _pearson(a, b):
+    a = a - a.mean(); b = b - b.mean()
+    return float((a * b).sum() / (np.sqrt((a * a).sum() * (b * b).sum()) + 1e-8))
+
+@torch.no_grad()
+def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.8):
+    """Depuis un état réel, tire K séquences d'actions au hasard ; compare le COÛT LATENT prédit par
+    le modèle au VRAI résultat (coverage et distance bloc-but) en simulant ces mêmes actions.
+    r_bd > 0 attendu (coût haut <-> bloc loin du but) ; r_cov < 0 (coût haut <-> peu de coverage)."""
+    env = make_env(); rng = np.random.default_rng(seed)
+    obs, info = env.reset(seed=seed)
+    gp = np.array(info["goal_pose"], np.float32)
+    far = np.array([40.0, 40.0], np.float32) if np.linalg.norm(gp[:2] - 40) > 120 else np.array([470.0, 470.0], np.float32)
+    gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
+    gtok = img_to_tokens(to64(gob["pixels"], hin, dev), P); zg = m.encode(gtok)[0]
+    keep = torch.ones(m.npf, device=dev)
+    if cost_mode == "latent_noagent": keep = (~agent_token_mask(gtok, P)).float().to(dev)
+    ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+    obs, _, _, _, info = env.step(ag.copy()); f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
+    bp0 = np.array(info["block_pose"], np.float32)
+    z0 = m.encode(img_to_tokens(to64(f0, hin, dev), P))[0]
+    z1 = m.encode(img_to_tokens(to64(f1, hin, dev), P))[0]
+    A = rng.uniform(-amax, amax, (K, Hp, 2)).astype(np.float32)
+    Z0 = z0.unsqueeze(0).expand(K, -1, -1); Z1 = z1.unsqueeze(0).expand(K, -1, -1)
+    zf = m.rollout(Z0, Z1, torch.tensor(A, device=dev))[:, -1]                # (K,npf,d)
+    diff = F.smooth_l1_loss(zf, zg.unsqueeze(0).expand(K, -1, -1), reduction="none").mean(-1)
+    cost_model = ((diff * keep).sum(-1) / keep.sum().clamp_min(1)).cpu().numpy()
+    true_cov = np.zeros(K, np.float32); true_bd = np.zeros(K, np.float32)
+    state0 = np.array([ag[0], ag[1], *bp0], np.float32)
+    for k in range(K):
+        obs2, info2 = reset_faithful(scratch, state0); agk = np.array(obs2["agent_pos"], np.float32)
+        for h in range(Hp):
+            act = np.clip(agk + A[k, h] * 256.0, 0, 512).astype(np.float32)
+            obs2, _, term, trunc, info2 = scratch.step(act); agk = np.array(obs2["agent_pos"], np.float32)
+            if term or trunc: break
+        true_cov[k] = float(info2.get("coverage", 0.0))
+        true_bd[k] = np.linalg.norm(np.array(info2["block_pose"], np.float32)[:2] - gp[:2])
+    env.close()
+    return _pearson(cost_model, true_bd), _pearson(cost_model, true_cov), float(true_bd.std()), float(cost_model.std())
+
 # ----------------------------------------------------------- CLI
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", type=str, default="eval", choices=["enc", "dyn", "eval"])
+    p.add_argument("--stage", type=str, default="eval", choices=["enc", "dyn", "eval", "probe"])
     p.add_argument("--data", type=str, default="")
     p.add_argument("--enc_ckpt", type=str, default=""); p.add_argument("--dyn_ckpt", type=str, default="")
     p.add_argument("--enc_steps", type=int, default=30000); p.add_argument("--dyn_steps", type=int, default=20000)
@@ -102,6 +143,8 @@ def get_args():
     p.add_argument("--oracle_iters", type=int, default=3); p.add_argument("--oracle_exec", type=int, default=5)
     p.add_argument("--task_seed", type=int, default=9000)
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
+    p.add_argument("--probe_k", type=int, default=96, help="séquences tirées / tâche pour --stage probe")
+    p.add_argument("--probe_seeds", type=int, default=5, help="nb de tâches pour --stage probe")
     return p.parse_args()
 
 def main():
@@ -168,11 +211,28 @@ def main():
         print(f"dynamique -> {dyn_ckpt}", flush=True)
         return
 
-    # ===================== ÉVAL : planif CEM latente (encodeur gelé + dynamique) =====================
+    # ===================== ÉVAL / PROBE : chargent la dynamique =====================
     if not os.path.exists(dyn_ckpt):
         raise SystemExit(f"dynamique introuvable : {dyn_ckpt} — lance d'abord --stage dyn")
     db = torch.load(dyn_ckpt, map_location=dev); m.dyn.load_state_dict(db["dyn"]); m.eval()
     print(f"dynamique chargée : {dyn_ckpt}", flush=True)
+
+    if a.stage == "probe":                              # le coût latent est-il corrélé au vrai progrès ?
+        scratch = make_env()
+        print(f"\n=== PROBE alignement coût-modèle vs vrai (coût {a.cost}, {a.probe_k} séq/tâche) ===", flush=True)
+        rbd, rcov = [], []
+        for k in range(a.probe_seeds):
+            r_bd, r_cov, bdstd, cstd = cost_alignment(m, a.hin, P, dev, scratch, a.task_seed + k, a.cost,
+                                                       K=a.probe_k, Hp=a.plan_h)
+            rbd.append(r_bd); rcov.append(r_cov)
+            print(f"  tâche {k}: r(coût, dist_bloc-but) {r_bd:+.2f}  r(coût, coverage) {r_cov:+.2f}"
+                  f"  (σ dist réelle {bdstd:.0f}px, σ coût {cstd:.3f})", flush=True)
+        scratch.close()
+        print(f"  MOYENNE : r(coût,dist) {np.mean(rbd):+.2f}  r(coût,coverage) {np.mean(rcov):+.2f}", flush=True)
+        print("  lecture : |r|>0.5 -> coût FIABLE (réparer la recherche/horizon) ; |r|~0 -> coût PLAT "
+              "(le monde imaginé ne reflète pas le vrai progrès sur cet horizon).", flush=True)
+        return
+
     if a.tasks > 0:
         scratch = make_env()
         print(f"\n=== PLANIFICATION (2 étapes, coût {a.cost}) — {a.tasks} tâches, ≤{a.max_steps} pas ===", flush=True)
