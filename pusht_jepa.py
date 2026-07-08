@@ -111,24 +111,26 @@ class JEPAWM(nn.Module):
             nxt = s.dyn(prev, cur, A[:, h]); prev, cur = cur, nxt; outs.append(nxt)
         return torch.stack(outs, 1)
 
-    def forward(s, tok, A, w_tf=1.0):
-        """tok:(B,T,npf,obs) clip ; A:(B,T-1,2) actions locales.
-        Cibles = latents des frames encodées (pas de stop-grad). Prédit les frames 2..T-1 depuis
-        (frame0,frame1). Perte = boucle-fermée + teacher-forced 1-pas + SIGReg."""
+    def forward(s, tok, A, w_tf=1.0, stopgrad=True):
+        """tok:(B,T,npf,obs) clip ; A:(B,T-1,2) actions locales. Prédit les frames 2..T-1 depuis
+        (frame0,frame1). Perte = boucle-fermée + teacher-forced 1-pas + SIGReg.
+        stopgrad=True : la CIBLE de prédiction est détachée (cible stable, recette DINO-WM) — SIGReg
+        reste sur z avec gradient (seul anti-collapse). stopgrad=False = fidèle LeJEPA (cible mouvante)."""
         B, T = tok.shape[:2]
-        z = s.encode_clip(tok)                          # (B,T,npf,d) — cibles ET SIGReg dessus
+        z = s.encode_clip(tok)                          # (B,T,npf,d) — SIGReg dessus (gradient)
+        zt = z.detach() if stopgrad else z              # CIBLE de prédiction (détachée si stopgrad)
         # action a[t] = transition t->t+1 ; prédire frame k (k>=2) utilise a[k-1].
         # --- boucle fermée depuis (z0,z1), actions a[1..T-2] -> frames 2..T-1 ---
         cl = z.new_zeros(())
         if T >= 3:
-            pred = s.rollout(z[:, 0], z[:, 1], A[:, 1:T - 1])            # (B,T-2,npf,d)
-            cl = F.smooth_l1_loss(pred, z[:, 2:T])
+            pred = s.rollout(z[:, 0], z[:, 1], A[:, 1:T - 1])            # (B,T-2,npf,d) ; contexte AVEC grad
+            cl = F.smooth_l1_loss(pred, zt[:, 2:T])
         # --- teacher-forced 1-pas : G(z[t-1],z[t],a[t]) vs z[t+1], t=1..T-2 ---
         tf = z.new_zeros(())
         if w_tf > 0 and T >= 3:
             for t in range(1, T - 1):
                 p = s.dyn(z[:, t - 1], z[:, t], A[:, t])
-                tf = tf + F.smooth_l1_loss(p, z[:, t + 1])
+                tf = tf + F.smooth_l1_loss(p, zt[:, t + 1])
             tf = tf / (T - 2)
         reg = sigreg(z.reshape(-1, s.d))
         return cl + w_tf * tf + s.rw * reg, cl.detach(), tf.detach(), reg.detach()
@@ -220,6 +222,7 @@ def get_args():
     p.add_argument("--nh", type=int, default=4); p.add_argument("--dyn_layers", type=int, default=4)
     p.add_argument("--rw", type=float, default=1.0, help="poids SIGReg (1.0 sur images, cf. drive_model)")
     p.add_argument("--w_tf", type=float, default=1.0, help="poids teacher-forced 1-pas (stabilise)")
+    p.add_argument("--stopgrad", type=int, default=1, help="1 = cible de prédiction détachée (cible stable, recette DINO-WM) ; 0 = fidèle LeJEPA (cible mouvante, échoue)")
     p.add_argument("--load", type=int, default=0); p.add_argument("--resume", type=int, default=0)
     p.add_argument("--tasks", type=int, default=0, help=">0 : évalue MPC/oracle/aléa sur ce nb de tâches")
     p.add_argument("--cost", type=str, default="latent", choices=["latent", "latent_noagent"])
@@ -252,14 +255,14 @@ def main():
     if not a.load:                                      # --load 1 = planifier sans réentraîner
         X, act = load_data(data); n, T = X.shape[0], X.shape[1]
         print(f"données {tuple(X.shape)}  |  {'reprise' if a.resume else 'entraînement'} "
-              f"{a.steps} pas, bs {a.bs}, SIGReg rw {m.rw}, dev {dev}", flush=True)
+              f"{a.steps} pas, bs {a.bs}, SIGReg rw {m.rw}, stopgrad {bool(a.stopgrad)}, dev {dev}", flush=True)
         opt = torch.optim.Adam(m.parameters(), a.lr)
         rng = np.random.default_rng(0)
         for st in range(a.steps):
             ids = torch.from_numpy(rng.integers(0, n, a.bs))
             tok = frames_to_tokens(X[ids], a.hin, P, dev)               # (bs,T,npf,obs)
             A = act[ids].to(dev)                                        # (bs,T-1,2)
-            loss, cl, tf, reg = m(tok, A, w_tf=a.w_tf)
+            loss, cl, tf, reg = m(tok, A, w_tf=a.w_tf, stopgrad=bool(a.stopgrad))
             opt.zero_grad(); loss.backward(); opt.step()
             if st % 500 == 0:
                 print(f"  step {st:6d}  loss {loss.item():.4f}  (cl {cl.item():.4f}  tf {tf.item():.4f}"
