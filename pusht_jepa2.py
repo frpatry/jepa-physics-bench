@@ -142,6 +142,28 @@ def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.
     return (_pearson(cost_model, true_bd), _pearson(cost_true, true_bd), _pearson(cost_model, true_cov),
             float(true_bd.std()), float(cost_model.std()))
 
+# ----------------------------------------------------------- pool de pré-entraînement MÉLANGÉ (scaling encodeur)
+def build_pool(mix, data, stl_cap=100000, vid_nclass=10, vid_per_class=200, vid_T=16):
+    """Renvoie un pool de frames uint8 (N,96,96,3) mélangé selon `mix` (ex. 'pusht,stl,video')."""
+    pools = []
+    if "pusht" in mix:
+        X = np.load(data)["X"]; p = X.reshape(-1, 96, 96, 3)
+        pools.append(p); print(f"  pusht : {len(p)} frames", flush=True)
+    if "stl" in mix:                                                     # images naturelles diverses (STL-10 non étiqueté)
+        import torchvision
+        ds = torchvision.datasets.STL10("/content/stl", split="unlabeled", download=True)
+        arr = np.transpose(ds.data[:stl_cap], (0, 2, 3, 1))             # (N,3,96,96)->(N,96,96,3)
+        pools.append(np.ascontiguousarray(arr)); print(f"  stl   : {len(arr)} frames", flush=True)
+    if "video" in mix:                                                  # vraies vidéos (UCF101-subset)
+        from types import SimpleNamespace
+        from lejepa_video import get_data
+        Xv, _, _ = get_data(SimpleNamespace(source="subset", nclass=vid_nclass, per_class=vid_per_class, T=vid_T, H=96))
+        v = (Xv.reshape(-1, 96, 96, 3) * 255).astype(np.uint8)
+        pools.append(v); print(f"  video : {len(v)} frames", flush=True)
+    pool = np.concatenate(pools, 0)
+    print(f"  POOL TOTAL : {len(pool)} frames", flush=True)
+    return torch.from_numpy(pool)
+
 # ----------------------------------------------------------- CLI
 def get_args():
     p = argparse.ArgumentParser()
@@ -157,6 +179,7 @@ def get_args():
     p.add_argument("--rw", type=float, default=1.0, help="poids SIGReg à l'étape 1 (encodeur)")
     p.add_argument("--mask_ratio", type=float, default=0.6); p.add_argument("--n_masks", type=int, default=4)
     p.add_argument("--w_tf", type=float, default=1.0)
+    p.add_argument("--mix", type=str, default="pusht", help="sources du pré-entraînement encodeur, ex. 'pusht,stl,video'")
     # éval
     p.add_argument("--tasks", type=int, default=0); p.add_argument("--cost", type=str, default="latent",
                    choices=["latent", "latent_noagent"])
@@ -182,12 +205,12 @@ def main():
 
     # ===================== ÉTAPE 1 : encodeur I-JEPA masqué + SIGReg, puis GELÉ =====================
     if a.stage == "enc":
-        X, _ = load_data(data); n, T = X.shape[0], X.shape[1]
-        Xf = X.reshape(n * T, X.shape[2], X.shape[3], 3)                     # frames à plat (I-JEPA per-frame)
+        print(f"construction du pool de pré-entraînement [{a.mix}] …", flush=True)
+        Xf = build_pool(a.mix, data)                                        # frames mélangées (I-JEPA per-frame)
         enc = VJEPA(obs, a.d, npf, a.nl, a.nh, a.rw, a.pred_layers).to(dev)
         opt = torch.optim.Adam(enc.parameters(), a.lr); rng = np.random.default_rng(0)
-        print(f"ÉTAPE 1 (encodeur SSL) : {Xf.shape[0]} frames, I-JEPA masqué (ratio {a.mask_ratio}, "
-              f"{a.n_masks} masques) + SIGReg rw {a.rw}, {a.enc_steps} pas, dev {dev}", flush=True)
+        print(f"ÉTAPE 1 (encodeur SSL) : {Xf.shape[0]} frames, d {a.d}, {a.nl} couches, I-JEPA masqué "
+              f"(ratio {a.mask_ratio}, {a.n_masks} masques) + SIGReg rw {a.rw}, {a.enc_steps} pas, dev {dev}", flush=True)
         for st in range(a.enc_steps):
             ids = torch.from_numpy(rng.integers(0, Xf.shape[0], a.bs))
             o = frames_to_tokens(Xf[ids].unsqueeze(1), a.hin, P, dev)[:, 0]  # (bs,npf,obs)
