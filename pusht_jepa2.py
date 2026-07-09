@@ -21,7 +21,7 @@ le prédicteur imagine dedans.
   python pusht_jepa2.py --stage dyn --dyn_steps 20000        # étape 2 : dynamique sur latents gelés
   python pusht_jepa2.py --stage eval --tasks 10              # planif MPC/oracle/aléa
 """
-import argparse, os
+import argparse, math, os
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from vjepa import VJEPA, sigreg, tube_masks
 from pusht_jepa import (Dynamics, frames_to_tokens, img_to_tokens, cem_latent,
@@ -78,6 +78,21 @@ def latent_smoothness(z, d):
     cos = F.cosine_similarity(zt, zt1, -1).mean().item()
     return marg, copy, cos
 
+# ----------------------------------------------------------- sonde de POSE (qualité de la représentation)
+class PoseReadout(nn.Module):
+    """Sonde attentive (façon V-JEPA) sur latent GELÉ -> (x, y, sinθ, cosθ) du bloc. Mesure si
+    l'encodeur ENCODE la pose (sinon = sous-entraîné/étroit ; si oui = c'est le coût L2 le problème)."""
+    def __init__(s, d, nh=4, p=0.1):
+        super().__init__()
+        s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        s.attn = nn.MultiheadAttention(d, nh, batch_first=True, dropout=p)
+        s.ln = nn.LayerNorm(d); s.drop = nn.Dropout(p); s.fc = nn.Linear(d, 4)
+    def forward(s, toks):
+        q = s.q.expand(toks.size(0), -1, -1)
+        pooled, _ = s.attn(q, toks, toks)
+        o = s.fc(s.drop(s.ln(pooled[:, 0])))
+        return torch.cat([o[:, :2].sigmoid(), F.normalize(o[:, 2:], dim=-1)], -1)   # xy∈[0,1], (sin,cos) unité
+
 # ----------------------------------------------------------- alignement coût-modèle vs vrai progrès
 def _pearson(a, b):
     a = a - a.mean(); b = b - b.mean()
@@ -130,7 +145,7 @@ def cost_alignment(m, hin, P, dev, scratch, seed, cost_mode, K=96, Hp=4, amax=0.
 # ----------------------------------------------------------- CLI
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", type=str, default="eval", choices=["enc", "dyn", "eval", "probe"])
+    p.add_argument("--stage", type=str, default="eval", choices=["enc", "dyn", "eval", "probe", "pose_probe"])
     p.add_argument("--data", type=str, default="")
     p.add_argument("--enc_ckpt", type=str, default=""); p.add_argument("--dyn_ckpt", type=str, default="")
     p.add_argument("--enc_steps", type=int, default=30000); p.add_argument("--dyn_steps", type=int, default=20000)
@@ -154,6 +169,7 @@ def get_args():
     p.add_argument("--policies", type=str, default="mpc,oracle,random")
     p.add_argument("--probe_k", type=int, default=96, help="séquences tirées / tâche pour --stage probe")
     p.add_argument("--probe_seeds", type=int, default=5, help="nb de tâches pour --stage probe")
+    p.add_argument("--probe_steps", type=int, default=4000, help="pas d'entraînement de la sonde pose")
     return p.parse_args()
 
 def main():
@@ -196,6 +212,38 @@ def main():
     enc.load_state_dict(eb["model"])
     m = WM2(enc, ea["d"], npf, a.dyn_layers, a.nh).to(dev)
     print(f"encodeur GELÉ chargé : {enc_ckpt}  (hin {a.hin}, d {ea['d']}, npf {npf})", flush=True)
+
+    # ===================== SONDE POSE : l'encodeur ENCODE-t-il la position du bloc ? =====================
+    if a.stage == "pose_probe":
+        dd = np.load(data); Xr = torch.from_numpy(dd["X"]); BPr = torch.from_numpy(dd["BP"].astype(np.float32))
+        n, T = Xr.shape[:2]; Xf = Xr.reshape(n * T, 96, 96, 3); BPf = BPr.reshape(n * T, 3)
+        ntr = int(0.9 * len(Xf)); rng = np.random.default_rng(0)
+        probe = PoseReadout(ea["d"]).to(dev); opt = torch.optim.Adam(probe.parameters(), 1e-3)
+        print(f"SONDE POSE : latent GELÉ -> (x,y,angle) du bloc, {len(Xf)} frames, {a.probe_steps} pas", flush=True)
+        for st in range(a.probe_steps):
+            ids = torch.from_numpy(rng.integers(0, ntr, a.bs))
+            with torch.no_grad(): z = m.encode(frames_to_tokens(Xf[ids].unsqueeze(1), a.hin, P, dev)[:, 0])
+            tgt = BPf[ids].to(dev); pred = probe(z)
+            ang = tgt[:, 2]; sc = torch.stack([ang.sin(), ang.cos()], -1)
+            loss = F.mse_loss(pred[:, :2], tgt[:, :2] / 512.0) + F.mse_loss(pred[:, 2:], sc)
+            opt.zero_grad(); loss.backward(); opt.step()
+            if st % 500 == 0: print(f"  step {st:5d}  loss {loss.item():.4f}", flush=True)
+        probe.eval(); pe, ae, nb = 0.0, 0.0, 0
+        with torch.no_grad():
+            for i in range(ntr, len(Xf), a.bs):
+                ids = torch.arange(i, min(i + a.bs, len(Xf)))
+                z = m.encode(frames_to_tokens(Xf[ids].unsqueeze(1), a.hin, P, dev)[:, 0]); pr = probe(z)
+                tg = BPf[ids].to(dev)
+                pe += (pr[:, :2] * 512.0 - tg[:, :2]).norm(dim=-1).sum().item()
+                da = torch.atan2(pr[:, 2], pr[:, 3]) - tg[:, 2]
+                ae += torch.atan2(da.sin(), da.cos()).abs().sum().item() * 180.0 / math.pi; nb += len(ids)
+        # baseline "aucune info" : prédire le centre / angle moyen
+        base_px = (BPf[ntr:, :2] - BPf[:ntr, :2].mean(0)).norm(dim=-1).mean().item()
+        print(f"\n=== SONDE POSE (test {nb} frames) : erreur POSITION {pe / nb:.1f} px  |  erreur ANGLE {ae / nb:.1f}°"
+              f"  (baseline sans info ~{base_px:.0f} px, 90°)", flush=True)
+        print("  lecture : position ~qq px -> l'encodeur ENCODE bien la pose (repr OK -> le pb est le coût L2) ;", flush=True)
+        print("            position ~grosse -> encodeur SOUS-ENTRAÎNÉ/étroit -> l'entraîner plus/plus de données.", flush=True)
+        return
 
     # ===================== ÉTAPE 2 : dynamique sur latents GELÉS =====================
     if a.stage == "dyn":
