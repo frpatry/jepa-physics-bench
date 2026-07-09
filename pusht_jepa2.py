@@ -179,6 +179,7 @@ def get_args():
     p.add_argument("--rw", type=float, default=1.0, help="poids SIGReg à l'étape 1 (encodeur)")
     p.add_argument("--mask_ratio", type=float, default=0.6); p.add_argument("--n_masks", type=int, default=4)
     p.add_argument("--w_tf", type=float, default=1.0)
+    p.add_argument("--clip", type=float, default=1.0, help="clipping de la norme du gradient (stabilité, surtout gros modèle)")
     p.add_argument("--mix", type=str, default="pusht", help="sources du pré-entraînement encodeur, ex. 'pusht,stl,video'")
     # éval
     p.add_argument("--tasks", type=int, default=0); p.add_argument("--cost", type=str, default="latent",
@@ -216,7 +217,10 @@ def main():
             o = frames_to_tokens(Xf[ids].unsqueeze(1), a.hin, P, dev)[:, 0]  # (bs,npf,obs)
             masks = [mm.to(dev) for mm in tube_masks(a.bs, 1, nP, a.mask_ratio, a.n_masks, rng)]
             loss = enc(o, masks)
-            opt.zero_grad(); loss.backward(); opt.step()
+            if not torch.isfinite(loss): print(f"  step {st}: loss non-finie, skip", flush=True); continue
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(enc.parameters(), a.clip)                # garde-fou anti-divergence
+            opt.step()
             if st % 500 == 0:
                 with torch.no_grad(): rg = sigreg(enc.tokens(o).reshape(-1, a.d)).item()
                 print(f"  step {st:6d}  loss {loss.item():.4f}  (sigreg latents {rg:.4f})", flush=True)
@@ -284,7 +288,10 @@ def main():
             ids = torch.from_numpy(rng.integers(0, n, a.bs))
             tok = frames_to_tokens(X[ids], a.hin, P, dev); A = act[ids].to(dev)
             loss, cl, tf = m.dyn_loss(tok, A, w_tf=a.w_tf)
-            opt.zero_grad(); loss.backward(); opt.step()
+            if not torch.isfinite(loss): print(f"  step {st}: loss non-finie, skip", flush=True); continue
+            opt.zero_grad(); loss.backward()
+            torch.nn.utils.clip_grad_norm_(m.dyn.parameters(), a.clip)              # garde-fou anti-divergence
+            opt.step()
             if st % 500 == 0:
                 print(f"  step {st:6d}  loss {loss.item():.4f}  (cl {cl.item():.4f}  tf {tf.item():.4f})", flush=True)
         torch.save({"dyn": m.dyn.state_dict(), "dyn_layers": a.dyn_layers}, dyn_ckpt)
