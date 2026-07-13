@@ -132,15 +132,32 @@ def stage_dyn(a, dev):
         marg = F.smooth_l1_loss(z, z.mean((0, 1, 2), keepdim=True).expand_as(z)).item()
     print(f"features V-JEPA 2 : copy {copy:.4f}  |  moyenne {marg:.4f}  (la dynamique doit battre copy)", flush=True)
     dyn = Dynamics(d, npf, a.dyn_layers, a.nh, residual=True).to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
+    ro, BP = None, None                                                      # perte POSE-AWARE (readout gelé)
+    ro_path = a.readout_ckpt or default_path("pusht_vj2ro.pt")
+    if a.w_pose > 0 and os.path.exists(ro_path):
+        rb = torch.load(ro_path, map_location=dev); ro = PoseReadout(rb["d"]).to(dev)
+        ro.load_state_dict(rb["ro"]); ro.eval()
+        for p in ro.parameters(): p.requires_grad_(False)
+        BP = torch.from_numpy(meta["BP"].astype(np.float32))
+        print(f"perte pose-aware ON (readout gelé, w_pose {a.w_pose}) — l'imaginé doit décoder la bonne pose", flush=True)
+    elif a.w_pose > 0:
+        print("readout absent -> perte latente seule (lance --stage readout AVANT dyn pour la pose-aware)", flush=True)
     print(f"ÉTAPE dyn : {a.dyn_steps} pas, d {d}, npf {npf}, bs {a.bs}, bf16 {amp}, dev {dev}", flush=True)
     for st in range(a.dyn_steps):
         ids = rng.integers(0, N, a.bs)
         z = load(ids); Ai = act[torch.from_numpy(ids)].to(dev)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
-            loss = F.smooth_l1_loss(rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1], ckpt=True), z[:, 2:T])
+            pred = rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1], ckpt=True)  # (bs,T-2,npf,d)
+            cl = F.smooth_l1_loss(pred, z[:, 2:T]); loss = cl; pl = torch.zeros((), device=dev)
+            if ro is not None:                                               # pose lue de l'imaginé vs vraie pose
+                bpt = BP[torch.from_numpy(ids)][:, 2:T].to(dev)
+                pp = ro(pred.reshape(-1, npf, d)).reshape(a.bs, T - 2, 4)
+                sc = torch.stack([bpt[..., 2].sin(), bpt[..., 2].cos()], -1)
+                pl = F.mse_loss(pp[..., :2], bpt[..., :2] / 512.0) + F.mse_loss(pp[..., 2:], sc)
+                loss = cl + a.w_pose * pl
         if not torch.isfinite(loss): continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(dyn.parameters(), a.clip); opt.step()
-        if st % 500 == 0: print(f"  step {st:5d}  cl {loss.item():.4f}  (copy {copy:.3f})", flush=True)
+        if st % 500 == 0: print(f"  step {st:5d}  cl {cl.item():.4f}  pose {pl.item():.4f}  (copy {copy:.3f})", flush=True)
     torch.save({"dyn": dyn.state_dict(), "d": d, "npf": npf, "dyn_layers": a.dyn_layers, "nh": a.nh, "residual": True},
                a.dyn_ckpt or default_path("pusht_vj2dyn.pt"))
     print(f"dynamique -> {a.dyn_ckpt or default_path('pusht_vj2dyn.pt')}", flush=True)
@@ -260,6 +277,7 @@ def get_args():
     p.add_argument("--dyn_steps", type=int, default=20000); p.add_argument("--readout_steps", type=int, default=6000)
     p.add_argument("--dyn_layers", type=int, default=4); p.add_argument("--nh", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--clip", type=float, default=1.0)
+    p.add_argument("--w_pose", type=float, default=2.0, help="poids de la perte pose-aware (readout gelé sur l'imaginé)")
     p.add_argument("--tasks", type=int, default=10); p.add_argument("--policies", type=str, default="mpc,random")
     p.add_argument("--plan_h", type=int, default=4); p.add_argument("--plan_pop", type=int, default=96)
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=40)
