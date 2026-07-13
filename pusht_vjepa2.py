@@ -116,27 +116,30 @@ def run_episode_vj2(a, dev, dyn, ro, seed, policy, scratch):
 def stage_dyn(a, dev):
     feat_path = a.cache or default_path("pusht_vj2feat.npy")
     meta = np.load(feat_path.replace(".npy", "_meta.npz"))
-    feat = torch.from_numpy(np.load(feat_path)); N, T, npf, d = feat.shape   # fp16 en RAM (~9.4Go)
+    feat = np.load(feat_path, mmap_mode="r"); N, T, npf, d = feat.shape       # MEMMAP (pas de RAM 9.4Go)
     A = torch.from_numpy(meta["A"].astype(np.float32)); AG = torch.from_numpy(meta["AG"].astype(np.float32))
     act = (A - AG[:, :-1]) / 256.0
     rng = np.random.default_rng(0)
+    amp = (dev == "cuda")                                                     # precision mixte bf16 (mémoire /2)
+    def load(ids): return torch.from_numpy(np.ascontiguousarray(feat[ids])).float().to(dev)
     with torch.no_grad():
-        z = feat[torch.from_numpy(rng.integers(0, N, 256))].float().to(dev)
+        z = load(rng.integers(0, N, 128))
         copy = F.smooth_l1_loss(z[:, 1:T - 1], z[:, 2:T]).item()
         marg = F.smooth_l1_loss(z, z.mean((0, 1, 2), keepdim=True).expand_as(z)).item()
     print(f"features V-JEPA 2 : copy {copy:.4f}  |  moyenne {marg:.4f}  (la dynamique doit battre copy)", flush=True)
     dyn = Dynamics(d, npf, a.dyn_layers, a.nh).to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
-    print(f"ÉTAPE dyn : {a.dyn_steps} pas, d {d}, npf {npf}, dev {dev}", flush=True)
+    print(f"ÉTAPE dyn : {a.dyn_steps} pas, d {d}, npf {npf}, bs {a.bs}, bf16 {amp}, dev {dev}", flush=True)
     for st in range(a.dyn_steps):
-        ids = torch.from_numpy(rng.integers(0, N, a.bs))
-        z = feat[ids].float().to(dev); Ai = act[ids].to(dev)
-        cl = F.smooth_l1_loss(rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1]), z[:, 2:T])
-        tf = z.new_zeros(())
-        for t in range(1, T - 1): tf = tf + F.smooth_l1_loss(dyn(z[:, t - 1], z[:, t], Ai[:, t]), z[:, t + 1])
-        tf = tf / (T - 2); loss = cl + tf
+        ids = rng.integers(0, N, a.bs)
+        z = load(ids); Ai = act[torch.from_numpy(ids)].to(dev)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
+            cl = F.smooth_l1_loss(rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1]), z[:, 2:T])
+            tf = z.new_zeros(())
+            for t in range(1, T - 1): tf = tf + F.smooth_l1_loss(dyn(z[:, t - 1], z[:, t], Ai[:, t]), z[:, t + 1])
+            loss = cl + tf / (T - 2)
         if not torch.isfinite(loss): continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(dyn.parameters(), a.clip); opt.step()
-        if st % 500 == 0: print(f"  step {st:5d}  loss {loss.item():.4f}  (cl {cl.item():.4f}  tf {tf.item():.4f})", flush=True)
+        if st % 500 == 0: print(f"  step {st:5d}  loss {loss.item():.4f}  (cl {cl.item():.4f}  tf {(tf / (T - 2)).item():.4f})", flush=True)
     torch.save({"dyn": dyn.state_dict(), "d": d, "npf": npf, "dyn_layers": a.dyn_layers, "nh": a.nh},
                a.dyn_ckpt or default_path("pusht_vj2dyn.pt"))
     print(f"dynamique -> {a.dyn_ckpt or default_path('pusht_vj2dyn.pt')}", flush=True)
