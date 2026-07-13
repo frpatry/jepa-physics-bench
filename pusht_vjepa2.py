@@ -171,6 +171,40 @@ def stage_readout(a, dev):
     torch.save({"ro": ro.state_dict(), "d": d}, a.readout_ckpt or default_path("pusht_vj2ro.pt"))
     print(f"readout -> {a.readout_ckpt or default_path('pusht_vj2ro.pt')}", flush=True)
 
+def _pose_err(pr, true):
+    """pr:(B,4)[x,y,sin,cos] readout, true:(B,3)[x,y,angle] -> (pos px, angle deg) moyens."""
+    pos = (pr[:, :2] * 512.0 - true[:, :2]).norm(dim=-1).mean().item()
+    da = torch.atan2(pr[:, 2], pr[:, 3]) - true[:, 2]
+    ang = torch.atan2(da.sin(), da.cos()).abs().mean().item() * 180.0 / math.pi
+    return pos, ang
+
+def stage_probe(a, dev):
+    """La dynamique+readout suivent-elles la vraie trajectoire de POSE ? On roule la dynamique avec
+    les VRAIES actions et on compare la pose IMAGINÉE à la vraie, par horizon (vs pose lue sur le RÉEL)."""
+    db = torch.load(a.dyn_ckpt or default_path("pusht_vj2dyn.pt"), map_location=dev)
+    dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"], residual=db.get("residual", False)).to(dev)
+    dyn.load_state_dict(db["dyn"]); dyn.eval()
+    rb = torch.load(a.readout_ckpt or default_path("pusht_vj2ro.pt"), map_location=dev)
+    ro = PoseReadout(rb["d"]).to(dev); ro.load_state_dict(rb["ro"]); ro.eval()
+    feat_path = a.cache or default_path("pusht_vj2feat.npy")
+    meta = np.load(feat_path.replace(".npy", "_meta.npz")); feat = torch.from_numpy(np.load(feat_path))
+    N, T, npf, d = feat.shape
+    A = torch.from_numpy(meta["A"].astype(np.float32)); AG = torch.from_numpy(meta["AG"].astype(np.float32))
+    BP = torch.from_numpy(meta["BP"].astype(np.float32)); act = (A - AG[:, :-1]) / 256.0
+    ids = torch.from_numpy(np.random.default_rng(2).integers(0, N, 512))
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+        z = feat[ids].float().to(dev); Ai = act[ids].to(dev)
+        imag = rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1])                 # (B,T-2,npf,d) frames 2..T-1 (vraies actions)
+    bp = BP[ids].to(dev)
+    print("\n=== PROBE suivi de pose (dynamique+readout roulées avec les VRAIES actions) ===", flush=True)
+    print("  horizon | pose IMAGINÉE (dyn) | pose RÉELLE (readout seul, borne)", flush=True)
+    for h in range(T - 2):
+        pi_pos, pi_ang = _pose_err(ro(imag[:, h].float()), bp[:, 2 + h])
+        pr_pos, pr_ang = _pose_err(ro(z[:, 2 + h].float()), bp[:, 2 + h])
+        print(f"    +{h + 1} pas | {pi_pos:5.1f}px {pi_ang:4.1f}° | {pr_pos:5.1f}px {pr_ang:4.1f}°", flush=True)
+    print("  lecture : imaginé proche du réel -> dyn+readout suivent la pose (le pb est la RECHERCHE/exécution) ;", flush=True)
+    print("            imaginé qui explose -> les latents imaginés sont OOD pour le readout (fixer dyn/readout).", flush=True)
+
 def stage_eval(a, dev):
     db = torch.load(a.dyn_ckpt or default_path("pusht_vj2dyn.pt"), map_location=dev)
     dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"], residual=db.get("residual", False)).to(dev)
@@ -212,7 +246,7 @@ def cache_features(a, dev, data):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", type=str, default="pose_probe",
-                   choices=["pose_probe", "cache", "dyn", "readout", "eval"])
+                   choices=["pose_probe", "cache", "dyn", "readout", "eval", "probe"])
     p.add_argument("--model", type=str, default="facebook/vjepa2-vitl-fpc64-256")
     p.add_argument("--data", type=str, default="")
     p.add_argument("--cache", type=str, default="", help="chemin du memmap de features (défaut Drive)")
@@ -240,6 +274,7 @@ def main():
     if a.stage == "cache":   cache_features(a, dev, data); return
     if a.stage == "dyn":     stage_dyn(a, dev); return
     if a.stage == "readout": stage_readout(a, dev); return
+    if a.stage == "probe":   stage_probe(a, dev); return
     if a.stage == "eval":    stage_eval(a, dev); return
     dd = np.load(data)
     X = dd["X"].reshape(-1, 96, 96, 3); BP = dd["BP"].reshape(-1, 3).astype(np.float32)
