@@ -52,10 +52,14 @@ def enc_gpu(frames, a, dev):
     return encode_frames(np.asarray(frames), a.model, dev, a.clip_len, a.enc_bs, verbose=False).float().to(dev)
 
 # ----------------------------------------------------------- dynamique + coût pose (planif façon V-JEPA 2-AC)
-def rollout(dyn, zp, zc, A):
+def rollout(dyn, zp, zc, A, ckpt=False):
+    """ckpt=True : gradient checkpointing (recalcule au backward) -> mémoire ~1 passe au lieu de Hp."""
+    from torch.utils.checkpoint import checkpoint
     outs, prev, cur = [], zp, zc
     for h in range(A.size(1)):
-        nxt = dyn(prev, cur, A[:, h]); prev, cur = cur, nxt; outs.append(nxt)
+        nxt = (checkpoint(dyn, prev, cur, A[:, h], use_reentrant=False)
+               if (ckpt and torch.is_grad_enabled()) else dyn(prev, cur, A[:, h]))
+        prev, cur = cur, nxt; outs.append(nxt)
     return torch.stack(outs, 1)
 
 def pose_cost(ph, pg, w_ang):
@@ -67,7 +71,7 @@ def pose_cost(ph, pg, w_ang):
 
 def cem_vj2(dyn, ro, z0, z1, pg, a, dev, mu0=None):
     Hp, pop, iters, elite, amax = a.plan_h, a.plan_pop, a.plan_iters, 16, 0.8
-    with torch.no_grad():
+    with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
         Z0 = z0.unsqueeze(0).expand(pop, -1, -1); Z1 = z1.unsqueeze(0).expand(pop, -1, -1)
         mu = torch.zeros(Hp, 2, device=dev) if mu0 is None else mu0.clone()
         sg = torch.full((Hp, 2), 0.30, device=dev)
@@ -133,13 +137,10 @@ def stage_dyn(a, dev):
         ids = rng.integers(0, N, a.bs)
         z = load(ids); Ai = act[torch.from_numpy(ids)].to(dev)
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=amp):
-            cl = F.smooth_l1_loss(rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1]), z[:, 2:T])
-            tf = z.new_zeros(())
-            for t in range(1, T - 1): tf = tf + F.smooth_l1_loss(dyn(z[:, t - 1], z[:, t], Ai[:, t]), z[:, t + 1])
-            loss = cl + tf / (T - 2)
+            loss = F.smooth_l1_loss(rollout(dyn, z[:, 0], z[:, 1], Ai[:, 1:T - 1], ckpt=True), z[:, 2:T])
         if not torch.isfinite(loss): continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(dyn.parameters(), a.clip); opt.step()
-        if st % 500 == 0: print(f"  step {st:5d}  loss {loss.item():.4f}  (cl {cl.item():.4f}  tf {(tf / (T - 2)).item():.4f})", flush=True)
+        if st % 500 == 0: print(f"  step {st:5d}  cl {loss.item():.4f}  (copy {copy:.3f})", flush=True)
     torch.save({"dyn": dyn.state_dict(), "d": d, "npf": npf, "dyn_layers": a.dyn_layers, "nh": a.nh},
                a.dyn_ckpt or default_path("pusht_vj2dyn.pt"))
     print(f"dynamique -> {a.dyn_ckpt or default_path('pusht_vj2dyn.pt')}", flush=True)
@@ -225,7 +226,7 @@ def get_args():
     p.add_argument("--dyn_layers", type=int, default=4); p.add_argument("--nh", type=int, default=8)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--clip", type=float, default=1.0)
     p.add_argument("--tasks", type=int, default=10); p.add_argument("--policies", type=str, default="mpc,random")
-    p.add_argument("--plan_h", type=int, default=4); p.add_argument("--plan_pop", type=int, default=192)
+    p.add_argument("--plan_h", type=int, default=4); p.add_argument("--plan_pop", type=int, default=96)
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=40)
     p.add_argument("--frameskip", type=int, default=5); p.add_argument("--w_ang", type=float, default=0.5)
     p.add_argument("--task_seed", type=int, default=9000)
