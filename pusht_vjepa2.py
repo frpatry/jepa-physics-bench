@@ -131,7 +131,7 @@ def stage_dyn(a, dev):
         copy = F.smooth_l1_loss(z[:, 1:T - 1], z[:, 2:T]).item()
         marg = F.smooth_l1_loss(z, z.mean((0, 1, 2), keepdim=True).expand_as(z)).item()
     print(f"features V-JEPA 2 : copy {copy:.4f}  |  moyenne {marg:.4f}  (la dynamique doit battre copy)", flush=True)
-    dyn = Dynamics(d, npf, a.dyn_layers, a.nh).to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
+    dyn = Dynamics(d, npf, a.dyn_layers, a.nh, residual=True).to(dev); opt = torch.optim.Adam(dyn.parameters(), a.lr)
     print(f"ÉTAPE dyn : {a.dyn_steps} pas, d {d}, npf {npf}, bs {a.bs}, bf16 {amp}, dev {dev}", flush=True)
     for st in range(a.dyn_steps):
         ids = rng.integers(0, N, a.bs)
@@ -141,7 +141,7 @@ def stage_dyn(a, dev):
         if not torch.isfinite(loss): continue
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(dyn.parameters(), a.clip); opt.step()
         if st % 500 == 0: print(f"  step {st:5d}  cl {loss.item():.4f}  (copy {copy:.3f})", flush=True)
-    torch.save({"dyn": dyn.state_dict(), "d": d, "npf": npf, "dyn_layers": a.dyn_layers, "nh": a.nh},
+    torch.save({"dyn": dyn.state_dict(), "d": d, "npf": npf, "dyn_layers": a.dyn_layers, "nh": a.nh, "residual": True},
                a.dyn_ckpt or default_path("pusht_vj2dyn.pt"))
     print(f"dynamique -> {a.dyn_ckpt or default_path('pusht_vj2dyn.pt')}", flush=True)
 
@@ -173,7 +173,8 @@ def stage_readout(a, dev):
 
 def stage_eval(a, dev):
     db = torch.load(a.dyn_ckpt or default_path("pusht_vj2dyn.pt"), map_location=dev)
-    dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"]).to(dev); dyn.load_state_dict(db["dyn"]); dyn.eval()
+    dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"], residual=db.get("residual", False)).to(dev)
+    dyn.load_state_dict(db["dyn"]); dyn.eval()
     rb = torch.load(a.readout_ckpt or default_path("pusht_vj2ro.pt"), map_location=dev)
     ro = PoseReadout(rb["d"]).to(dev); ro.load_state_dict(rb["ro"]); ro.eval()
     scratch = make_env()

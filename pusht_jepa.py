@@ -62,18 +62,21 @@ class Dynamics(nn.Module):
     """Prédicteur attentionnel : contexte = tokens de 2 frames (t-1,t) + un token d'ACTION ;
     requêtes = npf mask-tokens positionnels de la frame t+1 -> latents prédits par attention.
     Rôles distincts (prev / cur / action / query) pour que l'attention sépare les sources."""
-    def __init__(s, d, npf, nl, nh):
+    def __init__(s, d, npf, nl, nh, residual=False):
         super().__init__()
-        s.npf = npf
+        s.npf = npf; s.residual = residual
         s.sp = nn.Embedding(npf, d)                     # position spatiale (partagée ctx + requêtes)
         s.role = nn.Embedding(4, d)                     # 0=prev 1=cur 2=action 3=query
         s.act = nn.Linear(2, d)                         # action locale (delta normalisé) -> token
         s.mask_token = nn.Parameter(torch.zeros(d))
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d); s.head = nn.Linear(d, d)
+        if residual:                                    # démarre en COPIE : Δ nul à l'init (head zéro)
+            nn.init.zeros_(s.head.weight); nn.init.zeros_(s.head.bias)
 
     def forward(s, z_prev, z_cur, a):
-        """z_prev,z_cur:(B,npf,d) ; a:(B,2) -> ẑ_next:(B,npf,d)."""
+        """z_prev,z_cur:(B,npf,d) ; a:(B,2) -> ẑ_next:(B,npf,d). residual : prédit le CHANGEMENT z_cur+Δ
+        (copier = Δ nul ; sinon, prédire des features riches d=1024 de zéro s'effondre sur la moyenne)."""
         B = z_cur.size(0); dev = z_cur.device
         pos = s.sp(torch.arange(s.npf, device=dev)).unsqueeze(0)          # (1,npf,d)
         prev = z_prev + pos + s.role.weight[0]
@@ -82,7 +85,8 @@ class Dynamics(nn.Module):
         q = (s.mask_token + s.role.weight[3]).unsqueeze(0) + pos          # (1,npf,d)
         q = q.expand(B, -1, -1)
         x = s.tr(torch.cat([prev, cur, atok, q], dim=1))
-        return s.head(s.ln(x[:, -s.npf:]))                               # lit les npf requêtes
+        out = s.head(s.ln(x[:, -s.npf:]))                                # lit les npf requêtes
+        return z_cur + out if s.residual else out
 
 # ----------------------------------------------------------- world model JEPA complet
 class JEPAWM(nn.Module):
