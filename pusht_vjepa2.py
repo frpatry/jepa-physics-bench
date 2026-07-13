@@ -46,12 +46,34 @@ def encode_frames(frames, name, dev, clip_len=2, bs=16):
         if (i // bs) % 20 == 0: print(f"  encodage V-JEPA 2 : {i + len(batch)}/{len(frames)}", flush=True)
     return torch.cat(out, 0)
 
+# ----------------------------------------------------------- CACHE : features V-JEPA 2 des données Push-T
+def cache_features(a, dev, data):
+    """Précalcule les features V-JEPA 2 (lentes, ViT-L) une fois -> memmap fp16 sur Drive, pour
+    entraîner la dynamique/le readout ensuite sans réencoder. + méta (actions, poses, but)."""
+    dd = np.load(data); X = dd["X"]; n, T = X.shape[:2]; N = min(a.n_cache, n)
+    feat_path = a.cache or default_path("pusht_vj2feat.npy")
+    meta_path = feat_path.replace(".npy", "_meta.npz")
+    z0 = encode_frames(X[0, :1], a.model, dev, a.clip_len, 1)                 # infère (ntok, d)
+    ntok, d = z0.shape[1], z0.shape[2]
+    feat = np.lib.format.open_memmap(feat_path, mode="w+", dtype=np.float16, shape=(N, T, ntok, d))
+    print(f"CACHE -> {feat_path}  shape {(N, T, ntok, d)}  (~{N * T * ntok * d * 2 / 1e9:.1f} Go fp16)", flush=True)
+    flat = feat.reshape(N * T, ntok, d); Xf = X[:N].reshape(N * T, 96, 96, 3)
+    CH = a.enc_bs * 8
+    for i in range(0, N * T, CH):
+        z = encode_frames(Xf[i:i + CH], a.model, dev, a.clip_len, a.enc_bs)
+        flat[i:i + len(z)] = z.numpy(); print(f"  {min(i + CH, N * T)}/{N * T} frames en cache", flush=True)
+    feat.flush()
+    np.savez(meta_path, A=dd["A"][:N], AG=dd["AG"][:N], BP=dd["BP"][:N], GP=dd["GP"], N=N, T=T)
+    print(f"META -> {meta_path}  |  cache prêt (encodeur = {a.model})", flush=True)
+
 # ----------------------------------------------------------- CLI
 def get_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--stage", type=str, default="pose_probe", choices=["pose_probe"])
+    p.add_argument("--stage", type=str, default="pose_probe", choices=["pose_probe", "cache"])
     p.add_argument("--model", type=str, default="facebook/vjepa2-vitl-fpc64-256")
     p.add_argument("--data", type=str, default="")
+    p.add_argument("--cache", type=str, default="", help="chemin du memmap de features (défaut Drive)")
+    p.add_argument("--n_cache", type=int, default=3000, help="séquences à mettre en cache (fp16 ~3.1Mo/frame)")
     p.add_argument("--n_probe", type=int, default=6000, help="frames Push-T échantillonnées pour la sonde")
     p.add_argument("--probe_steps", type=int, default=6000); p.add_argument("--bs", type=int, default=64)
     p.add_argument("--enc_bs", type=int, default=16, help="batch d'encodage V-JEPA 2 (ViT-L, mémoire GPU)")
@@ -62,6 +84,8 @@ def main():
     a = get_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     data = a.data or default_path("pusht_data.npz")
+    if a.stage == "cache":
+        cache_features(a, dev, data); return
     dd = np.load(data)
     X = dd["X"].reshape(-1, 96, 96, 3); BP = dd["BP"].reshape(-1, 3).astype(np.float32)
     rng = np.random.default_rng(0)
