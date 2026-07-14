@@ -226,6 +226,53 @@ def stage_probe(a, dev):
     print("  lecture : imaginé proche du réel -> dyn+readout suivent la pose (le pb est la RECHERCHE/exécution) ;", flush=True)
     print("            imaginé qui explose -> les latents imaginés sont OOD pour le readout (fixer dyn/readout).", flush=True)
 
+def stage_align(a, dev):
+    """Le coût imaginé CLASSE-t-il correctement les actions ? Depuis un état, K séquences au hasard ;
+    on corrèle le coût-pose IMAGINÉ (dyn+readout) au VRAI progrès simulé. r~0 -> l'imagination ne
+    discrimine pas les actions (scaler la dynamique n'aidera pas -> structurel). r élevé -> coût fiable."""
+    db = torch.load(a.dyn_ckpt or default_path("pusht_vj2dyn.pt"), map_location=dev)
+    dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"], residual=db.get("residual", False)).to(dev)
+    dyn.load_state_dict(db["dyn"]); dyn.eval()
+    rb = torch.load(a.readout_ckpt or default_path("pusht_vj2ro.pt"), map_location=dev)
+    ro = PoseReadout(rb["d"]).to(dev); ro.load_state_dict(rb["ro"]); ro.eval()
+    scratch = make_env(); K, Hp = a.probe_k, a.plan_h
+    def pear(x, y):
+        x = x - x.mean(); y = y - y.mean()
+        return float((x * y).sum() / (np.sqrt((x * x).sum() * (y * y).sum()) + 1e-8))
+    print(f"\n=== ALIGNEMENT coût imaginé vs vrai progrès ({K} actions/état, {a.probe_seeds} états) ===", flush=True)
+    rs = []
+    for s in range(a.probe_seeds):
+        env = make_env(); rng = np.random.default_rng(a.task_seed + s)
+        obs, info = env.reset(seed=a.task_seed + s); gp = np.array(info["goal_pose"], np.float32)
+        far = np.array([40.0, 40.0], np.float32) if np.linalg.norm(gp[:2] - 40) > 120 else np.array([470.0, 470.0], np.float32)
+        gob, _ = reset_faithful(scratch, np.array([far[0], far[1], gp[0], gp[1], gp[2]], np.float32))
+        ag = np.array(obs["agent_pos"], np.float32); f0 = obs["pixels"]
+        for _ in range(a.frameskip): obs, _, _, _, info = env.step(ag.copy())
+        f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32); bp0 = np.array(info["block_pose"], np.float32)
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=(dev == "cuda")):
+            pg = ro(enc_gpu([gob["pixels"]], a, dev))[0]
+            z0 = enc_gpu([f0], a, dev)[0]; z1 = enc_gpu([f1], a, dev)[0]
+            A = rng.uniform(-0.8, 0.8, (K, Hp, 2)).astype(np.float32)
+            zf = rollout(dyn, z0.unsqueeze(0).expand(K, -1, -1), z1.unsqueeze(0).expand(K, -1, -1),
+                         torch.tensor(A, device=dev))[:, -1]
+            cost = (ro(zf.float())[:, :2] - pg[:2]).norm(dim=-1).cpu().numpy()   # coût position imaginé
+        true_d = np.zeros(K, np.float32); state0 = np.array([ag[0], ag[1], *bp0], np.float32)
+        for k in range(K):
+            obs2, info2 = reset_faithful(scratch, state0); agk = np.array(obs2["agent_pos"], np.float32); stop = False
+            for h in range(Hp):
+                act = np.clip(agk + A[k, h] * 256.0, 0, 512).astype(np.float32)
+                for _ in range(a.frameskip):
+                    obs2, _, term, trunc, info2 = scratch.step(act); agk = np.array(obs2["agent_pos"], np.float32)
+                    if term or trunc: stop = True; break
+                if stop: break
+            true_d[k] = np.linalg.norm(np.array(info2["block_pose"], np.float32)[:2] - gp[:2])
+        env.close(); r = pear(cost, true_d); rs.append(r)
+        print(f"  état {s}: r(coût, dist réelle) {r:+.2f}  (σ coût {cost.std():.3f}, σ dist réelle {true_d.std():.0f}px)", flush=True)
+    scratch.close()
+    print(f"  MOYENNE r {np.mean(rs):+.2f}", flush=True)
+    print("  r>0.5 -> coût FIABLE, scaler la dynamique/le CEM aidera ; r~0 -> l'imagination NE DISCRIMINE PAS "
+          "les actions (structurel : readout-sur-imaginé ou contexte OOD -> scaler seul n'aidera pas).", flush=True)
+
 def stage_eval(a, dev):
     db = torch.load(a.dyn_ckpt or default_path("pusht_vj2dyn.pt"), map_location=dev)
     dyn = Dynamics(db["d"], db["npf"], db["dyn_layers"], db["nh"], residual=db.get("residual", False)).to(dev)
@@ -267,7 +314,7 @@ def cache_features(a, dev, data):
 def get_args():
     p = argparse.ArgumentParser()
     p.add_argument("--stage", type=str, default="pose_probe",
-                   choices=["pose_probe", "cache", "dyn", "readout", "eval", "probe"])
+                   choices=["pose_probe", "cache", "dyn", "readout", "eval", "probe", "align"])
     p.add_argument("--model", type=str, default="facebook/vjepa2-vitl-fpc64-256")
     p.add_argument("--data", type=str, default="")
     p.add_argument("--cache", type=str, default="", help="chemin du memmap de features (défaut Drive)")
@@ -297,6 +344,7 @@ def main():
     if a.stage == "dyn":     stage_dyn(a, dev); return
     if a.stage == "readout": stage_readout(a, dev); return
     if a.stage == "probe":   stage_probe(a, dev); return
+    if a.stage == "align":   stage_align(a, dev); return
     if a.stage == "eval":    stage_eval(a, dev); return
     dd = np.load(data)
     X = dd["X"].reshape(-1, 96, 96, 3); BP = dd["BP"].reshape(-1, 3).astype(np.float32)
