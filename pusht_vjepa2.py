@@ -334,6 +334,8 @@ def get_args():
     p.add_argument("--plan_iters", type=int, default=3); p.add_argument("--max_steps", type=int, default=40)
     p.add_argument("--frameskip", type=int, default=5); p.add_argument("--w_ang", type=float, default=0.5)
     p.add_argument("--task_seed", type=int, default=9000)
+    p.add_argument("--probe_seeds", type=int, default=5, help="nb d'états pour --stage align")
+    p.add_argument("--probe_k", type=int, default=64, help="séquences d'actions tirées par état pour --stage align")
     return p.parse_args()
 
 def main():
