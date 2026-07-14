@@ -95,10 +95,12 @@ def run_episode_vj2(a, dev, dyn, ro, seed, policy, scratch):
     for _ in range(a.frameskip): obs, _, _, _, info = env.step(ag.copy())    # 1 transition frameskip -> contexte (f0,f1)
     f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
     best, success, mu = float(info.get("coverage", 0.0)), False, None
+    zp = zc = None
+    if policy == "mpc":                                                      # encodage initial (1 fois)
+        with torch.no_grad(): zp = enc_gpu([f0], a, dev)[0]; zc = enc_gpu([f1], a, dev)[0]
     for _ in range(a.max_steps):
         if policy == "mpc":
-            with torch.no_grad(): z0 = enc_gpu([f0], a, dev)[0]; z1 = enc_gpu([f1], a, dev)[0]
-            plan = cem_vj2(dyn, ro, z0, z1, pg, a, dev, mu)
+            plan = cem_vj2(dyn, ro, zp, zc, pg, a, dev, mu)
             delta = plan[0].cpu().numpy(); mu = torch.cat([plan[1:], torch.zeros(1, 2, device=dev)])
         elif policy == "oracle":
             state = np.array([ag[0], ag[1], *np.array(info["block_pose"], np.float32)], np.float32)
@@ -110,9 +112,11 @@ def run_episode_vj2(a, dev, dyn, ro, seed, policy, scratch):
             obs, _, term, trunc, info = env.step(act); best = max(best, float(info.get("coverage", 0.0)))
             if info.get("is_success", False) or term: done = True; break
             if trunc: break
-        f0, f1 = f1, obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
+        f1 = obs["pixels"]; ag = np.array(obs["agent_pos"], np.float32)
         if done: success = True; break
         if trunc: break
+        if policy == "mpc":                                                  # 1 SEUL encodage/pas (réutilise zc)
+            with torch.no_grad(): zp = zc; zc = enc_gpu([f1], a, dev)[0]
     env.close()
     return success, best
 
