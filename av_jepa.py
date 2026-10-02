@@ -181,6 +181,39 @@ def sample_pairs(arm, B, T, nP, nv, rng, n_masks, p_drop=0.3):
         pairs.append((cm, tg))
     return present, pairs
 
+class SupModel(nn.Module):
+    """PLAFOND SUPERVISÉ : même encodeur, entraîné bout-à-bout sur les étiquettes cachées
+    (masse, impact ; + matériau si le son est en entrée). Dit si l'info est LISIBLE dans ces entrées
+    à cette résolution — indépendamment de l'objectif JEPA."""
+    def __init__(s, dv, da, nv, T, d, nl, nh):
+        super().__init__()
+        s.nv, s.T = nv, T
+        s.enc = AVEncoder(dv, da, d, nv + T, nv, nl, nh)
+        s.h_mat, s.h_lm, s.h_imp = AttentiveProbe(d, 6), AttentiveProbe(d, 3), AttentiveProbe(d, 2)
+
+def train_sup(arm, tok, w, a, dev, nv, T):
+    torch.manual_seed(a.seed)
+    m = SupModel(tok.size(-1), 2 * NB, nv, T, a.d, a.nl, a.nh).to(dev)
+    keep = np.zeros(nv + T, bool); keep[:nv] = True
+    if arm == "sup_va": keep[nv:] = True
+    idx = torch.from_numpy(np.where(keep)[0]).to(dev)
+    lm = torch.from_numpy(w["LM"]); y = torch.stack([lm[:, 0], lm[:, 1], lm[:, 0] - lm[:, 1]], 1)
+    y = ((y - y.mean(0)) / y.std(0)).to(dev); mat = torch.from_numpy(w["MAT"]).long().to(dev)
+    imp = torch.from_numpy(w["IMP"][:, 1:]).long().to(dev)
+    fpos = imp.float().mean().clamp(0.01, 0.99); cw = torch.stack([1 / (1 - fpos), 1 / fpos])
+    opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); t0 = time.time()
+    for it in range(1, a.steps + 1):
+        bi = torch.randint(0, len(tok), (a.bs,)); o = tok[bi].to(dev).float(); ix = idx.expand(a.bs, -1)
+        Z = m.enc(_gather(o, ix), ix); bd = bi.to(dev)
+        l_lm = F.mse_loss(m.h_lm(Z), y[bd])
+        l_imp = F.cross_entropy(m.h_imp(frame_tokens(Z, keep, nv, T).flatten(0, 1)), imp[bd].flatten(), weight=cw)
+        l_mat = F.cross_entropy(m.h_mat(Z).view(-1, 3), mat[bd].view(-1)) if arm == "sup_va" else torch.zeros((), device=dev)
+        loss = l_lm + l_imp + l_mat
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        if it % max(1, a.steps // 10) == 0 or it == 1:
+            print(f"  [{arm}] step {it:5d}  masse {l_lm.item():.3f}  impact {l_imp.item():.3f}  matériau {l_mat.item():.3f}  ({time.time() - t0:.0f}s)", flush=True)
+    return m.eval()
+
 def pretrain(arm, tok, a, dev, nv, T, nP, rng):
     torch.manual_seed(a.seed)
     m = AVJEPA(tok.size(-1), 2 * NB, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
@@ -212,6 +245,12 @@ def encode(m, tok, cond, dev, bs=256):
         out.append(m.enc(_gather(o, ix), ix).half().cpu())
     return torch.cat(out), keep
 
+def frame_tokens(Z, keep, nv, T):
+    """Z:(n,k,d) latents des tokens gardés -> (n,T-1,kf,d) : tokens de la frame t (patches + audio t), t=1..T-1."""
+    kept = np.where(keep)[0]; npf = nv // T
+    frame = np.where(kept < nv, kept // npf, kept - nv)
+    return torch.stack([Z[:, torch.from_numpy(np.where(frame == t)[0]).to(Z.device)] for t in range(1, T)], 1)
+
 def fit_probe(Ttr, ytr, Tte, nout, task, dev, steps, bs=128, lr=1e-3):
     pr = AttentiveProbe(Ttr.size(-1), nout).to(dev); opt = torch.optim.AdamW(pr.parameters(), lr, weight_decay=1e-2)
     if task == "imp":                                                   # classes déséquilibrées -> poids inverses
@@ -240,9 +279,7 @@ def evaluate(m, tok, w, cond, dev, steps, ntr):
     res["lm_hit"] = (r2(p[hit, 0], y[te][hit, 0]) + r2(p[hit, 1], y[te][hit, 1])) / 2
     res["ratio_hit"] = r2(p[hit, 2], y[te][hit, 2])
     # impact par frame : tokens de la frame t (patches de t + token audio t si présent), frames 1..T-1
-    T, nv = m.T, m.nv; npf = nv // T; kept = np.where(keep)[0]
-    frame = np.where(kept < nv, kept // npf, kept - nv)
-    Zf = torch.stack([Z[:, torch.from_numpy(np.where(frame == t)[0])] for t in range(1, T)], 1)  # (n,T-1,kf,d)
+    Zf = frame_tokens(Z, keep, m.nv, m.T)                                # (n,T-1,kf,d)
     imp = torch.from_numpy(w["IMP"][:, 1:]).long()
     Ztr, Zte = Zf[tr].flatten(0, 1), Zf[te].flatten(0, 1); ytr, yte = imp[tr].flatten(), imp[te].flatten()
     p = fit_probe(Ztr, ytr, Zte, 2, "imp", dev, steps).argmax(-1)
@@ -298,6 +335,11 @@ def main():
         print("--- encodeur NON entraîné (ce que la sonde tire des entrées brutes)")
         steps = a.steps; a.steps = 0; run_evals(pretrain("va", tok, a, dev, nv, a.T, nP, rng), "init", ["v", "va", "a"]); a.steps = steps
     for arm in a.arms.split(","):
+        if arm.startswith("sup"):
+            print(f"--- PLAFOND SUPERVISÉ bras {arm.upper()} ({a.steps} pas, étiquettes du jeu d'entraînement)", flush=True)
+            m = train_sup(arm, tok, wtr, a, dev, nv, a.T)
+            run_evals(m, arm.upper(), ["v"] if arm == "sup_v" else ["va"])
+            continue
         print(f"--- pré-entraînement JEPA bras {arm.upper()} ({a.steps} pas)", flush=True)
         m = pretrain(arm, tok, a, dev, nv, a.T, nP, rng)
         run_evals(m, arm.upper(), ["v"] if arm == "v" else ["v", "va", "a"])
@@ -311,6 +353,13 @@ def main():
         print(f"\nCONTRÔLE NÉGATIF matériau en vision seule (hasard 33%) : V {v['mat']:.0%}, VA {va['mat']:.0%}")
         print(f"Q1 SON = PROFESSEUR (VA|vision vs V|vision) : ratio choc {va['ratio_hit']:+.2f} vs {v['ratio_hit']:+.2f} ; "
               f"impact {va['imp_bacc']:.0%} vs {v['imp_bacc']:.0%}")
+    if ("SUP_V", "v") in get:
+        sv = get[("SUP_V", "v")]
+        print(f"PLAFOND SUPERVISÉ vision : log-masse {sv['lm_all']:+.2f}, ratio choc {sv['ratio_hit']:+.2f}, impact {sv['imp_bacc']:.0%} "
+              f"-> si élevé : l'info EST lisible à cette résolution, c'est l'objectif JEPA qui ne la capte pas")
+    if ("SUP_VA", "va") in get:
+        s2 = get[("SUP_VA", "va")]
+        print(f"PLAFOND SUPERVISÉ vision+son : matériau {s2['mat']:.0%}, ratio choc {s2['ratio_hit']:+.2f} (= liage son<->disque possible ?)")
     if ("VA", "va") in get:
         b = get[("VA", "va")]
         print(f"Q2 SON À L'INFÉRENCE (VA|vision+son) : matériau {b['mat']:.0%}, log-masse {b['lm_all']:+.2f}, impact {b['imp_bacc']:.0%}")
