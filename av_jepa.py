@@ -148,10 +148,21 @@ class AVEncoder(nn.Module):
         return s.ln(s.tr(e + s.mod(isa.long()) + s.pos(idx)))
 
 class AVJEPA(nn.Module):
-    def __init__(s, dv, da, nv, T, d, nl, nh, pred_layers):
+    def __init__(s, dv, da, nv, T, d, nl, nh, pred_layers, sig_on="token"):
         super().__init__()
-        s.nv, s.T, s.ntok = nv, T, nv + T
+        s.nv, s.T, s.ntok, s.sig_on = nv, T, nv + T, sig_on
         s.enc = AVEncoder(dv, da, d, s.ntok, nv, nl, nh); s.pred = Predictor(d, s.ntok, pred_layers, nh)
+    def sig_input(s, z, pidx):
+        """sur quoi porte SIGReg. 'token' : chaque token (≈90 % de fond noir -> l'encodeur doit
+        inventer de la variance sur du vide) ; 'frame' : moyenne des tokens de chaque frame
+        (représentation globale, esprit LeJEPA) -> (B*T, d)."""
+        if s.sig_on == "token": return z.reshape(-1, z.size(-1))
+        # (pour "both", sig_input renvoie la version frame ; la version token est ajoutée dans loss)
+        npf = s.nv // s.T
+        fr = torch.where(pidx < s.nv, pidx // npf, pidx - s.nv)                     # (B,kp) frame de chaque token
+        oh = F.one_hot(fr, s.T).to(z.dtype)                                          # (B,kp,T)
+        zt = oh.transpose(1, 2) @ z / oh.sum(1).unsqueeze(-1).clamp_min(1)           # (B,T,d)
+        return zt.reshape(-1, z.size(-1))
     def loss(s, o, present, pairs):
         """present:(B,N) tokens du passage-cible propre ; pairs = [(ctx_mask, tgt_mask)] (B,N) bool."""
         B, N, _ = o.shape; pidx = _idx(present)
@@ -162,7 +173,10 @@ class AVJEPA(nn.Module):
         for cm, tm in pairs:
             cidx, tidx = _idx(cm), _idx(tm)
             pl = pl + F.smooth_l1_loss(s.pred(s.enc(_gather(o, cidx), cidx), cidx, tidx), _gather(zf, tidx))
-        return pl / len(pairs), sigreg(z.reshape(-1, z.size(-1)))
+        if s.sig_on == "both":                                          # token (anti-collapse spatial) + frame (global)
+            sr = (sigreg(z.reshape(-1, z.size(-1))) + sigreg(s.sig_input(z, pidx))) / 2
+        else: sr = sigreg(s.sig_input(z, pidx))
+        return pl / len(pairs), sr
 
 def sample_pairs(arm, B, T, nP, nv, rng, n_masks, p_drop=0.3):
     """masques de pré-entraînement. vision = tokens [0,nv) frame-major ; audio = [nv, nv+T)."""
@@ -243,7 +257,7 @@ def fresh_stream(a, amu, asd, steps):
 def pretrain(arm, tok, a, dev, nv, T, nP, rng, fresh=None):
     """fresh = itérateur de lots neufs (fresh_stream) ou None (rejeu du jeu fini tok)."""
     torch.manual_seed(a.seed)
-    m = AVJEPA(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
+    m = AVJEPA(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh, a.pred_layers, a.sig_on).to(dev)
     if a.steps == 0: return m.eval()
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); t0 = time.time()
     for it in range(1, a.steps + 1):
@@ -333,6 +347,7 @@ def get_args():
     p.add_argument("--r", type=float, default=0.12); p.add_argument("--occl", type=float, default=0.0)
     p.add_argument("--pitch_mass", type=int, default=1)
     p.add_argument("--stream", type=int, default=0, help="JEPA : lots NEUFS à chaque pas (flux infini, pas de rejeu)")
+    p.add_argument("--sig_on", type=str, default="token", choices=["token", "frame", "both"], help="SIGReg sur chaque token, sur la moyenne par frame, ou les deux")
     p.add_argument("--workers", type=int, default=2, help="processus de génération du flux (0 = séquentiel)")
     p.add_argument("--a_sub", type=int, default=1, help="sous-fenêtres audio par frame (synchronie fine)")
     p.add_argument("--steps", type=int, default=6000); p.add_argument("--bs", type=int, default=64)
