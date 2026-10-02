@@ -43,9 +43,9 @@ PARTIALS = [np.array([1., 2.7, 5.2]), np.array([1., 2.76, 5.40, 8.93]), np.array
 TAU = np.array([0.02, 0.45, 0.12])                                      # résonance (s) : sec / long / moyen
 SR, SPF, NB = 8000, 512, 32                                             # 64 ms d'audio par frame
 
-def band_matrix():
-    """pooling rfft(512) -> NB bandes log-espacées 100..4000 Hz (bande vide -> bin le plus proche)."""
-    fr = np.fft.rfftfreq(SPF, 1 / SR); e = np.geomspace(100, SR / 2, NB + 1)
+def band_matrix(L=SPF):
+    """pooling rfft(L) -> NB bandes log-espacées 100..4000 Hz (bande vide -> bin le plus proche)."""
+    fr = np.fft.rfftfreq(L, 1 / SR); e = np.geomspace(100, SR / 2, NB + 1)
     W = np.zeros((NB, len(fr)), np.float32)
     for b in range(NB):
         on = (fr >= e[b]) & (fr < e[b + 1])
@@ -53,13 +53,18 @@ def band_matrix():
         else: W[b, np.argmin(abs(fr - math.sqrt(e[b] * e[b + 1])))] = 1
     return W
 
-def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11):
-    rng = np.random.default_rng(seed)
+def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11, a_sub=1):
+    """a_sub : nb de sous-fenêtres audio par frame (résolution temporelle du son : l'instant d'un
+    rebond dans la frame devient audible -> synchronie son<->image). A : (n, T, a_sub*2, NB).
+    L'instant du son = instant PHYSIQUE du choc dans l'intervalle (t-1, t] (pas un tirage)."""
+    assert SPF % a_sub == 0, "a_sub doit diviser 512 (1, 2, 4...)"
+    rng = np.random.default_rng(seed); Ls = SPF // a_sub
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
-    X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, 2, NB), np.float32)
+    X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
+    POS = np.zeros((n, T, 2, 2), np.float32)
     MAT = rng.integers(0, 3, (n, 2)); LM = rng.uniform(np.log(1 / 3), np.log(3), (n, 2)).astype(np.float32)
     IMP = np.zeros((n, T), bool); HIT = np.zeros(n, bool)
-    win = np.hanning(SPF).astype(np.float32); W = band_matrix(); tt_all = np.arange(T * SPF) / SR
+    win = np.hanning(Ls).astype(np.float32); W = band_matrix(Ls); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
         cols = PAL[np.sort(rng.choice(len(PAL), 2, replace=False))]    # objet 0 = plus petit indice palette
         m = np.exp(LM[i]); P = np.zeros((2, 2), np.float32)
@@ -73,23 +78,29 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
             th = np.array([a0, a0 + math.pi]) + rng.normal(0, 0.35, 2)
         else: th = rng.uniform(0, 2 * math.pi, 2)
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
-        ev = []                                                         # (t, objet, impulsion, x du choc)
+        ev = []                                                         # (t+fraction, objet, impulsion, x du choc)
         for t in range(T):
             if t > 0:
-                P = P + V
+                P0, V0 = P.copy(), V.copy(); P = P + V
                 for k in range(2):
                     for dd in range(2):
                         if P[k, dd] < r or P[k, dd] > 1 - r:
+                            wall = r if P[k, dd] < r else 1 - r
+                            fr_ = float(np.clip((wall - P0[k, dd]) / (V[k, dd] + 1e-9), 0, 0.999))
                             J = 2 * m[k] * abs(V[k, dd]); V[k, dd] = -V[k, dd]
                             P[k, dd] = 2 * r - P[k, dd] if P[k, dd] < r else 2 * (1 - r) - P[k, dd]
-                            ev.append((t, k, J, P[k, 0]))
+                            ev.append((t - 1 + fr_, k, J, P[k, 0]))
                 dv = P[0] - P[1]; dist = float(np.linalg.norm(dv))
                 if 1e-6 < dist < 2 * r:
                     nv = dv / dist; s_ = float((V[0] - V[1]) @ nv)
                     if s_ < 0:
                         J = -2 * s_ * m[0] * m[1] / (m[0] + m[1])
                         V[0] += J / m[0] * nv; V[1] -= J / m[1] * nv; HIT[i] = True
-                        xc = float((P[0, 0] + P[1, 0]) / 2); ev += [(t, 0, J, xc), (t, 1, J, xc)]
+                        d0, dw = P0[0] - P0[1], V0[0] - V0[1]                     # instant du contact :
+                        qa, qb, qc = dw @ dw, 2 * d0 @ dw, d0 @ d0 - 4 * r * r     # |d0 + f·dw| = 2r
+                        disc = qb * qb - 4 * qa * qc
+                        fr_ = float(np.clip((-qb - math.sqrt(disc)) / (2 * qa), 0, 0.999)) if disc > 0 and qa > 1e-12 else 0.999
+                        xc = float((P[0, 0] + P[1, 0]) / 2); ev += [(t - 1 + fr_, 0, J, xc), (t - 1 + fr_, 1, J, xc)]
                     push = (2 * r - dist) / 2
                     P[0] = np.clip(P[0] + push * nv, r, 1 - r); P[1] = np.clip(P[1] - push * nv, r, 1 - r)
             img = np.zeros((H, H, 3), np.float32)
@@ -97,11 +108,11 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
                 al = np.clip((r - np.sqrt((xx - P[k, 0]) ** 2 + (yy - P[k, 1]) ** 2)) * H + 0.5, 0, 1)[..., None]
                 img = img * (1 - al) + cols[k] * al
             if occl > 0: img[:, (xx[0] > 0.5 - occl / 2) & (xx[0] < 0.5 + occl / 2)] = 0.5
-            X[i, t] = img
+            X[i, t] = img; POS[i, t] = P
         sig = rng.normal(0, 0.005, (2, T * SPF)).astype(np.float32)    # bruit de fond
-        for (t, k, J, xc) in ev:
-            IMP[i, t] = True
-            on = t * SPF + int(rng.integers(0, SPF // 2)); tt = tt_all[:T * SPF - on]
+        for (te, k, J, xc) in ev:
+            IMP[i, int(te) + 1] = True                                  # choc dans (t-1, t] -> frame t
+            on = int(round(te * SPF)) + SPF; tt = tt_all[:T * SPF - on]    # fenêtre audio t = intervalle (t-1, t]
             f0 = F_MAT[MAT[i, k]] * (m[k] ** (-1 / 3) if pitch_mass else 1.0); amp = min(J / 0.15, 4.0)
             s = np.zeros_like(tt)
             for j, rr in enumerate(PARTIALS[MAT[i, k]]):
@@ -109,9 +120,9 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
                     s += np.exp(-tt / (TAU[MAT[i, k]] / (1 + j))) * np.sin(2 * math.pi * f0 * rr * tt + rng.uniform(0, 6.28)) / (1 + j)
             xc = float(np.clip(xc, 0, 1))
             sig[0, on:] += amp * math.sqrt(1 - xc) * s; sig[1, on:] += amp * math.sqrt(xc) * s
-        fr = sig.reshape(2, T, SPF) * win
-        A[i] = np.log1p(np.einsum("bf,ctf->tcb", W, np.abs(np.fft.rfft(fr, axis=-1)) ** 2))
-    return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, HIT=HIT)
+        fr = sig.reshape(2, T, a_sub, Ls) * win
+        A[i] = np.log1p(np.einsum("bf,ctsf->tscb", W, np.abs(np.fft.rfft(fr, axis=-1)) ** 2)).reshape(T, a_sub * 2, NB)
+    return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, HIT=HIT, POS=POS)
 
 # ---------------------------------------------------------------- tokens : vision (patches) + audio (1/frame)
 def make_tokens(w, P, amu=None, asd=None):
@@ -193,7 +204,7 @@ class SupModel(nn.Module):
 
 def train_sup(arm, tok, w, a, dev, nv, T):
     torch.manual_seed(a.seed)
-    m = SupModel(tok.size(-1), 2 * NB, nv, T, a.d, a.nl, a.nh).to(dev)
+    m = SupModel(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh).to(dev)
     keep = np.zeros(nv + T, bool); keep[:nv] = True
     if arm == "sup_va": keep[nv:] = True
     idx = torch.from_numpy(np.where(keep)[0]).to(dev)
@@ -214,14 +225,16 @@ def train_sup(arm, tok, w, a, dev, nv, T):
             print(f"  [{arm}] step {it:5d}  masse {l_lm.item():.3f}  impact {l_imp.item():.3f}  matériau {l_mat.item():.3f}  ({time.time() - t0:.0f}s)", flush=True)
     return m.eval()
 
-def pretrain(arm, tok, a, dev, nv, T, nP, rng):
+def pretrain(arm, tok, a, dev, nv, T, nP, rng, fresh=None):
+    """fresh(seed) -> tokens d'un lot NEUF : flux d'expérience (jamais deux fois la même séquence,
+    comme un enfant) au lieu de rejouer un jeu fini -> pas de mémorisation."""
     torch.manual_seed(a.seed)
-    m = AVJEPA(tok.size(-1), 2 * NB, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
+    m = AVJEPA(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
     if a.steps == 0: return m.eval()
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); t0 = time.time()
     for it in range(1, a.steps + 1):
-        bi = torch.randint(0, len(tok), (a.bs,))
-        o = tok[bi].to(dev).float()
+        if fresh is not None: o = fresh(100_000 + it).to(dev).float()
+        else: o = tok[torch.randint(0, len(tok), (a.bs,))].to(dev).float()
         present, pairs = sample_pairs(arm, a.bs, T, nP, nv, rng, a.n_masks)
         tt = lambda x: torch.from_numpy(x).to(dev)
         pl, sr = m.loss(o, tt(np.broadcast_to(present, (a.bs, len(present))).copy()), [(tt(c), tt(g)) for c, g in pairs])
@@ -305,6 +318,8 @@ def get_args():
     p.add_argument("--T", type=int, default=8); p.add_argument("--H", type=int, default=32); p.add_argument("--P", type=int, default=8)
     p.add_argument("--r", type=float, default=0.12); p.add_argument("--occl", type=float, default=0.0)
     p.add_argument("--pitch_mass", type=int, default=1)
+    p.add_argument("--stream", type=int, default=0, help="JEPA : lots NEUFS à chaque pas (flux infini, pas de rejeu)")
+    p.add_argument("--a_sub", type=int, default=1, help="sous-fenêtres audio par frame (synchronie fine)")
     p.add_argument("--steps", type=int, default=6000); p.add_argument("--bs", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--rw", type=float, default=1.0)
     p.add_argument("--n_masks", type=int, default=3)
@@ -318,12 +333,14 @@ def get_args():
 def main():
     a = get_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; rng = np.random.default_rng(a.seed)
     t0 = time.time()
-    wtr = gen_world(a.n, a.T, a.H, a.r, a.seed, a.pitch_mass, a.occl)
-    wpr = gen_world(a.n_probe, a.T, a.H, a.r, a.seed + 1000, a.pitch_mass, a.occl)
+    wtr = gen_world(a.n, a.T, a.H, a.r, a.seed, a.pitch_mass, a.occl, a_sub=a.a_sub)
+    wpr = gen_world(a.n_probe, a.T, a.H, a.r, a.seed + 1000, a.pitch_mass, a.occl, a_sub=a.a_sub)
     print(f"monde : {a.n}+{a.n_probe} séquences en {time.time() - t0:.0f}s | choc disque-disque {wtr['HIT'].mean():.0%} "
           f"| frames avec impact {wtr['IMP'][:, 1:].mean():.0%} | occl {a.occl}", flush=True)
     if a.fig: fig_world(wpr, a.fig)
     tok, amu, asd = make_tokens(wtr, a.P); tokp, _, _ = make_tokens(wpr, a.P, amu, asd)
+    fresh = lambda sd: make_tokens(gen_world(a.bs, a.T, a.H, a.r, sd, a.pitch_mass, a.occl, a_sub=a.a_sub), a.P, amu, asd)[0]
+    a.da = wtr["A"].shape[2] * NB; assert a.da <= tok.size(-1), "audio plus large que le patch vision : baisser --a_sub"
     nP = a.H // a.P; nv = a.T * nP * nP; ntr = int(0.75 * a.n_probe)
     rows = []
     def run_evals(m, name, conds):
@@ -341,7 +358,7 @@ def main():
             run_evals(m, arm.upper(), ["v"] if arm == "sup_v" else ["va"])
             continue
         print(f"--- pré-entraînement JEPA bras {arm.upper()} ({a.steps} pas)", flush=True)
-        m = pretrain(arm, tok, a, dev, nv, a.T, nP, rng)
+        m = pretrain(arm, tok, a, dev, nv, a.T, nP, rng, fresh if a.stream else None)
         run_evals(m, arm.upper(), ["v"] if arm == "v" else ["v", "va", "a"])
     print("\n================ RÉSUMÉ (sondes sur encodeur gelé, jeu tenu à l'écart) ================")
     print(f"{'modèle':>7s} {'entrée':>6s} | {'matériau':>8s} | {'lmasse':>6s} | {'lm choc':>7s} | {'ratio choc':>10s} | {'impact':>6s}")
