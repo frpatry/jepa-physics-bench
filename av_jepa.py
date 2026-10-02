@@ -225,15 +225,29 @@ def train_sup(arm, tok, w, a, dev, nv, T):
             print(f"  [{arm}] step {it:5d}  masse {l_lm.item():.3f}  impact {l_imp.item():.3f}  matériau {l_mat.item():.3f}  ({time.time() - t0:.0f}s)", flush=True)
     return m.eval()
 
+def _fresh_batch(job):
+    """worker : (graine, kwargs monde, P, amu, asd) -> tokens fp16 d'un lot neuf."""
+    sd, kw, P, amu, asd = job
+    return make_tokens(gen_world(seed=sd, **kw), P, amu, asd)[0]
+
+def fresh_stream(a, amu, asd, steps):
+    """flux d'expérience : un lot NEUF par pas (jamais deux fois la même séquence, comme un enfant),
+    généré en PARALLÈLE sur les CPU pendant que le GPU apprend (la génération était le goulot)."""
+    import multiprocessing as mp
+    kw = dict(n=a.bs, T=a.T, H=a.H, r=a.r, pitch_mass=a.pitch_mass, occl=a.occl, a_sub=a.a_sub)
+    jobs = ((100_000 + it, kw, a.P, amu, asd) for it in range(1, steps + 1))
+    if a.workers <= 0: yield from map(_fresh_batch, jobs); return
+    with mp.get_context("fork").Pool(a.workers) as pool:
+        yield from pool.imap(_fresh_batch, jobs, chunksize=2)
+
 def pretrain(arm, tok, a, dev, nv, T, nP, rng, fresh=None):
-    """fresh(seed) -> tokens d'un lot NEUF : flux d'expérience (jamais deux fois la même séquence,
-    comme un enfant) au lieu de rejouer un jeu fini -> pas de mémorisation."""
+    """fresh = itérateur de lots neufs (fresh_stream) ou None (rejeu du jeu fini tok)."""
     torch.manual_seed(a.seed)
     m = AVJEPA(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
     if a.steps == 0: return m.eval()
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); t0 = time.time()
     for it in range(1, a.steps + 1):
-        if fresh is not None: o = fresh(100_000 + it).to(dev).float()
+        if fresh is not None: o = next(fresh).to(dev).float()
         else: o = tok[torch.randint(0, len(tok), (a.bs,))].to(dev).float()
         present, pairs = sample_pairs(arm, a.bs, T, nP, nv, rng, a.n_masks)
         tt = lambda x: torch.from_numpy(x).to(dev)
@@ -319,6 +333,7 @@ def get_args():
     p.add_argument("--r", type=float, default=0.12); p.add_argument("--occl", type=float, default=0.0)
     p.add_argument("--pitch_mass", type=int, default=1)
     p.add_argument("--stream", type=int, default=0, help="JEPA : lots NEUFS à chaque pas (flux infini, pas de rejeu)")
+    p.add_argument("--workers", type=int, default=2, help="processus de génération du flux (0 = séquentiel)")
     p.add_argument("--a_sub", type=int, default=1, help="sous-fenêtres audio par frame (synchronie fine)")
     p.add_argument("--steps", type=int, default=6000); p.add_argument("--bs", type=int, default=64)
     p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--rw", type=float, default=1.0)
@@ -339,7 +354,6 @@ def main():
           f"| frames avec impact {wtr['IMP'][:, 1:].mean():.0%} | occl {a.occl}", flush=True)
     if a.fig: fig_world(wpr, a.fig)
     tok, amu, asd = make_tokens(wtr, a.P); tokp, _, _ = make_tokens(wpr, a.P, amu, asd)
-    fresh = lambda sd: make_tokens(gen_world(a.bs, a.T, a.H, a.r, sd, a.pitch_mass, a.occl, a_sub=a.a_sub), a.P, amu, asd)[0]
     a.da = wtr["A"].shape[2] * NB; assert a.da <= tok.size(-1), "audio plus large que le patch vision : baisser --a_sub"
     nP = a.H // a.P; nv = a.T * nP * nP; ntr = int(0.75 * a.n_probe)
     rows = []
@@ -358,7 +372,7 @@ def main():
             run_evals(m, arm.upper(), ["v"] if arm == "sup_v" else ["va"])
             continue
         print(f"--- pré-entraînement JEPA bras {arm.upper()} ({a.steps} pas)", flush=True)
-        m = pretrain(arm, tok, a, dev, nv, a.T, nP, rng, fresh if a.stream else None)
+        m = pretrain(arm, tok, a, dev, nv, a.T, nP, rng, fresh_stream(a, amu, asd, a.steps) if a.stream else None)
         run_evals(m, arm.upper(), ["v"] if arm == "v" else ["v", "va", "a"])
     print("\n================ RÉSUMÉ (sondes sur encodeur gelé, jeu tenu à l'écart) ================")
     print(f"{'modèle':>7s} {'entrée':>6s} | {'matériau':>8s} | {'lmasse':>6s} | {'lm choc':>7s} | {'ratio choc':>10s} | {'impact':>6s}")
