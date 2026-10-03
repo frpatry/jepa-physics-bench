@@ -16,7 +16,7 @@ Si le JEPA a appris le liage seul, son lecteur doit gagner surtout à PEU d'éti
 import argparse, time
 import numpy as np, torch, torch.nn.functional as F
 from av_jepa import gen_world, NB
-from av_fusion import build_tokens, feats, pretrain_frozen, FrozenTargetJEPA
+from av_fusion import build_tokens, feats, pretrain_frozen, pretrain_ema, FrozenTargetJEPA
 from av_bind_check import Reader, r2
 
 @torch.no_grad()
@@ -55,7 +55,8 @@ def main():
     p.add_argument("--d", type=int, default=256); p.add_argument("--nl", type=int, default=4)
     p.add_argument("--nh", type=int, default=8); p.add_argument("--pred_layers", type=int, default=2)
     p.add_argument("--read_steps", type=int, default=3000); p.add_argument("--budgets", type=str, default="300,1000,6000")
-    p.add_argument("--reps", type=str, default="raw,init,jepa"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--reps", type=str, default="raw,init,jepa", help="raw,init,jepa (cibles gelées),ema (recette classique)")
+    p.add_argument("--ema", type=float, default=0.996, help="momentum initial de l'encodeur cible (-> 1.0)"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     rng = np.random.default_rng(a.seed)
     Ztr = feats(a.train_cache, a.n_train, 0, a, dev); Zpr = feats(a.probe_cache, a.n_probe, 1000, a, dev)
@@ -76,6 +77,10 @@ def main():
         print(f"--- JEPA de fusion à cibles gelées ({a.steps} pas, AUCUNE étiquette)", flush=True)
         m = pretrain_frozen("va", tok, a, dev, nv, Tt, nP, rng)
         R["jepa"] = (represent(m, tok, dev), represent(m, tokp, dev), a.d); del m
+    if "ema" in a.reps:
+        print(f"--- JEPA RECETTE CLASSIQUE : encodeur cible EMA ({a.steps} pas, AUCUNE étiquette)", flush=True)
+        m = pretrain_ema("va", tok, a, dev, nv, Tt, nP, rng)
+        R["ema"] = (represent(m, tok, dev), represent(m, tokp, dev), a.d); del m
     res = {}
     for L in [int(x) for x in a.budgets.split(",")]:
         for name, (Rtr, Rte, da) in R.items():

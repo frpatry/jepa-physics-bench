@@ -75,6 +75,46 @@ def pretrain_frozen(arm, tok, a, dev, nv, T, nP, rng):
             print(f"  [{arm} cibles gelées] step {it:5d}  pred {loss.item():.4f}  ({_t.time() - t0:.0f}s)", flush=True)
     return m.eval()
 
+class EMAWrap(torch.nn.Module):
+    """porte l'encodeur CIBLE (copie lente) pour l'évaluation : .enc = cible EMA (protocole I-JEPA)."""
+    def __init__(s, enc, nv, T):
+        super().__init__(); s.enc, s.nv, s.T = enc, nv, T
+
+def pretrain_ema(arm, tok, a, dev, nv, T, nP, rng):
+    """RECETTE CLASSIQUE META (I-JEPA / V-JEPA / V-JEPA 2) : encodeur de CONTEXTE (appris) + encodeur
+    CIBLE = moyenne mobile exponentielle du contexte (sans gradient) ; cible = LayerNorm(cible(clip complet))
+    aux positions masquées ; perte L1 ; AUCUN SIGReg (l'anti-collapse vient de l'EMA + prédicteur)."""
+    import copy, math, time as _t
+    from av_jepa import AVJEPA
+    torch.manual_seed(a.seed)
+    m = AVJEPA(tok.size(-1), a.da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
+    tgt = copy.deepcopy(m.enc).eval()
+    for p_ in tgt.parameters(): p_.requires_grad_(False)
+    opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); t0 = _t.time()
+    warm = max(1, a.steps // 15)
+    for it in range(1, a.steps + 1):
+        for g in opt.param_groups: g["lr"] = a.lr * min(1.0, it / warm)                  # warmup
+        o = tok[torch.randint(0, len(tok), (a.bs,))].to(dev).float()
+        present, pairs = sample_pairs(arm, a.bs, T, nP, nv, rng, a.n_masks)
+        B, N, _ = o.shape; pres = torch.from_numpy(np.broadcast_to(present, (B, N)).copy()).to(dev)
+        pidx = _idx(pres)
+        with torch.no_grad():
+            z = F.layer_norm(tgt(_gather(o, pidx), pidx), (a.d,))
+            zf = torch.zeros(B, N, a.d, device=dev).scatter(1, pidx.unsqueeze(-1).expand(-1, -1, a.d), z)
+        loss = 0.0
+        for c_, g_ in pairs:
+            cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
+            loss = loss + F.l1_loss(m.pred(m.enc(_gather(o, cidx), cidx), cidx, tidx), _gather(zf, tidx))
+        loss = loss / len(pairs)
+        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.steps) + 1) / 2                 # 0.996 -> 1.0
+        with torch.no_grad():
+            for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
+        if it % max(1, a.steps // 10) == 0 or it == 1:
+            with torch.no_grad(): sd = z.std(0).mean().item()                                # surveille le collapse
+            print(f"  [{arm} EMA] step {it:5d}  pred {loss.item():.4f}  std cible {sd:.3f}  mom {mom:.4f}  ({_t.time() - t0:.0f}s)", flush=True)
+    return EMAWrap(tgt, nv, T).eval()
+
 def per_step_labels(w, Tt):
     """impact par pas temporel V-JEPA 2 (= frames 2t, 2t+1)."""
     w = dict(w); w["IMP"] = w["IMP"][:, 0::2] | w["IMP"][:, 1::2]; return w
