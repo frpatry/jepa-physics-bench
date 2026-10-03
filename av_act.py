@@ -111,15 +111,16 @@ def step_inputs(w, Tt):
 
 class ACPredictor(nn.Module):
     """bloc-causal : les tokens du pas s voient les pas ≤ s ; ils prédisent le pas s+1."""
-    def __init__(s, k, Tt, dv, da, dt, dact, d, nl, nh, mods):
+    def __init__(s, k, Tt, dv, da, dt, dact, d, nl, nh, mods, residual=True):
         super().__init__()
-        s.k, s.Tt, s.mods = k, Tt, mods
+        s.k, s.Tt, s.mods, s.residual = k, Tt, mods, residual
         s.ev, s.ea, s.et, s.eact = nn.Linear(dv, d), nn.Linear(da, d), nn.Linear(dt, d), nn.Linear(dact, d)
         s.m = k + ("a" in mods) + ("t" in mods) + 1
         s.pos = nn.Parameter(torch.zeros(1, Tt, s.m, d)); nn.init.normal_(s.pos, std=0.02)
         layer = nn.TransformerEncoderLayer(d, nh, 2 * d, batch_first=True, dropout=0.0, activation="gelu")
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
         s.hv, s.ha, s.ht = nn.Linear(d, dv), nn.Linear(d, da), nn.Linear(d, dt)
+        if residual: nn.init.zeros_(s.hv.weight); nn.init.zeros_(s.hv.bias)   # part de la COPIE, n'apprend que le changement
         step = torch.arange(Tt).repeat_interleave(s.m)
         s.register_buffer("mask", step[None, :] > step[:, None])           # True = interdit (futur)
     def forward(s, V, A, Tch, Act):
@@ -129,7 +130,7 @@ class ACPredictor(nn.Module):
         parts.append(s.eact(Act).unsqueeze(2))
         x = (torch.cat(parts, 2) + s.pos).reshape(B, s.Tt * s.m, -1)
         h = s.ln(s.tr(x, mask=s.mask)).reshape(B, s.Tt, s.m, -1)
-        out = {"v": s.hv(h[:, :, :s.k])}; j = s.k
+        dV = s.hv(h[:, :, :s.k]); out = {"v": V + dV if s.residual else dV}; j = s.k   # résiduel : ẑ(s+1) = z(s) + Δ
         if "a" in s.mods: out["a"] = s.ha(h[:, :, j]); j += 1
         if "t" in s.mods: out["t"] = s.ht(h[:, :, j])
         return out, h
@@ -168,6 +169,7 @@ def main():
     p.add_argument("--variants", type=str, default="v,va,vat"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--fig", type=str, default="av_act_world.png")
     p.add_argument("--targets", type=str, default="v", choices=["v", "own"])
+    p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub)
@@ -242,7 +244,7 @@ def main():
     rows = [("copie", copy_err)]
     for mods in a.variants.split(","):
         torch.manual_seed(a.seed)
-        m = ACPredictor(k, Tt, dv, Atr.size(-1), Ttr.size(-1), Ctr.size(-1), a.d, a.nl, a.nh, mods).to(dev)
+        m = ACPredictor(k, Tt, dv, Atr.size(-1), Ttr.size(-1), Ctr.size(-1), a.d, a.nl, a.nh, mods, bool(a.residual)).to(dev)
         opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); tt0 = time.time()
         for it in range(1, a.steps + 1):
             bi = torch.randint(0, len(Vtr), (a.bs,))
