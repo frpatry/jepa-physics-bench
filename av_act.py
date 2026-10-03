@@ -134,11 +134,25 @@ class ACPredictor(nn.Module):
         if "t" in s.mods: out["t"] = s.ht(h[:, :, j])
         return out, h
 
-def loss_fn(out, V, A, Tch):
+def loss_fn(out, V, A, Tch, targets="v"):
+    """targets 'v' : toutes les variantes prédisent la MÊME cible (latents visuels) -> comparaison
+    équitable (son/toucher = entrées seulement) ; 'own' : chaque variante prédit aussi ses modalités."""
     l = F.smooth_l1_loss(out["v"][:, :-1], V[:, 1:])
-    if "a" in out: l = l + F.smooth_l1_loss(out["a"][:, :-1], A[:, 1:])
-    if "t" in out: l = l + F.smooth_l1_loss(out["t"][:, :-1], Tch[:, 1:])
+    if targets == "own":
+        if "a" in out: l = l + F.smooth_l1_loss(out["a"][:, :-1], A[:, 1:])
+        if "t" in out: l = l + F.smooth_l1_loss(out["t"][:, :-1], Tch[:, 1:])
     return l
+
+class PosReadout(nn.Module):
+    """lecteur GELÉ latents V-JEPA 2 d'un pas -> positions (2 disques + main). Entraîné sur les VRAIS
+    latents, puis appliqué aux latents PRÉDITS : erreur en pixels = espace décodé « certifié »."""
+    def __init__(s, dv, d=256):
+        super().__init__()
+        s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 16, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        s.att = nn.MultiheadAttention(d, 4, batch_first=True); s.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 256), nn.GELU(), nn.Linear(256, 6))
+    def forward(s, v):                                                  # v (B, k, dv)
+        h = s.proj(v) + s.pos[:, :v.size(1)]
+        return s.out(s.att(s.q.expand(len(v), -1, -1), h, h)[0][:, 0])
 
 def main():
     p = argparse.ArgumentParser()
@@ -153,6 +167,8 @@ def main():
     p.add_argument("--nl", type=int, default=4); p.add_argument("--nh", type=int, default=8)
     p.add_argument("--variants", type=str, default="v,va,vat"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--fig", type=str, default="av_act_world.png")
+    p.add_argument("--targets", type=str, default="v", choices=["v", "own"])
+    p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub)
     wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub)
@@ -194,6 +210,35 @@ def main():
     copy_err = (Vte[:, :-1].float() - Vte[:, 1:].float()).abs().mean((2, 3)).numpy()      # (n, Tt-1)
     print(f"tokens : {Tt} pas × ({k} visuels + son + toucher + action) | pas avec poussée {push.mean():.0%} "
           f"(1re fois {first.mean():.0%}, disque déjà touché {retouch.mean():.0%})", flush=True)
+    # --- lecteur de positions (vrais latents) -> métrique décodée en pixels
+    def pos_target(w):                                                  # état en fin de pas s (frame 2s+1)
+        P = w["POS"][:, 1::2].reshape(len(w["POS"]), Tt, 4); Hh = w["HAND"][:, 1::2]
+        return torch.from_numpy(np.concatenate([P, Hh], -1))           # (n, Tt, 6)
+    Ptr, Pte = pos_target(wtr), pos_target(wte); torch.manual_seed(0)
+    ro = PosReadout(dv).to(dev); opt = torch.optim.AdamW(ro.parameters(), 1e-3, weight_decay=1e-2)
+    for it in range(a.ro_steps):
+        bi = torch.randint(0, len(Vtr), (128,)); sj = torch.randint(0, Tt, (128,))
+        loss = F.mse_loss(ro(Vtr[bi, sj].to(dev).float()), Ptr[bi, sj].to(dev)); opt.zero_grad(); loss.backward(); opt.step()
+    ro.eval()
+    def readout(Vs):                                                   # (n, S, k, dv) -> (n, S, 6)
+        with torch.no_grad():
+            return torch.cat([ro(Vs[i:i + 512].flatten(0, 1).to(dev).float()).cpu().view(-1, Vs.size(1), 6)
+                              for i in range(0, len(Vs), 512)])
+    true_next = Pte[:, 1:]                                             # (n, Tt-1, 6)
+    def disk_err(pred):                                                # erreur px des disques POUSSÉS au pas s+1
+        e = (pred[..., :4] - true_next[..., :4]).view(n_te, Tt - 1, 2, 2).norm(dim=-1) * 32   # (n, Tt-1, 2)
+        pushed = np.zeros((n_te, Tt - 1, 2), bool)
+        for i in range(n_te):
+            for s_ in range(Tt - 1):
+                for x in who[i, 2 * s_ + 2:2 * s_ + 4]:
+                    if x >= 0: pushed[i, s_, x] = True
+        return e.numpy(), pushed
+    ceil = readout(Vte[:, 1:]); e_ceil, pushed = disk_err(ceil)
+    e_copy, _ = disk_err(readout(Vte[:, :-1]))
+    def px(e, msk): return float(e[msk].mean())
+    pf = pushed & first[..., None]; pr = pushed & retouch[..., None]
+    print(f"lecteur de positions (vrais latents) : disques poussés {px(e_ceil, pushed):.2f} px (plafond) ; copie {px(e_copy, pushed):.2f} px", flush=True)
+    dec = [("lecture vrai futur", e_ceil), ("copie", e_copy)]
     rows = [("copie", copy_err)]
     for mods in a.variants.split(","):
         torch.manual_seed(a.seed)
@@ -202,16 +247,17 @@ def main():
         for it in range(1, a.steps + 1):
             bi = torch.randint(0, len(Vtr), (a.bs,))
             V, A_, T_, C_ = Vtr[bi].to(dev).float(), Atr[bi].to(dev), Ttr[bi].to(dev), Ctr[bi].to(dev)
-            out, _ = m(V, A_, T_, C_); loss = loss_fn(out, V, A_, T_)
+            out, _ = m(V, A_, T_, C_); loss = loss_fn(out, V, A_, T_, a.targets)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
-        m.eval(); errs = []
+        m.eval(); errs = []; preds = []
         with torch.no_grad():
             for i in range(0, n_te, 256):
                 sl = slice(i, i + 256); V = Vte[sl].to(dev).float()
                 out, _ = m(V, Ate[sl].to(dev), Tte_[sl].to(dev), Cte[sl].to(dev))
-                errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu())
+                errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu()); preds.append(out["v"][:, :-1].half().cpu())
         rows.append((mods.upper(), torch.cat(errs).numpy()))
+        e_dec, _ = disk_err(readout(torch.cat(preds))); dec.append((mods.upper(), e_dec)); del preds
         e = rows[-1][1]
         print(f"  {mods.upper():>4s} | erreur latents pas suivant : tous {e.mean():.4f} | poussée {e[push].mean():.4f} "
               f"| 1re poussée {e[first].mean():.4f} | disque déjà touché {e[retouch].mean():.4f}", flush=True)
@@ -219,6 +265,10 @@ def main():
     print(f"{'modèle':>6s} | {'tous':>7s} | {'poussée':>7s} | {'1re pouss.':>10s} | {'déjà touché':>11s}")
     for name, e in rows:
         print(f"{name:>6s} | {e.mean():7.4f} | {e[push].mean():7.4f} | {e[first].mean():10.4f} | {e[retouch].mean():11.4f}")
+    print("\n===== POSITION PRÉDITE DES DISQUES POUSSÉS (px, lecteur gelé sur latents prédits ; plus bas = mieux) =====")
+    print(f"{'modèle':>18s} | {'poussés':>7s} | {'1re poussée':>11s} | {'déjà touché':>11s}")
+    for name, e in dec:
+        print(f"{name:>18s} | {px(e, pushed):7.2f} | {px(e, pf):11.2f} | {px(e, pr):11.2f}")
     g = {n_: e for n_, e in rows}
     if "VAT" in g and "VA" in g:
         print(f"\nTOUCHER (VAT vs VA) sur disque déjà touché : {g['VA'][retouch].mean():.4f} -> {g['VAT'][retouch].mean():.4f} "
