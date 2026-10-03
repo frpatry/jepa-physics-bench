@@ -169,6 +169,8 @@ def main():
     p.add_argument("--variants", type=str, default="v,va,vat"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--fig", type=str, default="av_act_world.png")
     p.add_argument("--targets", type=str, default="v", choices=["v", "own"])
+    p.add_argument("--ctx", type=int, default=3, help="dernier pas de contexte observé avant le rollout")
+    p.add_argument("--sens_drop", type=float, default=0.5, help="p de couper son/toucher sur un suffixe (entraînement)")
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -238,6 +240,30 @@ def main():
     ceil = readout(Vte[:, 1:]); e_ceil, pushed = disk_err(ceil)
     e_copy, _ = disk_err(readout(Vte[:, :-1]))
     def px(e, msk): return float(e[msk].mean())
+    # --- ROLLOUT : contexte = pas 0..c (on a vu/entendu/senti), puis H pas IMAGINÉS avec les actions prévues ;
+    #     son et toucher du futur inconnus (zéro) ; les latents prédits sont réinjectés comme vision.
+    c, H = a.ctx, Tt - 1 - a.ctx
+    def rollout(m):
+        out_all = []
+        with torch.no_grad():
+            for i in range(0, n_te, 256):
+                sl = slice(i, i + 256); V = Vte[sl].to(dev).float().clone()
+                A_, T_ = Ate[sl].to(dev).clone(), Tte_[sl].to(dev).clone(); A_[:, c + 1:] = 0; T_[:, c + 1:] = 0
+                for h in range(1, H + 1):
+                    o, _ = m(V, A_, T_, Cte[sl].to(dev)); V[:, c + h] = o["v"][:, c + h - 1]
+                out_all.append(V[:, c + 1:].half().cpu())
+        return readout(torch.cat(out_all))                              # (n, H, 6)
+    tr_fut = Pte[:, c + 1:]                                             # vraies positions futures (n, H, 6)
+    def roll_err(pred):                                                 # (n, H, 2) px par disque
+        return ((pred[..., :4] - tr_fut[..., :4]).view(n_te, H, 2, 2).norm(dim=-1) * 32).numpy()
+    lm_te = wte["LM"]; touched = np.zeros((n_te, 2), bool); pushed_fut = np.zeros((n_te, 2), bool)
+    for i in range(n_te):
+        for x in who[i, :2 * c + 2]:
+            if x >= 0: touched[i, x] = True                             # senti PENDANT le contexte
+        for x in who[i, 2 * c + 2:]:
+            if x >= 0: pushed_fut[i, x] = True                          # poussé pendant le futur imaginé
+    extreme = np.abs(lm_te) > 0.7                                       # masse < 0.5 ou > 2
+    rollouts = {"copie": readout(Vte[:, c:c + 1].expand(-1, H, -1, -1).contiguous()), "vrai futur": readout(Vte[:, c + 1:])}
     pf = pushed & first[..., None]; pr = pushed & retouch[..., None]
     print(f"lecteur de positions (vrais latents) : disques poussés {px(e_ceil, pushed):.2f} px (plafond) ; copie {px(e_copy, pushed):.2f} px", flush=True)
     dec = [("lecture vrai futur", e_ceil), ("copie", e_copy)]
@@ -249,7 +275,12 @@ def main():
         for it in range(1, a.steps + 1):
             bi = torch.randint(0, len(Vtr), (a.bs,))
             V, A_, T_, C_ = Vtr[bi].to(dev).float(), Atr[bi].to(dev), Ttr[bi].to(dev), Ctr[bi].to(dev)
-            out, _ = m(V, A_, T_, C_); loss = loss_fn(out, V, A_, T_, a.targets)
+            if a.sens_drop > 0:                                         # suffixe sans son/toucher (= futur imaginé)
+                cut = torch.randint(1, Tt + 1, (a.bs, 1), device=dev)
+                keep = (torch.arange(Tt, device=dev)[None] < cut) | (torch.rand(a.bs, 1, device=dev) > a.sens_drop)
+                A_in, T_in = A_ * keep[..., None], T_ * keep[..., None]
+            else: A_in, T_in = A_, T_
+            out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
         m.eval(); errs = []; preds = []
@@ -260,6 +291,7 @@ def main():
                 errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu()); preds.append(out["v"][:, :-1].half().cpu())
         rows.append((mods.upper(), torch.cat(errs).numpy()))
         e_dec, _ = disk_err(readout(torch.cat(preds))); dec.append((mods.upper(), e_dec)); del preds
+        rollouts[mods.upper()] = rollout(m)
         e = rows[-1][1]
         print(f"  {mods.upper():>4s} | erreur latents pas suivant : tous {e.mean():.4f} | poussée {e[push].mean():.4f} "
               f"| 1re poussée {e[first].mean():.4f} | disque déjà touché {e[retouch].mean():.4f}", flush=True)
@@ -267,6 +299,15 @@ def main():
     print(f"{'modèle':>6s} | {'tous':>7s} | {'poussée':>7s} | {'1re pouss.':>10s} | {'déjà touché':>11s}")
     for name, e in rows:
         print(f"{name:>6s} | {e.mean():7.4f} | {e[push].mean():7.4f} | {e[first].mean():10.4f} | {e[retouch].mean():11.4f}")
+    print(f"\n===== ROLLOUT {H} PAS IMAGINÉS après {c + 1} pas de contexte (px disques POUSSÉS dans le futur, horizon final) =====")
+    groups = [("tous poussés", pushed_fut), ("déjà touché (contexte)", pushed_fut & touched),
+              ("jamais touché", pushed_fut & ~touched), ("déjà touché + masse extrême", pushed_fut & touched & extreme)]
+    print(f"{'modèle':>11s} | " + " | ".join(f"{g:>27s}" for g, _ in groups) + f" | {'tous disques h=1..H':>20s}")
+    for name, pr_ in rollouts.items():
+        e = roll_err(pr_)
+        print(f"{name:>11s} | " + " | ".join(f"{e[:, -1][msk].mean():27.2f}" for _, msk in groups)
+              + " | " + " ".join(f"{e[:, h].mean():.2f}" for h in range(H)))
+    print(f"(effectifs : " + ", ".join(f"{g} {msk.sum()}" for g, msk in groups) + ")")
     print("\n===== POSITION PRÉDITE DES DISQUES POUSSÉS (px, lecteur gelé sur latents prédits ; plus bas = mieux) =====")
     print(f"{'modèle':>18s} | {'poussés':>7s} | {'1re poussée':>11s} | {'déjà touché':>11s}")
     for name, e in dec:
