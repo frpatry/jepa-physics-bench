@@ -188,8 +188,11 @@ def main():
     p.add_argument("--labels", type=int, default=1000); p.add_argument("--n_test", type=int, default=1000)
     p.add_argument("--read_steps", type=int, default=2000); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time(); rng = np.random.default_rng(a.seed)
-    w = gen_world(a.n_pool, a.T, a.H, seed=a.seed, a_sub=a.a_sub)
-    pool = dict(X=torch.from_numpy((w["X"] * 255).round().astype(np.uint8)), A=torch.from_numpy(w["A"].astype(np.float16))); del w
+    Xs, As = [], []                                                     # par morceaux : sinon OOM (20k × float32)
+    for c0 in range(0, a.n_pool, 2000):
+        w = gen_world(min(2000, a.n_pool - c0), a.T, a.H, seed=a.seed + 7919 * (c0 // 2000), a_sub=a.a_sub)
+        Xs.append(torch.from_numpy((w["X"] * 255).round().astype(np.uint8))); As.append(torch.from_numpy(w["A"].astype(np.float16))); del w
+    pool = dict(X=torch.cat(Xs), A=torch.cat(As)); del Xs, As
     wp = gen_world(a.n_probe, a.T, a.H, seed=1000, a_sub=a.a_sub)
     a.da = 2 * a.a_sub * NB; nP = a.H // a.P; nv = a.T * nP * nP
     Af = pool["A"][:4000].float(); Af = Af.reshape(len(Af), a.T, -1)
