@@ -109,20 +109,27 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
                 img = img * (1 - al) + cols[k] * al
             if occl > 0: img[:, (xx[0] > 0.5 - occl / 2) & (xx[0] < 0.5 + occl / 2)] = 0.5
             X[i, t] = img; POS[i, t] = P
-        sig = rng.normal(0, 0.005, (2, T * SPF)).astype(np.float32)    # bruit de fond
-        for (te, k, J, xc) in ev:
-            IMP[i, int(te) + 1] = True                                  # choc dans (t-1, t] -> frame t
-            on = int(round(te * SPF)) + SPF; tt = tt_all[:T * SPF - on]    # fenêtre audio t = intervalle (t-1, t]
-            f0 = F_MAT[MAT[i, k]] * (m[k] ** (-1 / 3) if pitch_mass else 1.0); amp = min(J / 0.15, 4.0)
-            s = np.zeros_like(tt)
-            for j, rr in enumerate(PARTIALS[MAT[i, k]]):
-                if f0 * rr < 0.95 * SR / 2:
-                    s += np.exp(-tt / (TAU[MAT[i, k]] / (1 + j))) * np.sin(2 * math.pi * f0 * rr * tt + rng.uniform(0, 6.28)) / (1 + j)
-            xc = float(np.clip(xc, 0, 1))
-            sig[0, on:] += amp * math.sqrt(1 - xc) * s; sig[1, on:] += amp * math.sqrt(xc) * s
-        fr = sig.reshape(2, T, a_sub, Ls) * win
-        A[i] = np.log1p(np.einsum("bf,ctsf->tscb", W, np.abs(np.fft.rfft(fr, axis=-1)) ** 2)).reshape(T, a_sub * 2, NB)
+        A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i])
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, HIT=HIT, POS=POS)
+
+def render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, pitch_mass, imp_row):
+    """événements (instant en frames, objet, impulsion, x) -> spectrogramme (T, a_sub*2, NB). Synthèse
+    MODALE : partiels amortis (matériau), amplitude ∝ impulsion, hauteur ∝ masse^-1/3, pano ∝ x.
+    Marque imp_row[t] pour un choc dans (t-1, t]."""
+    Ls = SPF // a_sub
+    sig = rng.normal(0, 0.005, (2, T * SPF)).astype(np.float32)        # bruit de fond
+    for (te, k, J, xc) in ev:
+        imp_row[int(te) + 1] = True                                     # choc dans (t-1, t] -> frame t
+        on = int(round(te * SPF)) + SPF; tt = tt_all[:T * SPF - on]     # fenêtre audio t = intervalle (t-1, t]
+        f0 = F_MAT[mat[k]] * (m[k] ** (-1 / 3) if pitch_mass else 1.0); amp = min(J / 0.15, 4.0)
+        s = np.zeros_like(tt)
+        for j, rr in enumerate(PARTIALS[mat[k]]):
+            if f0 * rr < 0.95 * SR / 2:
+                s += np.exp(-tt / (TAU[mat[k]] / (1 + j))) * np.sin(2 * math.pi * f0 * rr * tt + rng.uniform(0, 6.28)) / (1 + j)
+        xc = float(np.clip(xc, 0, 1))
+        sig[0, on:] += amp * math.sqrt(1 - xc) * s; sig[1, on:] += amp * math.sqrt(xc) * s
+    fr = sig.reshape(2, T, a_sub, Ls) * win
+    return np.log1p(np.einsum("bf,ctsf->tscb", W, np.abs(np.fft.rfft(fr, axis=-1)) ** 2)).reshape(T, a_sub * 2, NB)
 
 # ---------------------------------------------------------------- tokens : vision (patches) + audio (1/frame)
 def make_tokens(w, P, amu=None, asd=None):
