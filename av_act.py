@@ -35,10 +35,10 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
     ACT = np.zeros((n, T, 2), np.float32); TOUCH = np.zeros((n, T, 4), np.float32)
     WHO = -np.ones((n, T), np.int64)                                    # disque poussé dans (t-1, t]
     MAT = rng.integers(0, 3, (n, 2)); LM = rng.uniform(np.log(1 / 3), np.log(3), (n, 2)).astype(np.float32)
-    IMP = np.zeros((n, T), bool)
+    IMP = np.zeros((n, T), bool); COL = np.zeros((n, 2, 3), np.float32)
     win = np.hanning(Ls).astype(np.float32); W = band_matrix(Ls); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
-        cols = PAL[np.sort(rng.choice(len(PAL), 2, replace=False))]; m = np.exp(LM[i])
+        cols = PAL[np.sort(rng.choice(len(PAL), 2, replace=False))]; m = np.exp(LM[i]); COL[i] = cols
         P = np.zeros((2, 2), np.float32); P[0] = rng.uniform(r, 1 - r, 2)
         for _ in range(100):
             P[1] = rng.uniform(r, 1 - r, 2)
@@ -97,7 +97,7 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
             img = img * (1 - hx) + hx                                   # main = carré blanc
             X[i, t] = img; POS[i, t] = P; HAND[i, t] = Hp
         A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i])
-    return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, POS=POS, HAND=HAND, ACT=ACT, TOUCH=TOUCH, WHO=WHO)
+    return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, POS=POS, HAND=HAND, ACT=ACT, TOUCH=TOUCH, WHO=WHO, COL=COL)
 
 # ---------------------------------------------------------------- tokens par pas V-JEPA 2 (2 frames)
 def step_inputs(w, Tt):
@@ -200,6 +200,10 @@ def main():
     st = {n_: (x.mean((0, 1)), x.std((0, 1)) + 1e-4) for n_, x in [("a", Atr), ("t", Ttr), ("c", Ctr)]}
     nz = lambda x, n_: torch.from_numpy((x - st[n_][0]) / st[n_][1])
     Atr, Ttr, Ctr, Ate, Tte_, Cte = nz(Atr, "a"), nz(Ttr, "t"), nz(Ctr, "c"), nz(Ate, "a"), nz(Tte_, "t"), nz(Cte, "c")
+    def mass_tok(w):                                                    # ORACLE (contrôle) : vraies log-masses + couleurs
+        x = np.concatenate([w["LM"] / 0.63, w["COL"].reshape(len(w["LM"]), 6)], -1).astype(np.float32)
+        return torch.from_numpy(np.repeat(x[:, None], Tt, 1))
+    Mtr, Mte = mass_tok(wtr), mass_tok(wte)
     # sous-ensembles d'éval : pas s+1 (frames 2s+2, 2s+3) avec poussée ; disque déjà touché avant ?
     who = wte["WHO"]; n_te = len(who)
     push = np.zeros((n_te, Tt - 1), bool); retouch = np.zeros((n_te, Tt - 1), bool)
@@ -243,14 +247,14 @@ def main():
     # --- ROLLOUT : contexte = pas 0..c (on a vu/entendu/senti), puis H pas IMAGINÉS avec les actions prévues ;
     #     son et toucher du futur inconnus (zéro) ; les latents prédits sont réinjectés comme vision.
     c, H = a.ctx, Tt - 1 - a.ctx
-    def rollout(m):
+    def rollout(m, C):
         out_all = []
         with torch.no_grad():
             for i in range(0, n_te, 256):
                 sl = slice(i, i + 256); V = Vte[sl].to(dev).float().clone()
                 A_, T_ = Ate[sl].to(dev).clone(), Tte_[sl].to(dev).clone(); A_[:, c + 1:] = 0; T_[:, c + 1:] = 0
                 for h in range(1, H + 1):
-                    o, _ = m(V, A_, T_, Cte[sl].to(dev)); V[:, c + h] = o["v"][:, c + h - 1]
+                    o, _ = m(V, A_, T_, C[sl].to(dev)); V[:, c + h] = o["v"][:, c + h - 1]
                 out_all.append(V[:, c + 1:].half().cpu())
         return readout(torch.cat(out_all))                              # (n, H, 6)
     tr_fut = Pte[:, c + 1:]                                             # vraies positions futures (n, H, 6)
@@ -270,11 +274,12 @@ def main():
     rows = [("copie", copy_err)]
     for mods in a.variants.split(","):
         torch.manual_seed(a.seed)
-        m = ACPredictor(k, Tt, dv, Atr.size(-1), Ttr.size(-1), Ctr.size(-1), a.d, a.nl, a.nh, mods, bool(a.residual)).to(dev)
+        CtrV, CteV = (torch.cat([Ctr, Mtr], -1), torch.cat([Cte, Mte], -1)) if "m" in mods else (Ctr, Cte)   # oracle -> token action
+        m = ACPredictor(k, Tt, dv, Atr.size(-1), Ttr.size(-1), CtrV.size(-1), a.d, a.nl, a.nh, mods, bool(a.residual)).to(dev)
         opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); tt0 = time.time()
         for it in range(1, a.steps + 1):
             bi = torch.randint(0, len(Vtr), (a.bs,))
-            V, A_, T_, C_ = Vtr[bi].to(dev).float(), Atr[bi].to(dev), Ttr[bi].to(dev), Ctr[bi].to(dev)
+            V, A_, T_, C_ = Vtr[bi].to(dev).float(), Atr[bi].to(dev), Ttr[bi].to(dev), CtrV[bi].to(dev)
             if a.sens_drop > 0:                                         # suffixe sans son/toucher (= futur imaginé)
                 cut = torch.randint(1, Tt + 1, (a.bs, 1), device=dev)
                 keep = (torch.arange(Tt, device=dev)[None] < cut) | (torch.rand(a.bs, 1, device=dev) > a.sens_drop)
@@ -287,11 +292,11 @@ def main():
         with torch.no_grad():
             for i in range(0, n_te, 256):
                 sl = slice(i, i + 256); V = Vte[sl].to(dev).float()
-                out, _ = m(V, Ate[sl].to(dev), Tte_[sl].to(dev), Cte[sl].to(dev))
+                out, _ = m(V, Ate[sl].to(dev), Tte_[sl].to(dev), CteV[sl].to(dev))
                 errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu()); preds.append(out["v"][:, :-1].half().cpu())
         rows.append((mods.upper(), torch.cat(errs).numpy()))
         e_dec, _ = disk_err(readout(torch.cat(preds))); dec.append((mods.upper(), e_dec)); del preds
-        rollouts[mods.upper()] = rollout(m)
+        rollouts[mods.upper()] = rollout(m, CteV)
         e = rows[-1][1]
         print(f"  {mods.upper():>4s} | erreur latents pas suivant : tous {e.mean():.4f} | poussée {e[push].mean():.4f} "
               f"| 1re poussée {e[first].mean():.4f} | disque déjà touché {e[retouch].mean():.4f}", flush=True)
