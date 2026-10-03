@@ -157,6 +157,9 @@ class AVJEPA(nn.Module):
         inventer de la variance sur du vide) ; 'frame' : moyenne des tokens de chaque frame
         (représentation globale, esprit LeJEPA) -> (B*T, d)."""
         if s.sig_on == "token": return z.reshape(-1, z.size(-1))
+        if s.sig_on == "centered":                                      # anti-RACCOURCI POSITIONNEL : on retire la
+            return (z - z.mean(0, keepdim=True)).reshape(-1, z.size(-1))  # moyenne par position (sur le batch) ->
+                                                                        # la variance doit venir du CONTENU
         # (pour "both", sig_input renvoie la version frame ; la version token est ajoutée dans loss)
         npf = s.nv // s.T
         fr = torch.where(pidx < s.nv, pidx // npf, pidx - s.nv)                     # (B,kp) frame de chaque token
@@ -309,7 +312,8 @@ def r2(p, y): return float(1 - ((p - y) ** 2).sum() / ((y - y.mean()) ** 2).sum(
 
 def evaluate(m, tok, w, cond, dev, steps, ntr):
     Z, keep = encode(m, tok, cond, dev); n = len(Z); tr, te = slice(0, ntr), slice(ntr, n)
-    res = {}
+    Zf_ = Z[:2000].float(); between = Zf_.mean(0).var(0).sum(); within = Zf_.var(0).mean(0).sum()
+    res = {"pos_share": float(between / (between + within))}          # part de variance due à la POSITION seule
     mat = torch.from_numpy(w["MAT"]).long()
     p = fit_probe(Z[tr], mat[tr], Z[te], 6, "mat", dev, steps)
     res["mat"] = float((p.view(-1, 2, 3).argmax(-1) == mat[te]).float().mean())
@@ -347,7 +351,7 @@ def get_args():
     p.add_argument("--r", type=float, default=0.12); p.add_argument("--occl", type=float, default=0.0)
     p.add_argument("--pitch_mass", type=int, default=1)
     p.add_argument("--stream", type=int, default=0, help="JEPA : lots NEUFS à chaque pas (flux infini, pas de rejeu)")
-    p.add_argument("--sig_on", type=str, default="token", choices=["token", "frame", "both"], help="SIGReg sur chaque token, sur la moyenne par frame, ou les deux")
+    p.add_argument("--sig_on", type=str, default="token", choices=["token", "frame", "both", "centered"], help="SIGReg sur chaque token, sur la moyenne par frame, ou les deux")
     p.add_argument("--workers", type=int, default=2, help="processus de génération du flux (0 = séquentiel)")
     p.add_argument("--a_sub", type=int, default=1, help="sous-fenêtres audio par frame (synchronie fine)")
     p.add_argument("--steps", type=int, default=6000); p.add_argument("--bs", type=int, default=64)
@@ -376,7 +380,7 @@ def main():
         for c in conds:
             r = evaluate(m, tokp, wpr, c, dev, a.probe_steps, ntr); rows.append((name, c, r))
             print(f"  {name:>7s} | entrée {c:>2s} | matériau {r['mat']:.0%} | log-masse R² {r['lm_all']:+.2f} "
-                  f"(avec choc {r['lm_hit']:+.2f}) | ratio masses R² {r['ratio_hit']:+.2f} | impact {r['imp_bacc']:.0%}", flush=True)
+                  f"(avec choc {r['lm_hit']:+.2f}) | ratio masses R² {r['ratio_hit']:+.2f} | impact {r['imp_bacc']:.0%} | var. position {r['pos_share']:.0%}", flush=True)
     if a.init_baseline:
         print("--- encodeur NON entraîné (ce que la sonde tire des entrées brutes)")
         steps = a.steps; a.steps = 0; run_evals(pretrain("va", tok, a, dev, nv, a.T, nP, rng), "init", ["v", "va", "a"]); a.steps = steps
