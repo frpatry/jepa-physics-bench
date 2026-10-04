@@ -45,10 +45,17 @@ def _batch(job):
     w = gen_world(n, T, H, seed=seed, a_sub=2)
     return (w["X"] * 255).round().astype(np.uint8), w["A"].astype(np.float16)
 
-def stream(start, bs, workers):
-    jobs = ((10_000_000 + i, bs) for i in range(start, 10 ** 9))
+def stream(start, bs, workers, prefetch=24):
+    """lots neufs générés en parallèle avec une avance BORNÉE : Pool.imap n'a aucune contre-pression ->
+    les workers (plus rapides que le GPU) remplissaient la RAM jusqu'à l'OOM (84 Go)."""
+    from collections import deque
     with mp.get_context("fork").Pool(workers) as pool:
-        for X, A in pool.imap(_batch, jobs, chunksize=4):
+        pending, i = deque(), start
+        for _ in range(prefetch):
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs),))); i += 1
+        while True:
+            X, A = pending.popleft().get()
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs),))); i += 1
             yield torch.from_numpy(X), torch.from_numpy(A)
 
 def build_probe(a, dev, st):
