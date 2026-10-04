@@ -6,6 +6,8 @@ Charge le checkpoint et isole la cause en 3 tests (encodeur cible EMA gelé ; r�
                      (signe de la différence G-D aux frames d'impact, lu sur le latent audio prédit
                      vs sur le vrai latent audio)
   (c) EXAMEN       : localisation sur des représentations RÉSUMÉES par frame (16 tokens) et 2000 étiq.
+  (d) OREILLES     : l'encodeur nourri du SEUL son sait-il de quel côté a eu lieu le choc ? (idée user :
+                     l'ouïe localise, la vision devrait « demander » à l'ouïe)
 Lecture : (a) bas -> perception ; (a) ok mais (b) bas -> l'objectif ignore la stéréo ; (c) ok -> c'était
 l'examen (lecteur trop chargé).
 
@@ -89,7 +91,11 @@ def main():
             def side(Za):
                 Xi, yi = Za[msk].unsqueeze(1), y[msk]; k = int(0.7 * len(yi))
                 return bacc(fit_reader(Xi[:k], yi[:k], Xi[k:], "bin", dev, a.steps).argmax(-1), yi[k:])
-            msg += f" | (b) côté du son : vrai latent {side(Ta):.0%} / PRÉDIT depuis l'image {side(Pa):.0%}"
+            # (d) les OREILLES SEULES : encodeur sur les seuls tokens audio -> côté du choc (G/D) ?
+            with torch.no_grad():
+                Za = torch.cat([tgt(tok[i:i + 64, nv:].to(dev).float(), aud.expand(len(tok[i:i + 64]), -1)).half().cpu() for i in range(0, a.n, 64)])
+            msg += (f" | (b) côté du son : vrai latent {side(Ta):.0%} / PRÉDIT depuis l'image {side(Pa):.0%}"
+                    f" | (d) oreilles seules {side(Za):.0%}")
         print(msg + f"  ({time.time() - t0:.0f}s)", flush=True)
     print("Lecture : (a) bas -> la vision ne localise pas ; (b) prédit ≈ 50 % alors que vrai haut -> l'objectif ignore la stéréo ;"
           " (c) haut -> c'était l'examen.")
