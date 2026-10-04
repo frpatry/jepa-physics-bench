@@ -67,9 +67,9 @@ def main():
     p.add_argument("--n", type=int, default=8000); p.add_argument("--n_test", type=int, default=3000)
     p.add_argument("--T", type=int, default=8); p.add_argument("--a_sub", type=int, default=1)
     p.add_argument("--r", type=float, default=0.12); p.add_argument("--smin", type=float, default=0.05)
-    p.add_argument("--smax", type=float, default=0.11); p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--smax", type=float, default=0.11); p.add_argument("--hum", type=float, default=0.0); p.add_argument("--steps", type=int, default=3000)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
-    t0 = time.time(); kw = dict(T=a.T, H=16, r=a.r, a_sub=a.a_sub, smin=a.smin, smax=a.smax)
+    t0 = time.time(); kw = dict(T=a.T, H=16, r=a.r, a_sub=a.a_sub, smin=a.smin, smax=a.smax, hum=a.hum)
     wtr, wte = gen_world(a.n, seed=0, **kw), gen_world(a.n_test, seed=999, **kw)
     nwall = wtr["IMP"][:, 1:].sum(1).mean()
     print(f"monde T={a.T} a_sub={a.a_sub} n={a.n} : choc disque-disque {wtr['HIT'].mean():.0%}, "

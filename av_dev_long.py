@@ -41,25 +41,25 @@ def to_tokens(X, A, P, st, sigma=0.0):
     return tok
 
 def _batch(job):
-    seed, n = job
-    w = gen_world(n, T, H, seed=seed, a_sub=2)
+    seed, n, hum = job
+    w = gen_world(n, T, H, seed=seed, a_sub=2, hum=hum)
     return (w["X"] * 255).round().astype(np.uint8), w["A"].astype(np.float16)
 
-def stream(start, bs, workers, prefetch=24):
+def stream(start, bs, workers, prefetch=24, hum=0.0):
     """lots neufs générés en parallèle avec une avance BORNÉE : Pool.imap n'a aucune contre-pression ->
     les workers (plus rapides que le GPU) remplissaient la RAM jusqu'à l'OOM (84 Go)."""
     from collections import deque
     with mp.get_context("fork").Pool(workers) as pool:
         pending, i = deque(), start
         for _ in range(prefetch):
-            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs),))); i += 1
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum),))); i += 1
         while True:
             X, A = pending.popleft().get()
-            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs),))); i += 1
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum),))); i += 1
             yield torch.from_numpy(X), torch.from_numpy(A)
 
 def build_probe(a, dev, st):
-    w = gen_world(a.n_probe, T, H, seed=1000, a_sub=2)
+    w = gen_world(a.n_probe, T, H, seed=1000, a_sub=2, hum=a.hum)
     X, A = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)), torch.from_numpy(w["A"])
     lab = (torch.arange(a.n_probe) % 2).long(); Asw = A.clone(); Asw[lab == 1] = A[lab == 1][:, :, [1, 0, 3, 2]]
     mk = lambda A_: torch.cat([to_tokens(X[i:i + 250].to(dev), A_[i:i + 250].to(dev), a.P, st).half().cpu()
@@ -88,11 +88,12 @@ def main():
     p.add_argument("--blur_down", type=int, default=25000, help="durée de l'étape C (σ 3 -> 0)")
     p.add_argument("--exam_every", type=int, default=10000); p.add_argument("--ckpt_every", type=int, default=2500)
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
-    p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
+    p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; nv = T * nP * nP; da = 2 * 2 * NB
-    w0 = gen_world(2000, T, H, seed=a.seed, a_sub=2); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T, -1)
+    w0 = gen_world(2000, T, H, seed=a.seed, a_sub=2, hum=a.hum); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T, -1)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0
     W = max(a.P * a.P * 3, da)
     print(f"GPU {torch.cuda.get_device_name(0) if dev == 'cuda' else 'cpu'} | {T} frames × {nP * nP} patches {a.P}×{a.P} + {T} audio "
@@ -111,7 +112,7 @@ def main():
         class Wrap(torch.nn.Module):
             def __init__(s, enc): super().__init__(); s.enc, s.nv, s.T = enc, nv, T
         state["exams"].append(("init", exam(Wrap(tgt), probe, a, dev, nv, "init (aléatoire)")))
-    data = stream(state["it"], a.bs, a.workers); ma = None
+    data = stream(state["it"], a.bs, a.workers, hum=a.hum); ma = None
     def sigma_of(stage, k):
         return {"A": 0.0, "B": a.sig_max, "D": 0.0}.get(stage, a.sig_max * max(0.0, 1 - k / a.blur_down))
     while state["it"] < a.total:

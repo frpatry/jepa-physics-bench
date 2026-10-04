@@ -53,7 +53,7 @@ def band_matrix(L=SPF):
         else: W[b, np.argmin(abs(fr - math.sqrt(e[b] * e[b + 1])))] = 1
     return W
 
-def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11, a_sub=1):
+def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11, a_sub=1, hum=0.0):
     """a_sub : nb de sous-fenêtres audio par frame (résolution temporelle du son : l'instant d'un
     rebond dans la frame devient audible -> synchronie son<->image). A : (n, T, a_sub*2, NB).
     L'instant du son = instant PHYSIQUE du choc dans l'intervalle (t-1, t] (pas un tirage)."""
@@ -109,15 +109,34 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
                 img = img * (1 - al) + cols[k] * al
             if occl > 0: img[:, (xx[0] > 0.5 - occl / 2) & (xx[0] < 0.5 + occl / 2)] = 0.5
             X[i, t] = img; POS[i, t] = P
-        A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i])
+        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass) if hum > 0 else None
+        A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i], extra)
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, HIT=HIT, POS=POS)
 
-def render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, pitch_mass, imp_row):
+def hum_signal(pos, mat, m, T, level, pitch_mass=1):
+    """MONDE v4 : chaque disque émet en CONTINU un bourdonnement sourd mais distinct (comme un moteur, un
+    roulement, les micro-sons d'un robot) — fondamentale = moitié de sa note d'impact (timbre lié au
+    matériau et à la masse), 3 harmoniques ; volume = plancher + vitesse (un disque immobile murmure,
+    un disque rapide ronronne) ; PANO qui SUIT sa position x image par image (interpolé à l'échantillon).
+    pos (T, 2, 2) -> signal stéréo (2, T*SPF)."""
+    n_s = T * SPF; tt = np.arange(n_s) / SR; fr = np.arange(n_s) / SPF            # temps en frames
+    sig = np.zeros((2, n_s), np.float32)
+    vel = np.linalg.norm(np.diff(pos, axis=0, prepend=pos[:1]), axis=-1)          # (T, 2) vitesse / frame
+    for k in range(pos.shape[1]):
+        x = np.interp(fr, np.arange(T), pos[:, k, 0]); sp = np.interp(fr, np.arange(T), vel[:, k])
+        f0 = 0.5 * F_MAT[mat[k]] * (m[k] ** (-1 / 3) if pitch_mass else 1.0)
+        tone = sum(np.sin(2 * math.pi * f0 * h * tt + 1.3 * h * k) / h for h in (1, 2, 3))
+        amp = level * (0.3 + sp / 0.08)
+        xc = np.clip(x, 0, 1); sig[0] += amp * np.sqrt(1 - xc) * tone; sig[1] += amp * np.sqrt(xc) * tone
+    return sig
+
+def render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, pitch_mass, imp_row, extra=None):
     """événements (instant en frames, objet, impulsion, x) -> spectrogramme (T, a_sub*2, NB). Synthèse
     MODALE : partiels amortis (matériau), amplitude ∝ impulsion, hauteur ∝ masse^-1/3, pano ∝ x.
     Marque imp_row[t] pour un choc dans (t-1, t]."""
     Ls = SPF // a_sub
     sig = rng.normal(0, 0.005, (2, T * SPF)).astype(np.float32)        # bruit de fond
+    if extra is not None: sig = sig + extra                             # sons continus des objets (v4)
     for (te, k, J, xc) in ev:
         imp_row[int(te) + 1] = True                                     # choc dans (t-1, t] -> frame t
         on = int(round(te * SPF)) + SPF; tt = tt_all[:T * SPF - on]     # fenêtre audio t = intervalle (t-1, t]

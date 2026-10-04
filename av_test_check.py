@@ -40,9 +40,9 @@ def fit(xtr, ytr, xte, yte, steps):
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--n", type=int, default=12000); p.add_argument("--n_test", type=int, default=2000)
-    p.add_argument("--steps", type=int, default=2500); p.add_argument("--budgets", type=str, default="1000,3000,10000")
+    p.add_argument("--steps", type=int, default=2500); p.add_argument("--hum", type=float, default=0.0); p.add_argument("--budgets", type=str, default="1000,3000,10000")
     a = p.parse_args(); t0 = time.time()
-    w = gen_world(a.n + a.n_test, 16, 32, seed=1000, a_sub=2); n = a.n + a.n_test; A = w["A"]   # (n,16,4,32) lignes = (sous-fenêtre, canal)
+    w = gen_world(a.n + a.n_test, 16, 32, seed=1000, a_sub=2, hum=a.hum); n = a.n + a.n_test; A = w["A"]   # (n,16,4,32) lignes = (sous-fenêtre, canal)
     print(f"monde {n} séquences ({time.time() - t0:.0f}s)", flush=True)
     # --- diagnostic stéréo : ILD (log G - log D) sur les frames d'impact vs position x des disques
     L, R = A[:, :, 0::2].sum((2, 3)), A[:, :, 1::2].sum((2, 3)); ild = L - R
