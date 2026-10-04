@@ -90,6 +90,7 @@ def exam(m, probe, a, dev, nv, tag):
     nte = min(1000, a.n_probe // 3); te = slice(a.n_probe - nte, a.n_probe); res = {}
     L1, L2 = min(1000, a.n_probe - nte), min(2000, a.n_probe - nte)
     R = represent(m, probe["sw"], np.ones(N, bool), dev)
+    res["ecart"] = float(R.float().std(0).mean())          # ALARME EFFONDREMENT : variabilité des latents entre scènes (→ 0 = effondré)
     res["localisation"] = bacc(fit_reader(R[:L1], probe["lab"][:L1], R[te], "bin", dev, a.read_steps).argmax(-1), probe["lab"][te])
     R = represent(m, probe["tok"], frame <= 7, dev)
     res["anticipation"] = bacc(fit_reader(R[:L2], probe["antic"][:L2], R[te], "bin", dev, a.read_steps).argmax(-1), probe["antic"][te])
@@ -97,6 +98,7 @@ def exam(m, probe, a, dev, nv, tag):
     if hasattr(m, "pred"):
         res["surprise"], res["surprise_choc"] = surprise(m.pred, m.enc_c, m.enc, probe["tok"], probe["swall"], probe["imp"], nv, dev)
         msg = f" | SURPRISE stéréo inversée {res['surprise']:.0%} (chocs {res['surprise_choc']:.0%}, 0 étiq.)"
+    msg += f" | écart-type latents {res['ecart']:.3f}"
     print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}" + msg, flush=True)
     return res
 
@@ -173,6 +175,8 @@ def main():
         if it % a.exam_every == 0:
             m.eval(); r = exam(type("W", (), {"enc": tgt, "nv": nv, "T": T, "pred": m.pred, "enc_c": m.enc})(), probe, a, dev, nv, f"pas {it} étape {stage}")
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
+            # INSTANTANÉ à chaque examen (le run v2 s'est EFFONDRÉ vers 80k : la sauvegarde unique écrasait l'état sain)
+            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state), a.ckpt.replace(".pt", f"_{it // 1000}k.pt"))
         if it % a.ckpt_every == 0 or it == a.total:
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state), a.ckpt + ".tmp")
             os.replace(a.ckpt + ".tmp", a.ckpt)
