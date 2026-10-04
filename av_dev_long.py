@@ -20,7 +20,7 @@ import multiprocessing as mp
 import numpy as np, torch, torch.nn.functional as F
 from av_jepa import gen_world, NB
 from av_dev import blur, masks, DevJEPA, fit_reader, represent, bacc
-from vjepa import _idx, _gather
+from vjepa import _idx, _gather, sigreg
 
 T, H = 16, 32
 
@@ -114,6 +114,8 @@ def main():
     p.add_argument("--exam_every", type=int, default=10000); p.add_argument("--ckpt_every", type=int, default=2500)
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
     p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
+    p.add_argument("--sig_w", type=float, default=0.0, help="ANTI-EFFONDREMENT : poids SIGReg (LeJEPA) sur le résumé par scène de l'encodeur en ligne")
+    p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
@@ -133,11 +135,15 @@ def main():
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
         m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); opt.load_state_dict(ck["opt"]); state = ck["state"]
         print(f"REPRISE au pas {state['it']} (étape {state['stage']})", flush=True)
+    elif a.init_from:
+        ck = torch.load(a.init_from, map_location=dev, weights_only=False)
+        m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); state = ck["state"]
+        print(f"DÉPART depuis l'instantané {a.init_from} : pas {state['it']} (étape {state['stage']}) | SIGReg poids {a.sig_w}", flush=True)
     else:
         class Wrap(torch.nn.Module):
             def __init__(s, enc): super().__init__(); s.enc, s.nv, s.T = enc, nv, T
         state["exams"].append(("init", exam(Wrap(tgt), probe, a, dev, nv, "init (aléatoire)")))
-    data = stream(state["it"], a.bs, a.workers, hum=a.hum); ma = None
+    data = stream(state["it"], a.bs, a.workers, hum=a.hum); ma = msr = None
     def sigma_of(stage, k):
         return {"A": 0.0, "B": a.sig_max, "D": 0.0}.get(stage, a.sig_max * max(0.0, 1 - k / a.blur_down))
     while state["it"] < a.total:
@@ -150,19 +156,25 @@ def main():
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad(): z = F.layer_norm(tgt(_gather(o, pidx), pidx).float(), (a.d,))
             zf = torch.zeros(B, N, a.d, device=dev).scatter(1, pidx.unsqueeze(-1).expand(-1, -1, a.d), z)
-            loss = 0.0
+            loss = 0.0; summ = []
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
-                loss = loss + F.l1_loss(m.pred(m.enc(_gather(o, cidx), cidx), cidx, tidx).float(), _gather(zf, tidx))
-            loss = loss / len(pairs)
+                zc = m.enc(_gather(o, cidx), cidx); summ.append(zc.float().mean(1))
+                loss = loss + F.l1_loss(m.pred(zc, cidx, tidx).float(), _gather(zf, tidx))
+            loss = loss / len(pairs); pred_loss = loss
+        sr = torch.zeros((), device=dev)
+        if a.sig_w > 0:                     # SIGReg : les résumés de scènes doivent rester VARIÉS (gaussienne isotrope) -> pas de « même réponse partout »
+            with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
+            loss = pred_loss + a.sig_w * sr
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        ma = loss.item() if ma is None else 0.995 * ma + 0.005 * loss.item()
+        ma = pred_loss.item() if ma is None else 0.995 * ma + 0.005 * pred_loss.item()
+        msr = sr.item() if msr is None else 0.995 * msr + 0.005 * sr.item()
         if it % 500 == 0:
             state["hist"].append((it, stage, ma))
-            print(f"  pas {it:6d} | étape {stage} (depuis {k}) | flou σ={sig:.1f} | perte {ma:.4f} | {time.time() - t0:.0f}s", flush=True)
+            print(f"  pas {it:6d} | étape {stage} (depuis {k}) | flou σ={sig:.1f} | perte {ma:.4f}" + (f" | SIGReg {msr:.3f}" if a.sig_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
             # passage d'étape : A et B quand la perte plafonne (gain < 2 % sur 3000 pas) ou au max ; C après la descente du flou
             prev = [h[2] for h in state["hist"] if h[1] == stage and h[0] <= it - 3000]
             plateau = k >= a.min_stage and prev and (prev[-1] - ma) / max(prev[-1], 1e-6) < 0.02
