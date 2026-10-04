@@ -64,7 +64,26 @@ def build_probe(a, dev, st):
     lab = (torch.arange(a.n_probe) % 2).long(); Asw = A.clone(); Asw[lab == 1] = A[lab == 1][:, :, [1, 0, 3, 2]]
     mk = lambda A_: torch.cat([to_tokens(X[i:i + 250].to(dev), A_[i:i + 250].to(dev), a.P, st).half().cpu()
                                for i in range(0, a.n_probe, 250)])
-    return dict(sw=mk(Asw), tok=mk(A), lab=lab, antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
+    return dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab,
+                antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
+
+@torch.no_grad()
+def surprise(pred, enc_c, tgt, tok, toksw, imp, nv, dev, bs=64):
+    """VIOLATION D'ATTENTE (comme chez le bébé, ZÉRO étiquette) : le prédicteur voit TOUTE l'image et prédit les
+    latents audio ; on compare l'erreur face au vrai son et face au son à stéréo INVERSÉE (même séquence).
+    -> % de séquences plus « surprenantes » inversées (50 % = ne remarque rien), sur toutes les frames audio
+    et sur les seules frames d'impact (tous les sons quand le monde v4 bourdonne)."""
+    vis = torch.arange(nv, device=dev); aud = torch.arange(nv, tok.size(1), device=dev); ec, es = [], []
+    for i in range(0, len(tok), bs):
+        o, osw = tok[i:i + bs].to(dev).float(), toksw[i:i + bs].to(dev).float(); B = len(o); full = torch.arange(o.size(1), device=dev).expand(B, -1)
+        p = pred(enc_c(_gather(o, vis.expand(B, -1)), vis.expand(B, -1)), vis.expand(B, -1), aud.expand(B, -1)).float()
+        zc = F.layer_norm(tgt(o, full).float(), (p.size(-1),))[:, nv:]; zs = F.layer_norm(tgt(osw, full).float(), (p.size(-1),))[:, nv:]
+        ec.append((p - zc).abs().mean(-1).cpu()); es.append((p - zs).abs().mean(-1).cpu())
+    ec, es = torch.cat(ec), torch.cat(es)                                   # (n, T) erreur par frame audio
+    tout = float((es.mean(1) > ec.mean(1)).float().mean())
+    k = imp.any(1); w_ = imp.float()
+    choc = float(((es * w_).sum(1)[k] > (ec * w_).sum(1)[k]).float().mean())
+    return tout, choc
 
 def exam(m, probe, a, dev, nv, tag):
     N = nv + T; npf = nv // T; frame = np.concatenate([np.arange(nv) // npf, np.arange(T)])
@@ -74,7 +93,11 @@ def exam(m, probe, a, dev, nv, tag):
     res["localisation"] = bacc(fit_reader(R[:L1], probe["lab"][:L1], R[te], "bin", dev, a.read_steps).argmax(-1), probe["lab"][te])
     R = represent(m, probe["tok"], frame <= 7, dev)
     res["anticipation"] = bacc(fit_reader(R[:L2], probe["antic"][:L2], R[te], "bin", dev, a.read_steps).argmax(-1), probe["antic"][te])
-    print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}", flush=True)
+    msg = ""
+    if hasattr(m, "pred"):
+        res["surprise"], res["surprise_choc"] = surprise(m.pred, m.enc_c, m.enc, probe["tok"], probe["swall"], probe["imp"], nv, dev)
+        msg = f" | SURPRISE stéréo inversée {res['surprise']:.0%} (chocs {res['surprise_choc']:.0%}, 0 étiq.)"
+    print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}" + msg, flush=True)
     return res
 
 def main():
@@ -148,7 +171,7 @@ def main():
                 print(f"  >>> ÉTAPE {stage} MAÎTRISÉE au pas {it} ({'plateau' if plateau else 'durée max'}) -> étape {nxt}", flush=True)
                 state["stage"], state["stage_start"] = nxt, it; ma = None
         if it % a.exam_every == 0:
-            m.eval(); r = exam(type("W", (), {"enc": tgt, "nv": nv, "T": T})(), probe, a, dev, nv, f"pas {it} étape {stage}")
+            m.eval(); r = exam(type("W", (), {"enc": tgt, "nv": nv, "T": T, "pred": m.pred, "enc_c": m.enc})(), probe, a, dev, nv, f"pas {it} étape {stage}")
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
         if it % a.ckpt_every == 0 or it == a.total:
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state), a.ckpt + ".tmp")

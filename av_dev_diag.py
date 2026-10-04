@@ -8,6 +8,8 @@ Charge le checkpoint et isole la cause en 3 tests (encodeur cible EMA gelé ; r�
   (c) EXAMEN       : localisation sur des représentations RÉSUMÉES par frame (16 tokens) et 2000 étiq.
   (d) OREILLES     : l'encodeur nourri du SEUL son sait-il de quel côté a eu lieu le choc ? (idée user :
                      l'ouïe localise, la vision devrait « demander » à l'ouïe)
+  (e) SURPRISE     : violation d'attente, ZÉRO étiquette — l'erreur de prédiction du son (depuis l'image)
+                     est-elle plus grande quand la stéréo est inversée ? (test du bébé)
 Lecture : (a) bas -> perception ; (a) ok mais (b) bas -> l'objectif ignore la stéréo ; (c) ok -> c'était
 l'examen (lecteur trop chargé).
 
@@ -17,7 +19,7 @@ import argparse, copy, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from av_jepa import gen_world, NB
 from av_dev import DevJEPA, fit_reader, bacc
-from av_dev_long import to_tokens, stereo, T, H
+from av_dev_long import to_tokens, stereo, surprise, T, H
 from vjepa import _idx, _gather
 
 class RegReader(nn.Module):
@@ -64,7 +66,8 @@ def main():
     X, A = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)), torch.from_numpy(w["A"])
     tok = torch.cat([to_tokens(X[i:i + 250].to(dev), A[i:i + 250].to(dev), a.P, st).half().cpu() for i in range(0, a.n, 250)])
     ntr = int(0.7 * a.n); tr, te = slice(0, ntr), slice(ntr, a.n)
-    pos = torch.from_numpy(w["POS"].reshape(a.n, T, 4))                              # (n, T, 4)
+    P2 = w["POS"]; o_ = np.argsort(P2[..., 0], axis=-1)                              # (n, T, 2, 2) -> trié par x
+    pos = torch.from_numpy(np.take_along_axis(P2, o_[..., None], axis=2).reshape(a.n, T, 4))   # disques indiscernables : gauche puis droite
     L, R = w["A"][:, :, 0::2].sum((2, 3)), w["A"][:, :, 1::2].sum((2, 3)); ild = torch.from_numpy(L - R)
     imp = torch.from_numpy(w["IMP"])
     for name, enc in [("init", m0.enc), ("run", tgt)]:
@@ -94,8 +97,10 @@ def main():
             # (d) les OREILLES SEULES : encodeur sur les seuls tokens audio -> côté du choc (G/D) ?
             with torch.no_grad():
                 Za = torch.cat([tgt(tok[i:i + 64, nv:].to(dev).float(), aud.expand(len(tok[i:i + 64]), -1)).half().cpu() for i in range(0, a.n, 64)])
+            toksw_all = torch.cat([to_tokens(X[i:i + 250].to(dev), A[i:i + 250, :, [1, 0, 3, 2]].to(dev), a.P, st).half().cpu() for i in range(0, a.n, 250)])
+            s_all, s_choc = surprise(m.pred, m.enc, tgt, tok, toksw_all, imp, nv, dev)
             msg += (f" | (b) côté du son : vrai latent {side(Ta):.0%} / PRÉDIT depuis l'image {side(Pa):.0%}"
-                    f" | (d) oreilles seules {side(Za):.0%}")
+                    f" | (d) oreilles seules {side(Za):.0%} | (e) SURPRISE stéréo inversée {s_all:.0%} (chocs {s_choc:.0%}, 0 étiq.)")
         print(msg + f"  ({time.time() - t0:.0f}s)", flush=True)
     print("Lecture : (a) bas -> la vision ne localise pas ; (b) prédit ≈ 50 % alors que vrai haut -> l'objectif ignore la stéréo ;"
           " (c) haut -> c'était l'examen.")
