@@ -115,6 +115,7 @@ def main():
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
     p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
     p.add_argument("--sig_w", type=float, default=0.0, help="ANTI-EFFONDREMENT : poids SIGReg (LeJEPA) sur le résumé par scène de l'encodeur en ligne")
+    p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -149,7 +150,10 @@ def main():
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; k = it - state["stage_start"]; stage = state["stage"]
         sig = sigma_of(stage, k)
-        for g in opt.param_groups: g["lr"] = a.lr * min(1.0, it / 3000)
+        lr_f = min(1.0, it / 3000)
+        if a.lr_decay:                      # décroissance COSINUS (recette I-JEPA standard) jusqu'à 5 % : un taux constant en fin de run + cible EMA figée = instabilité suspecte
+            lr_f *= 0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2
+        for g in opt.param_groups: g["lr"] = a.lr * lr_f
         X, A = next(data); o = to_tokens(X.to(dev, non_blocking=True), A.to(dev, non_blocking=True), a.P, st, sig)
         present, pairs = masks("a" if stage == "A" else "va", a.bs, T, nP, nv, rng, a.n_masks)
         B, N, _ = o.shape; pidx = _idx(torch.from_numpy(np.broadcast_to(present, (B, N)).copy()).to(dev))
