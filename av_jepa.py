@@ -53,7 +53,7 @@ def band_matrix(L=SPF):
         else: W[b, np.argmin(abs(fr - math.sqrt(e[b] * e[b + 1])))] = 1
     return W
 
-def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11, a_sub=1, hum=0.0):
+def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, smin=0.05, smax=0.11, a_sub=1, hum=0.0, hum_mode="hum"):
     """a_sub : nb de sous-fenêtres audio par frame (résolution temporelle du son : l'instant d'un
     rebond dans la frame devient audible -> synchronie son<->image). A : (n, T, a_sub*2, NB).
     L'instant du son = instant PHYSIQUE du choc dans l'intervalle (t-1, t] (pas un tirage)."""
@@ -109,11 +109,11 @@ def gen_world(n, T=8, H=32, r=0.12, seed=0, pitch_mass=1, occl=0.0, p_aim=0.6, s
                 img = img * (1 - al) + cols[k] * al
             if occl > 0: img[:, (xx[0] > 0.5 - occl / 2) & (xx[0] < 0.5 + occl / 2)] = 0.5
             X[i, t] = img; POS[i, t] = P
-        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass) if hum > 0 else None
+        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass, hum_mode) if hum > 0 else None
         A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i], extra)
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, HIT=HIT, POS=POS)
 
-def hum_signal(pos, mat, m, T, level, pitch_mass=1):
+def hum_signal(pos, mat, m, T, level, pitch_mass=1, mode="hum"):
     """MONDE v4 : chaque disque émet en CONTINU un bourdonnement sourd mais distinct (comme un moteur, un
     roulement, les micro-sons d'un robot) — fondamentale = moitié de sa note d'impact (timbre lié au
     matériau et à la masse), 3 harmoniques ; volume = plancher + vitesse (un disque immobile murmure,
@@ -126,7 +126,9 @@ def hum_signal(pos, mat, m, T, level, pitch_mass=1):
         x = np.interp(fr, np.arange(T), pos[:, k, 0]); sp = np.interp(fr, np.arange(T), vel[:, k])
         f0 = 0.5 * F_MAT[mat[k]] * (m[k] ** (-1 / 3) if pitch_mass else 1.0)
         tone = sum(np.sin(2 * math.pi * f0 * h * tt + 1.3 * h * k) / h for h in (1, 2, 3))
-        amp = level * (0.3 + sp / 0.08)
+        if mode == "fric":                  # MONDE v5 (idée user) : FROTTEMENT sur la surface — SILENCE à l'arrêt, son
+            amp = level * (sp / 0.08) * math.sqrt(m[k])   # continu en glissant, plus fort s'il va vite ET s'il est lourd
+        else: amp = level * (0.3 + sp / 0.08)
         xc = np.clip(x, 0, 1); sig[0] += amp * np.sqrt(1 - xc) * tone; sig[1] += amp * np.sqrt(xc) * tone
     return sig
 

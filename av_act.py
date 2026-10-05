@@ -30,7 +30,52 @@ from av_vjepa2 import encode_vjepa2
 M_HAND, R_HAND = 1.0, 0.07
 SWAP = [2, 3, 0, 1, 4, 5]                                               # échange disque 0 <-> disque 1 (main inchangée)
 
-def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0):
+def act_physics(P, V, Hp, a, m, r, damp, t, ev, touch, who, fric=0.0):
+    """un pas du monde v3 (main pilotée par l'action a). touch (4,) et who (T,) modifiés en place.
+    fric > 0 (monde v5) : frottement de COULOMB en plus de l'amortissement — un disque glissant perd fric
+    de vitesse par frame et S'ARRÊTE ; plus facile à pousser loin s'il est léger (impulsion / masse)."""
+    Vh = a.copy(); P0 = P.copy()
+    Hp = np.clip(Hp + Vh, R_HAND, 1 - R_HAND); P = P + V
+    for k in range(2):                                      # murs
+        for dd in range(2):
+            if P[k, dd] < r or P[k, dd] > 1 - r:
+                wall = r if P[k, dd] < r else 1 - r
+                fr_ = float(np.clip((wall - P0[k, dd]) / (V[k, dd] + 1e-9), 0, 0.999))
+                J = 2 * m[k] * abs(V[k, dd]); V[k, dd] = -V[k, dd]
+                P[k, dd] = 2 * r - P[k, dd] if P[k, dd] < r else 2 * (1 - r) - P[k, dd]
+                ev.append((t - 1 + fr_, k, J, P[k, 0]))
+    for k in range(2):                                      # MAIN -> disque (choc à 2 corps)
+        dv = P[k] - Hp; dist = float(np.linalg.norm(dv))
+        if 1e-6 < dist < r + R_HAND:
+            nv = dv / dist; s_ = float((V[k] - Vh) @ nv)
+            if s_ < 0:
+                J = -2 * s_ * M_HAND * m[k] / (M_HAND + m[k])
+                V[k] += J / m[k] * nv; Vh -= J / M_HAND * nv
+                touch[:2] += -J * nv; touch[2] += J; touch[3] = J / (-s_ + 0.01); who[t] = k
+                ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
+            P[k] = np.clip(Hp + nv * (r + R_HAND), r, 1 - r)
+    dv = P[0] - P[1]; dist = float(np.linalg.norm(dv))     # disque <-> disque
+    if 1e-6 < dist < 2 * r:
+        nv = dv / dist; s_ = float((V[0] - V[1]) @ nv)
+        if s_ < 0:
+            J = -2 * s_ * m[0] * m[1] / (m[0] + m[1]); V[0] += J / m[0] * nv; V[1] -= J / m[1] * nv
+            xc = float((P[0, 0] + P[1, 0]) / 2); ev += [(t - 0.5, 0, J, xc), (t - 0.5, 1, J, xc)]
+        push = (2 * r - dist) / 2
+        P[0] = np.clip(P[0] + push * nv, r, 1 - r); P[1] = np.clip(P[1] - push * nv, r, 1 - r)
+    V *= damp                                               # frottement : il faut pousser
+    if fric > 0:
+        sp = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (sp + 1e-9), 0, 1)
+    return P, V, Hp
+
+def render_act(P, Hp, cols, xx, yy, r, H):
+    img = np.zeros((H, H, 3), np.float32)
+    for k in range(2):
+        al = np.clip((r - np.sqrt((xx - P[k, 0]) ** 2 + (yy - P[k, 1]) ** 2)) * H + 0.5, 0, 1)[..., None]
+        img = img * (1 - al) + cols[k] * al
+    hx = np.clip((R_HAND * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
+    return img * (1 - hx) + hx                              # main = carré blanc
+
+def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0, hum_mode="hum", fric=0.0):
     rng = np.random.default_rng(seed); Ls = SPF // a_sub
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -63,43 +108,9 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
                 left -= 1
                 d = tgt - Hp; a = vmax * d / max(np.linalg.norm(d), vmax) + rng.normal(0, 0.015, 2)
                 a = np.clip(a, -vmax, vmax).astype(np.float32); ACT[i, t - 1] = a   # action t-1 : frame t-1 -> t
-                Vh = a.copy(); P0, V0 = P.copy(), V.copy()
-                Hp = np.clip(Hp + Vh, R_HAND, 1 - R_HAND); P = P + V
-                for k in range(2):                                      # murs
-                    for dd in range(2):
-                        if P[k, dd] < r or P[k, dd] > 1 - r:
-                            wall = r if P[k, dd] < r else 1 - r
-                            fr_ = float(np.clip((wall - P0[k, dd]) / (V[k, dd] + 1e-9), 0, 0.999))
-                            J = 2 * m[k] * abs(V[k, dd]); V[k, dd] = -V[k, dd]
-                            P[k, dd] = 2 * r - P[k, dd] if P[k, dd] < r else 2 * (1 - r) - P[k, dd]
-                            ev.append((t - 1 + fr_, k, J, P[k, 0]))
-                for k in range(2):                                      # MAIN -> disque (choc à 2 corps)
-                    dv = P[k] - Hp; dist = float(np.linalg.norm(dv))
-                    if 1e-6 < dist < r + R_HAND:
-                        nv = dv / dist; s_ = float((V[k] - Vh) @ nv)
-                        if s_ < 0:
-                            J = -2 * s_ * M_HAND * m[k] / (M_HAND + m[k])
-                            V[k] += J / m[k] * nv; Vh -= J / M_HAND * nv
-                            TOUCH[i, t, :2] += -J * nv; TOUCH[i, t, 2] += J; TOUCH[i, t, 3] = J / (-s_ + 0.01); WHO[i, t] = k
-                            ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
-                        P[k] = np.clip(Hp + nv * (r + R_HAND), r, 1 - r)
-                dv = P[0] - P[1]; dist = float(np.linalg.norm(dv))     # disque <-> disque
-                if 1e-6 < dist < 2 * r:
-                    nv = dv / dist; s_ = float((V[0] - V[1]) @ nv)
-                    if s_ < 0:
-                        J = -2 * s_ * m[0] * m[1] / (m[0] + m[1]); V[0] += J / m[0] * nv; V[1] -= J / m[1] * nv
-                        xc = float((P[0, 0] + P[1, 0]) / 2); ev += [(t - 0.5, 0, J, xc), (t - 0.5, 1, J, xc)]
-                    push = (2 * r - dist) / 2
-                    P[0] = np.clip(P[0] + push * nv, r, 1 - r); P[1] = np.clip(P[1] - push * nv, r, 1 - r)
-                V *= damp                                               # frottement : il faut pousser
-            img = np.zeros((H, H, 3), np.float32)
-            for k in range(2):
-                al = np.clip((r - np.sqrt((xx - P[k, 0]) ** 2 + (yy - P[k, 1]) ** 2)) * H + 0.5, 0, 1)[..., None]
-                img = img * (1 - al) + cols[k] * al
-            hx = np.clip((R_HAND * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
-            img = img * (1 - hx) + hx                                   # main = carré blanc
-            X[i, t] = img; POS[i, t] = P; HAND[i, t] = Hp
-        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass) if hum > 0 else None   # monde v4 : chaque disque bourdonne
+                P, V, Hp = act_physics(P, V, Hp, a, m, r, damp, t, ev, TOUCH[i, t], WHO[i], fric)
+            X[i, t] = render_act(P, Hp, cols, xx, yy, r, H); POS[i, t] = P; HAND[i, t] = Hp
+        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass, hum_mode) if hum > 0 else None   # v4 : bourdonne ; v5 : FROTTE
         A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i], extra)
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, POS=POS, HAND=HAND, ACT=ACT, TOUCH=TOUCH, WHO=WHO, COL=COL)
 
@@ -114,8 +125,9 @@ def step_inputs(w, Tt):
     return A.astype(np.float32), Tch.astype(np.float32), Act.astype(np.float32)
 
 # ---------------------------------------------------------------- NOTRE encodeur bébé GELÉ (phase 1 -> phase 2)
+_ENC = {}
 @torch.no_grad()
-def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64):
+def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64, quiet=False):
     """encodeur CIBLE (EMA) d'un instantané av_dev_long, appliqué FRAME PAR FRAME (aucune fuite du futur dans
     le latent du pas t, comme l'encodeur image de V-JEPA 2-AC) : 64 patches -> moyenne 2×2 = 4×4 tokens + le
     token audio de la frame -> (n, T, 17, d)."""
@@ -124,10 +136,13 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64):
     from av_dev import DevJEPA
     from av_dev_long import to_tokens, stereo, T as T0, H as H0
     nP = H0 // P; npf = nP * nP; nv = T0 * npf; da = 2 * 2 * NB; W = max(P * P * 3, da)
-    w0 = gen_world(2000, T0, H0, seed=0, a_sub=2, hum=a.hum); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T0, -1)
-    st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0     # mêmes stats que le pré-entraînement
-    m = DevJEPA(W, da, nv, T0, d, nl, nh, pred_layers).to(dev); enc = copy.deepcopy(m.enc)
-    enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); del m
+    if a.enc_ckpt not in _ENC:                  # chargé UNE fois (la planification ré-encode à chaque pas)
+        w0 = gen_world(2000, T0, H0, seed=0, a_sub=2, hum=a.hum, hum_mode=a.hum_mode); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T0, -1)
+        st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0     # mêmes stats que le pré-entraînement
+        m = DevJEPA(W, da, nv, T0, d, nl, nh, pred_layers).to(dev); enc = copy.deepcopy(m.enc)
+        enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); del m
+        _ENC[a.enc_ckpt] = (enc, st)
+    enc, st = _ENC[a.enc_ckpt]
     X = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)); A = torch.from_numpy(w["A"]); n = len(X); out = []
     for i in range(0, n, bs):
         tok = to_tokens(X[i:i + bs].to(dev), A[i:i + bs].to(dev), P, st); B = len(tok); zs = []
@@ -143,7 +158,7 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64):
                 F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), a.dev_pool).flatten(2).transpose(1, 2)   # (B, (8/pool)², d)
             zs.append(torch.cat([zv, z[:, npf:]], 1))
         out.append(torch.stack(zs, 1).half().cpu())
-    print(f"  encodeur bébé gelé ({a.enc_ckpt}) -> {tuple(out[0].shape[1:])} par séquence", flush=True)
+    if not quiet: print(f"  encodeur bébé gelé ({a.enc_ckpt}) -> {tuple(out[0].shape[1:])} par séquence", flush=True)
     return torch.cat(out)
 
 class ACPredictor(nn.Module):
@@ -225,10 +240,14 @@ def main():
     p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
+    p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : SON DE FROTTEMENT (silence à l'arrêt)")
+    p.add_argument("--fric", type=float, default=0.0, help="frottement de Coulomb (vitesse perdue / frame ; 0.004 ≈ s'arrête vite)")
+    p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")
+    p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
-    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum)
-    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum)
+    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
+    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
     cont = (wtr["WHO"] >= 0).any(1).mean()
     print(f"monde v3 : {a.n_train}+{a.n_test} séquences | {cont:.0%} avec poussée | poussées/séq "
           f"{(wtr['WHO'] >= 0).sum(1).mean():.1f} ({time.time() - t0:.0f}s)", flush=True)
@@ -331,7 +350,7 @@ def main():
     pf = pushed & first[..., None]; pr = pushed & retouch[..., None]
     print(f"lecteur de positions (vrais latents) : disques poussés {px(e_ceil, pushed):.2f} px (plafond) ; copie {px(e_copy, pushed):.2f} px", flush=True)
     dec = [("lecture vrai futur", e_ceil), ("copie", e_copy)]
-    rows = [("copie", copy_err)]
+    rows = [("copie", copy_err)]; trained = {}
     for mods in a.variants.split(","):
         torch.manual_seed(a.seed)
         CtrV, CteV = (torch.cat([Ctr, Mtr], -1), torch.cat([Cte, Mte], -1)) if "m" in mods else (Ctr, Cte)   # oracle -> token action
@@ -356,7 +375,7 @@ def main():
                 errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu()); preds.append(out["v"][:, :-1].half().cpu())
         rows.append((mods.upper(), torch.cat(errs).numpy()))
         e_dec, _ = disk_err(readout(torch.cat(preds))); dec.append((mods.upper(), e_dec)); del preds
-        rollouts[mods.upper()] = rollout(m, CteV)
+        rollouts[mods.upper()] = rollout(m, CteV); trained[mods] = m
         e = rows[-1][1]
         print(f"  {mods.upper():>4s} | erreur latents pas suivant : tous {e.mean():.4f} | poussée {e[push].mean():.4f} "
               f"| 1re poussée {e[first].mean():.4f} | disque déjà touché {e[retouch].mean():.4f}", flush=True)
@@ -384,6 +403,79 @@ def main():
               f"{100 * (1 - g['VAT'][first].mean() / g['VA'][first].mean()):+.1f} %")
     if "VA" in g and "V" in g:
         print(f"SON (VA vs V) sur poussée : {100 * (1 - g['VA'][push].mean() / g['V'][push].mean()):+.1f} %")
+    # ================= PLANIFICATION (System 2) : « amène un disque sur la cible » =================
+    # Le bébé IMAGINE les conséquences de séquences de gestes avec son modèle du monde (encodeur gelé +
+    # prédicteur conditionné par l'action), choisit la meilleure (CEM), joue le 1er geste, regarde, recommence.
+    # Coût = distance (lecteur de positions, instrument) d'un disque prédit à la cible. Comparé au hasard et à
+    # un ORACLE qui connaît l'état exact.
+    if a.plan > 0 and a.encoder == "dev":
+        H0 = 32; r_ = 0.12; vmax = 0.1; damp = 0.96; Ls = SPF // a.a_sub
+        yy, xx = (np.mgrid[0:H0, 0:H0].astype(np.float32) + 0.5) / H0
+        win = np.hanning(Ls).astype(np.float32); Wb = band_matrix(Ls); tt_all = np.arange(a.T * SPF) / SR
+        smu = {n_: torch.from_numpy(st[n_][0]).float().to(dev) for n_ in st}; ssd = {n_: torch.from_numpy(st[n_][1]).float().to(dev) for n_ in st}
+        c0 = a.ctx
+        def episode(ep, policy, m=None):
+            rng = np.random.default_rng(10_000 + ep); arng = np.random.default_rng(20_000 + ep)
+            cols = PAL[np.sort(rng.choice(len(PAL), 2, replace=False))]; me = np.exp(rng.uniform(np.log(1 / 3), np.log(3), 2)); mat = rng.integers(0, 3, 2)
+            P = np.zeros((2, 2), np.float32); P[0] = rng.uniform(r_, 1 - r_, 2)
+            for _ in range(100):
+                P[1] = rng.uniform(r_, 1 - r_, 2)
+                if np.linalg.norm(P[1] - P[0]) > 2.5 * r_: break
+            V = np.zeros((2, 2), np.float32)
+            for _ in range(100):
+                Hp = rng.uniform(R_HAND, 1 - R_HAND, 2).astype(np.float32); dd_ = np.linalg.norm(P - Hp, axis=1)
+                if np.all(dd_ > r_ + R_HAND + 0.05) and dd_.min() < 0.4: break
+            for _ in range(200):                                       # cible loin des deux disques
+                g = rng.uniform(r_ + 0.05, 1 - r_ - 0.05, 2).astype(np.float32)
+                if np.linalg.norm(P - g, axis=1).min() > 0.25: break
+            X = np.zeros((a.T, H0, H0, 3), np.float32); POS = np.zeros((a.T, 2, 2), np.float32); TOUCH = np.zeros((a.T, 4), np.float32)
+            WHO = -np.ones(a.T, np.int64); ACT = np.zeros((a.T, 2), np.float32); ev = []
+            X[0] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[0] = P; d0 = float(np.linalg.norm(P - g, axis=1).min())
+            def step(t, act):
+                nonlocal P, V, Hp
+                P, V, Hp = act_physics(P, V, Hp, act, me, r_, damp, t, ev, TOUCH[t], WHO, a.fric)
+                X[t] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[t] = P; ACT[t - 1] = act
+            for t in range(1, c0 + 1):                                  # contexte : le bébé gigote un peu
+                step(t, np.clip(rng.normal(0, 0.03, 2), -vmax, vmax).astype(np.float32))
+            for t in range(c0, a.T - 1):                               # choisir le geste t -> t+1
+                if policy == "hasard": act = rng.uniform(-vmax, vmax, 2).astype(np.float32)
+                elif policy == "oracle":                               # connaît l'état : se placer derrière le disque, pousser vers g
+                    kk = int(np.argmin(np.linalg.norm(P - g, axis=1))); u = (g - P[kk]) / (np.linalg.norm(g - P[kk]) + 1e-6)
+                    behind = P[kk] - u * (r_ + R_HAND + 0.01); d = behind - Hp
+                    tgt = P[kk] + u * 0.1 if np.linalg.norm(d) < 0.04 else behind
+                    d = tgt - Hp; act = (vmax * d / max(np.linalg.norm(d), vmax)).astype(np.float32)
+                else:                                                  # MPC dans l'IMAGINATION
+                    Pp = POS.copy(); Pp[t + 1:] = POS[t]
+                    extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
+                    Aud = render_audio(ev, mat, me, a.T, a.a_sub, arng, Wb, win, tt_all, 1, np.zeros(a.T, bool), extra)
+                    Z = encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
+                    Vn = ((Z.float() - vmu) / vsd).to(dev)
+                    An = (torch.from_numpy(Aud.reshape(1, a.T, -1)).float().to(dev) - smu["a"]) / ssd["a"]
+                    Tn = (torch.from_numpy(TOUCH.reshape(1, a.T, -1)).float().to(dev) - smu["t"]) / ssd["t"]
+                    An[:, t + 1:] = 0; Tn[:, t + 1:] = 0
+                    Hh = min(a.plan_h, a.T - 1 - t); mu_ = torch.zeros(Hh, 2, device=dev); sd_ = torch.full((Hh, 2), 0.06, device=dev)
+                    gt = torch.from_numpy(g).to(dev)
+                    for _ in range(a.plan_iters):
+                        cand = (mu_ + sd_ * torch.randn(a.plan_pop, Hh, 2, device=dev)).clamp(-vmax, vmax)
+                        Craw = torch.from_numpy(ACT).to(dev).expand(a.plan_pop, -1, -1).clone(); Craw[:, t:t + Hh] = cand
+                        Cn = (Craw - smu["c"]) / ssd["c"]
+                        Vb = Vn.expand(a.plan_pop, -1, -1, -1).clone(); Ab = An.expand(a.plan_pop, -1, -1); Tb = Tn.expand(a.plan_pop, -1, -1)
+                        with torch.no_grad():
+                            for h in range(1, Hh + 1):
+                                o, _ = m(Vb, Ab, Tb, Cn); Vb[:, t + h] = o["v"][:, t + h - 1]
+                            pos = ro(Vb[:, t + Hh])[:, :4].view(-1, 2, 2)
+                        cost = (pos - gt).norm(dim=-1).min(-1).values
+                        el = cand[cost.argsort()[:max(4, a.plan_pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
+                    act = mu_[0].cpu().numpy().astype(np.float32)
+                step(t + 1, act)
+            dfin = float(np.linalg.norm(P - g, axis=1).min())
+            return d0, dfin
+        print(f"\n===== PLANIFICATION : amener un disque sur une cible ({a.plan} épisodes, {a.T - 1 - c0} gestes, CEM {a.plan_pop}×{a.plan_iters}, horizon {a.plan_h}) =====", flush=True)
+        print(f"{'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
+        pols = [("hasard", None), ("oracle", None)] + [(f"MPC {mo.upper()}", trained[mo]) for mo in trained]
+        for name, mm in pols:
+            tp = time.time(); res = np.array([episode(e, "mpc" if mm is not None else name, mm) for e in range(a.plan)])
+            print(f"{name:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 1] < 0.06):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
 if __name__ == "__main__":
