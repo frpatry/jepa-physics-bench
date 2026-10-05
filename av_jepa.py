@@ -173,10 +173,16 @@ class AVEncoder(nn.Module):
     def forward(s, tok, idx):
         isa = idx >= s.nv
         e = torch.where(isa.unsqueeze(-1), s.ea(tok[..., :s.da]), s.ev(tok))
-        mask = None
-        if s.sep:                               # ENCODEURS SÉPARÉS (idée user « deux entrées ») : un patch ne voit que
-            mask = (isa.unsqueeze(2) != isa.unsqueeze(1)).repeat_interleave(s.nh, 0)   # l'image, un token audio que le son ;
-        return s.ln(s.tr(e + s.mod(isa.long()) + s.pos(idx), mask=mask))              # la fusion = le PRÉDICTEUR
+        x = e + s.mod(isa.long()) + s.pos(idx)
+        if s.sep:                               # ENCODEURS SÉPARÉS (idée user « deux entrées ») : un patch ne voit que l'image,
+            kv = int((~isa[0]).sum())           # un token audio que le son ; la fusion = le PRÉDICTEUR. Indices triés -> vision
+            if bool(((~isa).sum(1) == kv).all()) and bool((~isa[:, :kv]).all()):     # puis audio, même nombre par ligne :
+                parts = [s.tr(x[:, :kv])] if kv > 0 else []                           # deux passes (attention RAPIDE)
+                if kv < x.size(1): parts.append(s.tr(x[:, kv:]))
+                return s.ln(torch.cat(parts, 1))
+            mask = (isa.unsqueeze(2) != isa.unsqueeze(1)).repeat_interleave(s.nh, 0)   # cas général : masque (lent)
+            return s.ln(s.tr(x, mask=mask))
+        return s.ln(s.tr(x))
 
 class AVJEPA(nn.Module):
     def __init__(s, dv, da, nv, T, d, nl, nh, pred_layers, sig_on="token"):
