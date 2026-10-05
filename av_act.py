@@ -243,6 +243,9 @@ def main():
     p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : SON DE FROTTEMENT (silence à l'arrêt)")
     p.add_argument("--fric", type=float, default=0.0, help="frottement de Coulomb (vitesse perdue / frame ; 0.004 ≈ s'arrête vite)")
     p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")
+    p.add_argument("--plan_c", type=int, default=3, help="frames de contexte avant de planifier")
+    p.add_argument("--plan_dmin", type=float, default=0.12); p.add_argument("--plan_dmax", type=float, default=0.22)
+    p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -356,7 +359,10 @@ def main():
         CtrV, CteV = (torch.cat([Ctr, Mtr], -1), torch.cat([Cte, Mte], -1)) if "m" in mods else (Ctr, Cte)   # oracle -> token action
         m = ACPredictor(k, Tt, dv, Atr.size(-1), Ttr.size(-1), CtrV.size(-1), a.d, a.nl, a.nh, mods, bool(a.residual)).to(dev)
         opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05); tt0 = time.time()
-        for it in range(1, a.steps + 1):
+        pc = f"{a.pred_cache}_{mods}.pt" if a.pred_cache else ""
+        if pc and os.path.exists(pc):                                   # prédicteur déjà entraîné (même encodeur, même monde)
+            m.load_state_dict(torch.load(pc, map_location=dev)); print(f"  [{mods}] prédicteur rechargé {pc}", flush=True)
+        for it in range(1, (0 if pc and os.path.exists(pc) else a.steps) + 1):
             bi = torch.randint(0, len(Vtr), (a.bs,))
             V, A_, T_, C_ = Vtr[bi].to(dev).float(), Atr[bi].to(dev), Ttr[bi].to(dev), CtrV[bi].to(dev)
             if a.sens_drop > 0:                                         # suffixe sans son/toucher (= futur imaginé)
@@ -367,6 +373,7 @@ def main():
             out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets, a.chg_w)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
+        if pc and not os.path.exists(pc): torch.save(m.state_dict(), pc)
         m.eval(); errs = []; preds = []
         with torch.no_grad():
             for i in range(0, n_te, a.eval_bs):
@@ -422,12 +429,13 @@ def main():
                 P[1] = rng.uniform(r_, 1 - r_, 2)
                 if np.linalg.norm(P[1] - P[0]) > 2.5 * r_: break
             V = np.zeros((2, 2), np.float32)
-            for _ in range(100):
+            kt = rng.integers(2)                                        # disque à amener ; la main démarre PRÈS de lui
+            for _ in range(200):
                 Hp = rng.uniform(R_HAND, 1 - R_HAND, 2).astype(np.float32); dd_ = np.linalg.norm(P - Hp, axis=1)
-                if np.all(dd_ > r_ + R_HAND + 0.05) and dd_.min() < 0.4: break
-            for _ in range(200):                                       # cible loin des deux disques
-                g = rng.uniform(r_ + 0.05, 1 - r_ - 0.05, 2).astype(np.float32)
-                if np.linalg.norm(P - g, axis=1).min() > 0.25: break
+                if np.all(dd_ > r_ + R_HAND + 0.03) and dd_[kt] < 0.3: break
+            for _ in range(500):                                       # cible à portée (0.12–0.22) de ce disque, loin de l'autre
+                ang = rng.uniform(0, 2 * np.pi); g = (P[kt] + rng.uniform(a.plan_dmin, a.plan_dmax) * np.array([np.cos(ang), np.sin(ang)])).astype(np.float32)
+                if np.all((g > r_ + 0.02) & (g < 1 - r_ - 0.02)) and np.linalg.norm(P[1 - kt] - g) > 0.25: break
             X = np.zeros((a.T, H0, H0, 3), np.float32); POS = np.zeros((a.T, 2, 2), np.float32); TOUCH = np.zeros((a.T, 4), np.float32)
             WHO = -np.ones(a.T, np.int64); ACT = np.zeros((a.T, 2), np.float32); ev = []
             X[0] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[0] = P; d0 = float(np.linalg.norm(P - g, axis=1).min())
@@ -435,15 +443,20 @@ def main():
                 nonlocal P, V, Hp
                 P, V, Hp = act_physics(P, V, Hp, act, me, r_, damp, t, ev, TOUCH[t], WHO, a.fric)
                 X[t] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[t] = P; ACT[t - 1] = act
-            for t in range(1, c0 + 1):                                  # contexte : le bébé gigote un peu
+            for t in range(1, a.plan_c + 1):                            # contexte : le bébé gigote un peu
                 step(t, np.clip(rng.normal(0, 0.03, 2), -vmax, vmax).astype(np.float32))
-            for t in range(c0, a.T - 1):                               # choisir le geste t -> t+1
+            for t in range(a.plan_c, a.T - 1):                         # choisir le geste t -> t+1
                 if policy == "hasard": act = rng.uniform(-vmax, vmax, 2).astype(np.float32)
-                elif policy == "oracle":                               # connaît l'état : se placer derrière le disque, pousser vers g
-                    kk = int(np.argmin(np.linalg.norm(P - g, axis=1))); u = (g - P[kk]) / (np.linalg.norm(g - P[kk]) + 1e-6)
-                    behind = P[kk] - u * (r_ + R_HAND + 0.01); d = behind - Hp
-                    tgt = P[kk] + u * 0.1 if np.linalg.norm(d) < 0.04 else behind
-                    d = tgt - Hp; act = (vmax * d / max(np.linalg.norm(d), vmax)).astype(np.float32)
+                elif policy == "oracle":                               # connaît l'état : CONTOURNE le disque, se place derrière, pousse doucement
+                    kk = kt; dg = g - P[kk]; u = dg / (np.linalg.norm(dg) + 1e-6); perp = np.array([-u[1], u[0]])
+                    behind = P[kk] - u * (r_ + R_HAND + 0.02); rel = Hp - P[kk]
+                    if np.linalg.norm(Hp - behind) < 0.03:              # en place : pousser vers la cible (vitesse ∝ distance restante)
+                        tgt = Hp + u; spd = min(vmax, 0.6 * np.linalg.norm(dg))
+                    elif rel @ u > -(r_ + R_HAND) * 0.5:                # devant ou à côté : passer par un point latéral
+                        side = perp if rel @ perp > 0 else -perp; tgt = P[kk] + side * (r_ + R_HAND + 0.06) - u * 0.05; spd = vmax
+                    else: tgt, spd = behind, vmax
+                    d = tgt - Hp; act = (spd * d / max(np.linalg.norm(d), 1e-6)).astype(np.float32)
+                    act = np.clip(act, -vmax, vmax)
                 else:                                                  # MPC dans l'IMAGINATION
                     Pp = POS.copy(); Pp[t + 1:] = POS[t]
                     extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
@@ -470,7 +483,7 @@ def main():
                 step(t + 1, act)
             dfin = float(np.linalg.norm(P - g, axis=1).min())
             return d0, dfin
-        print(f"\n===== PLANIFICATION : amener un disque sur une cible ({a.plan} épisodes, {a.T - 1 - c0} gestes, CEM {a.plan_pop}×{a.plan_iters}, horizon {a.plan_h}) =====", flush=True)
+        print(f"\n===== PLANIFICATION : amener un disque sur une cible à {a.plan_dmin}–{a.plan_dmax} ({a.plan} épisodes, {a.T - 1 - a.plan_c} gestes, CEM {a.plan_pop}×{a.plan_iters}, horizon {a.plan_h}) =====", flush=True)
         print(f"{'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
         pols = [("hasard", None), ("oracle", None)] + [(f"MPC {mo.upper()}", trained[mo]) for mo in trained]
         for name, mm in pols:
