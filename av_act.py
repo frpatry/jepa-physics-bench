@@ -28,6 +28,7 @@ from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio, hum_signal
 from av_vjepa2 import encode_vjepa2
 
 M_HAND, R_HAND = 1.0, 0.07
+SWAP = [2, 3, 0, 1, 4, 5]                                               # échange disque 0 <-> disque 1 (main inchangée)
 
 def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0):
     rng = np.random.default_rng(seed); Ls = SPF // a_sub
@@ -211,6 +212,7 @@ def main():
     p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
     p.add_argument("--eval_bs", type=int, default=64)
+    p.add_argument("--perm_ro", type=int, default=1, help="lecteur de positions invariant à l'ordre des 2 disques (sinon il doit deviner « qui est le disque 0 » par la couleur)")
     p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
@@ -269,15 +271,21 @@ def main():
     ro = PosReadout(dv).to(dev); opt = torch.optim.AdamW(ro.parameters(), 1e-3, weight_decay=1e-2)
     for it in range(a.ro_steps):
         bi = torch.randint(0, len(Vtr), (128,)); sj = torch.randint(0, Tt, (128,))
-        loss = F.mse_loss(ro(Vtr[bi, sj].to(dev).float()), Ptr[bi, sj].to(dev)); opt.zero_grad(); loss.backward(); opt.step()
+        pr_, y_ = ro(Vtr[bi, sj].to(dev).float()), Ptr[bi, sj].to(dev)
+        loss = F.mse_loss(pr_, y_) if not a.perm_ro else torch.minimum(((pr_ - y_) ** 2).mean(-1), ((pr_[:, SWAP] - y_) ** 2).mean(-1)).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
     ro.eval()
     def readout(Vs):                                                   # (n, S, k, dv) -> (n, S, 6)
         with torch.no_grad():
             return torch.cat([ro(Vs[i:i + 512].flatten(0, 1).to(dev).float()).cpu().view(-1, Vs.size(1), 6)
                               for i in range(0, len(Vs), 512)])
     true_next = Pte[:, 1:]                                             # (n, Tt-1, 6)
+    def align(pred, true):                                             # lecteur INVARIANT à l'ordre des disques : meilleure attribution
+        if not a.perm_ro: return pred
+        sw = pred[..., SWAP]; better = ((sw - true)[..., :4] ** 2).sum(-1) < ((pred - true)[..., :4] ** 2).sum(-1)
+        return torch.where(better[..., None], sw, pred)
     def disk_err(pred):                                                # erreur px des disques POUSSÉS au pas s+1
-        e = (pred[..., :4] - true_next[..., :4]).view(n_te, Tt - 1, 2, 2).norm(dim=-1) * 32   # (n, Tt-1, 2)
+        e = (align(pred, true_next)[..., :4] - true_next[..., :4]).view(n_te, Tt - 1, 2, 2).norm(dim=-1) * 32   # (n, Tt-1, 2)
         pushed = np.zeros((n_te, Tt - 1, 2), bool)
         for i in range(n_te):
             for s_ in range(Tt - 1):
@@ -302,7 +310,7 @@ def main():
         return readout(torch.cat(out_all))                              # (n, H, 6)
     tr_fut = Pte[:, c + 1:]                                             # vraies positions futures (n, H, 6)
     def roll_err(pred):                                                 # (n, H, 2) px par disque
-        return ((pred[..., :4] - tr_fut[..., :4]).view(n_te, H, 2, 2).norm(dim=-1) * 32).numpy()
+        return ((align(pred, tr_fut)[..., :4] - tr_fut[..., :4]).view(n_te, H, 2, 2).norm(dim=-1) * 32).numpy()
     lm_te = wte["LM"]; touched = np.zeros((n_te, 2), bool); pushed_fut = np.zeros((n_te, 2), bool)
     for i in range(n_te):
         for x in who[i, :f * (c + 1)]:
