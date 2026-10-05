@@ -210,6 +210,7 @@ def main():
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
     p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
+    p.add_argument("--eval_bs", type=int, default=64)
     p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
@@ -292,8 +293,8 @@ def main():
     def rollout(m, C):
         out_all = []
         with torch.no_grad():
-            for i in range(0, n_te, 256):
-                sl = slice(i, i + 256); V = Vte[sl].to(dev).float().clone()
+            for i in range(0, n_te, a.eval_bs):
+                sl = slice(i, i + a.eval_bs); V = Vte[sl].to(dev).float().clone()
                 A_, T_ = Ate[sl].to(dev).clone(), Tte_[sl].to(dev).clone(); A_[:, c + 1:] = 0; T_[:, c + 1:] = 0
                 for h in range(1, H + 1):
                     o, _ = m(V, A_, T_, C[sl].to(dev)); V[:, c + h] = o["v"][:, c + h - 1]
@@ -332,8 +333,8 @@ def main():
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
         m.eval(); errs = []; preds = []
         with torch.no_grad():
-            for i in range(0, n_te, 256):
-                sl = slice(i, i + 256); V = Vte[sl].to(dev).float()
+            for i in range(0, n_te, a.eval_bs):
+                sl = slice(i, i + a.eval_bs); V = Vte[sl].to(dev).float()
                 out, _ = m(V, Ate[sl].to(dev), Tte_[sl].to(dev), CteV[sl].to(dev))
                 errs.append((out["v"][:, :-1] - V[:, 1:]).abs().mean((2, 3)).cpu()); preds.append(out["v"][:, :-1].half().cpu())
         rows.append((mods.upper(), torch.cat(errs).numpy()))
