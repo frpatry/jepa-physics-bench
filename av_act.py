@@ -131,8 +131,13 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64):
     for i in range(0, n, bs):
         tok = to_tokens(X[i:i + bs].to(dev), A[i:i + bs].to(dev), P, st); B = len(tok); zs = []
         for t in range(T0):
-            idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
-            z = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)       # (B, 65, d)
+            if a.dev_ctx == "causal":           # PASSÉ seulement : frames 0..t (comme à l'entraînement, des frames visibles), jamais le futur
+                idx = torch.cat([torch.arange((t + 1) * npf), nv + torch.arange(t + 1)]).to(dev).expand(B, -1)
+                zz = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)
+                z = torch.cat([zz[:, t * npf:(t + 1) * npf], zz[:, -1:]], 1)                         # tokens de la frame t
+            else:                               # frame seule
+                idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
+                z = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)   # (B, 65, d)
             zv = z[:, :npf] if a.dev_pool == 1 else \
                 F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), a.dev_pool).flatten(2).transpose(1, 2)   # (B, (8/pool)², d)
             zs.append(torch.cat([zv, z[:, npf:]], 1))
@@ -205,6 +210,7 @@ def main():
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
     p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
+    p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
