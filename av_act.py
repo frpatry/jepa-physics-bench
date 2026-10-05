@@ -172,10 +172,18 @@ class ACPredictor(nn.Module):
         if "t" in s.mods: out["t"] = s.ht(h[:, :, j])
         return out, h
 
-def loss_fn(out, V, A, Tch, targets="v"):
+def loss_fn(out, V, A, Tch, targets="v", chg_w=0.0):
     """targets 'v' : toutes les variantes prédisent la MÊME cible (latents visuels) -> comparaison
-    équitable (son/toucher = entrées seulement) ; 'own' : chaque variante prédit aussi ses modalités."""
-    l = F.smooth_l1_loss(out["v"][:, :-1], V[:, 1:])
+    équitable (son/toucher = entrées seulement) ; 'own' : chaque variante prédit aussi ses modalités.
+    chg_w > 0 : ATTENTION À CE QUI BOUGE (auto-supervisé, 0 étiquette) — l'erreur de chaque token est pondérée
+    par 1 + chg_w × (changement de son latent t -> t+1, normalisé) : les quelques tokens du disque poussé
+    ne sont plus noyés dans le décor immobile."""
+    e = F.smooth_l1_loss(out["v"][:, :-1], V[:, 1:], reduction="none").mean(-1)          # (B, Tt-1, k)
+    if chg_w > 0:
+        with torch.no_grad():
+            c = (V[:, 1:] - V[:, :-1]).abs().mean(-1); w = 1 + chg_w * c / (c.mean() + 1e-6)
+        l = (e * w).sum() / w.sum()
+    else: l = e.mean()
     if targets == "own":
         if "a" in out: l = l + F.smooth_l1_loss(out["a"][:, :-1], A[:, 1:])
         if "t" in out: l = l + F.smooth_l1_loss(out["t"][:, :-1], Tch[:, 1:])
@@ -212,6 +220,7 @@ def main():
     p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
     p.add_argument("--eval_bs", type=int, default=64)
+    p.add_argument("--chg_w", type=float, default=0.0, help="poids de l'attention au changement (0 = perte uniforme)")
     p.add_argument("--perm_ro", type=int, default=1, help="lecteur de positions invariant à l'ordre des 2 disques (sinon il doit deviner « qui est le disque 0 » par la couleur)")
     p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
@@ -336,7 +345,7 @@ def main():
                 keep = (torch.arange(Tt, device=dev)[None] < cut) | (torch.rand(a.bs, 1, device=dev) > a.sens_drop)
                 A_in, T_in = A_ * keep[..., None], T_ * keep[..., None]
             else: A_in, T_in = A_, T_
-            out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets)
+            out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets, a.chg_w)
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
         m.eval(); errs = []; preds = []
