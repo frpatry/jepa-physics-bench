@@ -19,15 +19,17 @@ Variantes (mêmes données/pas) : V+action | V+son+action | V+son+TOUCHER+action
   avoir senti le disque doit aider à prédire comment il réagira à la prochaine poussée).
 
   python av_act.py --n_train 6000 --n_test 2000      # Colab (encode V-JEPA 2 une fois, caches /content)
+  python av_act.py --encoder dev --hum 0.15 --ctx 5   # PHASE 2 SUR NOTRE BÉBÉ : encodeur v4 GELÉ au meilleur moment
+                                                     # (pas 20k, surprise 87 %), monde v3 + bourdonnement, pas = 1 frame
 """
 import argparse, math, os, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
-from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio
+from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio, hum_signal
 from av_vjepa2 import encode_vjepa2
 
 M_HAND, R_HAND = 1.0, 0.07
 
-def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96):
+def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0):
     rng = np.random.default_rng(seed); Ls = SPF // a_sub
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -96,18 +98,46 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
             hx = np.clip((R_HAND * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
             img = img * (1 - hx) + hx                                   # main = carré blanc
             X[i, t] = img; POS[i, t] = P; HAND[i, t] = Hp
-        A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i])
+        extra = hum_signal(POS[i], MAT[i], m, T, hum, pitch_mass) if hum > 0 else None   # monde v4 : chaque disque bourdonne
+        A[i] = render_audio(ev, MAT[i], m, T, a_sub, rng, W, win, tt_all, pitch_mass, IMP[i], extra)
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, POS=POS, HAND=HAND, ACT=ACT, TOUCH=TOUCH, WHO=WHO, COL=COL)
 
 # ---------------------------------------------------------------- tokens par pas V-JEPA 2 (2 frames)
 def step_inputs(w, Tt):
     """audio (n,Tt,2*a_sub*2*NB), toucher (n,Tt,8), action (n,Tt,4) alignés sur les pas V-JEPA 2.
     action du pas s = transitions 2s+1 -> 2s+2 et 2s+2 -> 2s+3 (ce qui mène au pas s+1)."""
-    n, T = w["ACT"].shape[:2]
+    n, T = w["ACT"].shape[:2]; f = T // Tt                             # frames par pas (2 : V-JEPA 2 ; 1 : notre encodeur)
     A = w["A"].reshape(n, Tt, -1); Tch = w["TOUCH"].reshape(n, Tt, -1)
-    act = np.concatenate([w["ACT"], np.zeros((n, 2, 2), np.float32)], 1)       # ACT[t] : t -> t+1
-    Act = np.stack([np.concatenate([act[:, 2 * s + 1], act[:, 2 * s + 2]], -1) for s in range(Tt)], 1)
+    act = np.concatenate([w["ACT"], np.zeros((n, f, 2), np.float32)], 1)       # ACT[t] : t -> t+1
+    Act = np.stack([np.concatenate([act[:, f * s + f - 1 + j] for j in range(f)], -1) for s in range(Tt)], 1)
     return A.astype(np.float32), Tch.astype(np.float32), Act.astype(np.float32)
+
+# ---------------------------------------------------------------- NOTRE encodeur bébé GELÉ (phase 1 -> phase 2)
+@torch.no_grad()
+def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=128):
+    """encodeur CIBLE (EMA) d'un instantané av_dev_long, appliqué FRAME PAR FRAME (aucune fuite du futur dans
+    le latent du pas t, comme l'encodeur image de V-JEPA 2-AC) : 64 patches -> moyenne 2×2 = 4×4 tokens + le
+    token audio de la frame -> (n, T, 17, d)."""
+    import copy
+    from av_jepa import gen_world
+    from av_dev import DevJEPA
+    from av_dev_long import to_tokens, stereo, T as T0, H as H0
+    nP = H0 // P; npf = nP * nP; nv = T0 * npf; da = 2 * 2 * NB; W = max(P * P * 3, da)
+    w0 = gen_world(2000, T0, H0, seed=0, a_sub=2, hum=a.hum); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T0, -1)
+    st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0     # mêmes stats que le pré-entraînement
+    m = DevJEPA(W, da, nv, T0, d, nl, nh, pred_layers).to(dev); enc = copy.deepcopy(m.enc)
+    enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); del m
+    X = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)); A = torch.from_numpy(w["A"]); n = len(X); out = []
+    for i in range(0, n, bs):
+        tok = to_tokens(X[i:i + bs].to(dev), A[i:i + bs].to(dev), P, st); B = len(tok); zs = []
+        for t in range(T0):
+            idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
+            z = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)       # (B, 65, d)
+            zv = F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), 2).flatten(2).transpose(1, 2)   # (B, 16, d)
+            zs.append(torch.cat([zv, z[:, npf:]], 1))
+        out.append(torch.stack(zs, 1).half().cpu())
+    print(f"  encodeur bébé gelé ({a.enc_ckpt}) -> {tuple(out[0].shape[1:])} par séquence", flush=True)
+    return torch.cat(out)
 
 class ACPredictor(nn.Module):
     """bloc-causal : les tokens du pas s voient les pas ≤ s ; ils prédisent le pas s+1."""
@@ -149,7 +179,7 @@ class PosReadout(nn.Module):
     latents, puis appliqué aux latents PRÉDITS : erreur en pixels = espace décodé « certifié »."""
     def __init__(s, dv, d=256):
         super().__init__()
-        s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 16, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 32, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         s.att = nn.MultiheadAttention(d, 4, batch_first=True); s.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 256), nn.GELU(), nn.Linear(256, 6))
     def forward(s, v):                                                  # v (B, k, dv)
         h = s.proj(v) + s.pos[:, :v.size(1)]
@@ -172,10 +202,13 @@ def main():
     p.add_argument("--ctx", type=int, default=3, help="dernier pas de contexte observé avant le rollout")
     p.add_argument("--sens_drop", type=float, default=0.5, help="p de couper son/toucher sur un suffixe (entraînement)")
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
+    p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
+    p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
+    p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
-    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub)
-    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub)
+    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum)
+    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum)
     cont = (wtr["WHO"] >= 0).any(1).mean()
     print(f"monde v3 : {a.n_train}+{a.n_test} séquences | {cont:.0%} avec poussée | poussées/séq "
           f"{(wtr['WHO'] >= 0).sum(1).mean():.1f} ({time.time() - t0:.0f}s)", flush=True)
@@ -191,9 +224,10 @@ def main():
         if os.path.exists(path):
             Z = torch.load(path)["Z"]
             if len(Z) == len(w["X"]): print(f"  cache {path}", flush=True); return Z
-        Z = encode_vjepa2(w["X"], a, dev); torch.save(dict(Z=Z), path); return Z
+        Z = encode_vjepa2(w["X"], a, dev) if a.encoder == "vjepa2" else encode_dev(w, a, dev)
+        torch.save(dict(Z=Z), path); return Z
     Ztr, Zte = feats(a.train_cache, wtr), feats(a.test_cache, wte)
-    Tt, k, dv = Ztr.shape[1], Ztr.shape[2], Ztr.shape[3]
+    Tt, k, dv = Ztr.shape[1], Ztr.shape[2], Ztr.shape[3]; f = a.T // Tt   # frames par pas
     vmu, vsd = Ztr[:2000].float().mean((0, 1, 2)), Ztr[:2000].float().std((0, 1, 2)) + 1e-4
     Vtr = ((Ztr.float() - vmu) / vsd).half(); Vte = ((Zte.float() - vmu) / vsd).half(); del Ztr, Zte
     Atr, Ttr, Ctr = step_inputs(wtr, Tt); Ate, Tte_, Cte = step_inputs(wte, Tt)
@@ -209,18 +243,18 @@ def main():
     push = np.zeros((n_te, Tt - 1), bool); retouch = np.zeros((n_te, Tt - 1), bool)
     for i in range(n_te):
         for s_ in range(Tt - 1):
-            ks = {int(x) for x in who[i, 2 * s_ + 2:2 * s_ + 4] if x >= 0}
+            ks = {int(x) for x in who[i, f * (s_ + 1):f * (s_ + 2)] if x >= 0}
             if ks:
                 push[i, s_] = True
-                before = {int(x) for x in who[i, :2 * s_ + 2] if x >= 0}
+                before = {int(x) for x in who[i, :f * (s_ + 1)] if x >= 0}
                 retouch[i, s_] = bool(ks & before)
     first = push & ~retouch
     copy_err = (Vte[:, :-1].float() - Vte[:, 1:].float()).abs().mean((2, 3)).numpy()      # (n, Tt-1)
     print(f"tokens : {Tt} pas × ({k} visuels + son + toucher + action) | pas avec poussée {push.mean():.0%} "
           f"(1re fois {first.mean():.0%}, disque déjà touché {retouch.mean():.0%})", flush=True)
     # --- lecteur de positions (vrais latents) -> métrique décodée en pixels
-    def pos_target(w):                                                  # état en fin de pas s (frame 2s+1)
-        P = w["POS"][:, 1::2].reshape(len(w["POS"]), Tt, 4); Hh = w["HAND"][:, 1::2]
+    def pos_target(w):                                                  # état en fin de pas s (dernière frame du pas)
+        P = w["POS"][:, f - 1::f].reshape(len(w["POS"]), Tt, 4); Hh = w["HAND"][:, f - 1::f]
         return torch.from_numpy(np.concatenate([P, Hh], -1))           # (n, Tt, 6)
     Ptr, Pte = pos_target(wtr), pos_target(wte); torch.manual_seed(0)
     ro = PosReadout(dv).to(dev); opt = torch.optim.AdamW(ro.parameters(), 1e-3, weight_decay=1e-2)
@@ -238,7 +272,7 @@ def main():
         pushed = np.zeros((n_te, Tt - 1, 2), bool)
         for i in range(n_te):
             for s_ in range(Tt - 1):
-                for x in who[i, 2 * s_ + 2:2 * s_ + 4]:
+                for x in who[i, f * (s_ + 1):f * (s_ + 2)]:
                     if x >= 0: pushed[i, s_, x] = True
         return e.numpy(), pushed
     ceil = readout(Vte[:, 1:]); e_ceil, pushed = disk_err(ceil)
@@ -262,9 +296,9 @@ def main():
         return ((pred[..., :4] - tr_fut[..., :4]).view(n_te, H, 2, 2).norm(dim=-1) * 32).numpy()
     lm_te = wte["LM"]; touched = np.zeros((n_te, 2), bool); pushed_fut = np.zeros((n_te, 2), bool)
     for i in range(n_te):
-        for x in who[i, :2 * c + 2]:
+        for x in who[i, :f * (c + 1)]:
             if x >= 0: touched[i, x] = True                             # senti PENDANT le contexte
-        for x in who[i, 2 * c + 2:]:
+        for x in who[i, f * (c + 1):]:
             if x >= 0: pushed_fut[i, x] = True                          # poussé pendant le futur imaginé
     extreme = np.abs(lm_te) > 0.7                                       # masse < 0.5 ou > 2
     rollouts = {"copie": readout(Vte[:, c:c + 1].expand(-1, H, -1, -1).contiguous()), "vrai futur": readout(Vte[:, c + 1:])}
