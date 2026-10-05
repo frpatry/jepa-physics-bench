@@ -115,6 +115,7 @@ def main():
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
     p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
     p.add_argument("--sig_w", type=float, default=0.0, help="ANTI-EFFONDREMENT : poids SIGReg (LeJEPA) sur le résumé par scène de l'encodeur en ligne")
+    p.add_argument("--ema_const", action="store_true", help="momentum EMA constant (au lieu de 0.996 -> 1 en cosinus)")
     p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
@@ -171,7 +172,7 @@ def main():
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
             loss = pred_loss + a.sig_w * sr
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
-        mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
+        mom = a.ema if a.ema_const else 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2   # const : la cible ne se FIGE pas en fin de run
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
         ma = pred_loss.item() if ma is None else 0.995 * ma + 0.005 * pred_loss.item()
