@@ -64,7 +64,9 @@ def build_probe(a, dev, st):
     lab = (torch.arange(a.n_probe) % 2).long(); Asw = A.clone(); Asw[lab == 1] = A[lab == 1][:, :, [1, 0, 3, 2]]
     mk = lambda A_: torch.cat([to_tokens(X[i:i + 250].to(dev), A_[i:i + 250].to(dev), a.P, st).half().cpu()
                                for i in range(0, a.n_probe, 250)])
-    return dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab,
+    P2 = w["POS"]; o_ = np.argsort(P2[..., 0], axis=-1)                        # disques indiscernables : gauche puis droite
+    pos = torch.from_numpy(np.take_along_axis(P2, o_[..., None], axis=2).reshape(len(P2), T, 4)).float()
+    return dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab, pos=pos,
                 antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
 
 @torch.no_grad()
@@ -85,6 +87,28 @@ def surprise(pred, enc_c, tgt, tok, toksw, imp, nv, dev, bs=64):
     choc = float(((es * w_).sum(1)[k] > (ec * w_).sum(1)[k]).float().mean())
     return tout, choc
 
+class _PosReader(torch.nn.Module):
+    def __init__(s, d, ntok, h=128):
+        super().__init__()
+        s.emb = torch.nn.Linear(d, h); s.pos = torch.nn.Parameter(torch.zeros(1, ntok, h)); s.cls = torch.nn.Parameter(torch.zeros(1, 1, h))
+        s.tr = torch.nn.TransformerEncoder(torch.nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.1), 2); s.out = torch.nn.Linear(h, 4)
+    def forward(s, x):
+        return s.out(s.tr(torch.cat([s.cls.expand(len(x), -1, -1), s.emb(x) + s.pos], 1))[:, 0])
+
+def loc_r2(m, probe, nv, dev, steps, n=1500):
+    """LA VISION SAIT-ELLE OÙ SONT LES DISQUES ? encodeur cible sur la séquence complète, tokens visuels d'une
+    frame -> positions (triées) des 2 disques ; R² sur 30 % tenus à l'écart (instrument, comme diag (a))."""
+    Z = represent(m, probe["tok"][:n], np.ones(probe["tok"].size(1), bool), dev)[:, :nv]
+    npf = nv // T; Z = Z.reshape(n, T, npf, -1).flatten(0, 1); y = probe["pos"][:n].flatten(0, 1)
+    k = int(0.7 * len(Z)); mu, sd = y[:k].mean(0), y[:k].std(0) + 1e-6
+    torch.manual_seed(0); r = _PosReader(Z.size(-1), npf).to(dev); opt = torch.optim.AdamW(r.parameters(), 3e-4, weight_decay=0.05)
+    for _ in range(steps):
+        bi = torch.randint(0, k, (256,)); l = F.mse_loss(r(Z[bi].to(dev).float()), ((y[bi] - mu) / sd).to(dev))
+        opt.zero_grad(); l.backward(); opt.step()
+    r.eval()
+    with torch.no_grad(): p = torch.cat([r(Z[i:i + 512].to(dev).float()).cpu() for i in range(k, len(Z), 512)]) * sd + mu
+    yt = y[k:]; return float(1 - ((p - yt) ** 2).sum() / ((yt - yt.mean(0)) ** 2).sum())
+
 def exam(m, probe, a, dev, nv, tag):
     N = nv + T; npf = nv // T; frame = np.concatenate([np.arange(nv) // npf, np.arange(T)])
     nte = min(1000, a.n_probe // 3); te = slice(a.n_probe - nte, a.n_probe); res = {}
@@ -99,6 +123,7 @@ def exam(m, probe, a, dev, nv, tag):
         res["surprise"], res["surprise_choc"] = surprise(m.pred, m.enc_c, m.enc, probe["tok"], probe["swall"], probe["imp"], nv, dev)
         msg = f" | SURPRISE stéréo inversée {res['surprise']:.0%} (chocs {res['surprise_choc']:.0%}, 0 étiq.)"
     msg += f" | écart-type latents {res['ecart']:.3f}"
+    res["pos_r2"] = loc_r2(m, probe, nv, dev, a.read_steps); msg += f" | VISION positions R² {res['pos_r2']:+.2f}"
     print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}" + msg, flush=True)
     return res
 
@@ -115,6 +140,7 @@ def main():
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
     p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
     p.add_argument("--sig_w", type=float, default=0.0, help="ANTI-EFFONDREMENT : poids SIGReg (LeJEPA) sur le résumé par scène de l'encodeur en ligne")
+    p.add_argument("--big_mask", type=int, default=0, help="nb de tirages « grand bloc 5×5 » dans la loterie des masques (0 = recette d'origine)")
     p.add_argument("--ema_const", action="store_true", help="momentum EMA constant (au lieu de 0.996 -> 1 en cosinus)")
     p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
@@ -156,7 +182,7 @@ def main():
             lr_f *= 0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         X, A = next(data); o = to_tokens(X.to(dev, non_blocking=True), A.to(dev, non_blocking=True), a.P, st, sig)
-        present, pairs = masks("a" if stage == "A" else "va", a.bs, T, nP, nv, rng, a.n_masks)
+        present, pairs = masks("a" if stage == "A" else "va", a.bs, T, nP, nv, rng, a.n_masks, a.big_mask)
         B, N, _ = o.shape; pidx = _idx(torch.from_numpy(np.broadcast_to(present, (B, N)).copy()).to(dev))
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad(): z = F.layer_norm(tgt(_gather(o, pidx), pidx).float(), (a.d,))

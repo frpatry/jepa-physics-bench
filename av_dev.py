@@ -46,7 +46,7 @@ def to_tokens(X, A, P, amu, asd, sigma=0.0):
     return torch.cat([v, pad], 1)
 
 # ---------------------------------------------------------------- masques selon le stade
-def masks(stage, B, T, nP, nv, rng, n_masks):
+def masks(stage, B, T, nP, nv, rng, n_masks, big=0):
     """stage 'a' : son seul (blocs audio, futur audio) ; 'va' : vision + son (tube, bloc, futur,
     son-depuis-image, bloc audio). Retourne present (N,) et [(ctx (B,N), tgt (B,N))]."""
     npf = nP * nP; N = nv + T
@@ -54,10 +54,17 @@ def masks(stage, B, T, nP, nv, rng, n_masks):
     frame = np.concatenate([np.arange(nv) // npf, np.arange(T)])
     present = isa.copy() if stage == "a" else np.ones(N, bool)
     strat = ["ablock", "afuture"] if stage == "a" else ["tube", "vblock", "future", "a_from_v", "ablock"]
+    if big and stage != "a": strat = ["bigtube"] * big + strat[1:]      # GRANDS blocs (recette I-JEPA) à la place des petits tubes
     pairs = []
     for _ in range(n_masks):
         st = strat[rng.integers(len(strat))]; tg = np.zeros((B, N), bool)
         if st == "tube": tg[:, :nv] = tube_masks(B, T, nP, 0.5, 1, rng)[0].numpy()
+        elif st == "bigtube":                   # UN bloc contigu 5×5 (~40 % de l'image) masqué sur toutes les frames :
+            hb = min(5, nP - 1)                 # un disque peut y être entièrement caché -> il faut savoir OÙ il est
+            for b in range(B):                  # (par le mouvement, les autres frames... ou le SON qui le suit)
+                r0, c0 = rng.integers(0, nP - hb + 1), rng.integers(0, nP - hb + 1)
+                cells = np.zeros((nP, nP), bool); cells[r0:r0 + hb, c0:c0 + hb] = True
+                tg[b, :nv] = np.tile(cells.ravel(), T)
         elif st in ("vblock", "ablock"):
             for b in range(B):
                 t0 = rng.integers(0, T - 3 + 1); blk = (frame >= t0) & (frame < t0 + 3)
