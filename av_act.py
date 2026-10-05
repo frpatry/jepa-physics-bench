@@ -140,7 +140,7 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64, quiet=Fa
         w0 = gen_world(2000, T0, H0, seed=0, a_sub=2, hum=a.hum, hum_mode=a.hum_mode); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T0, -1)
         st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0     # mêmes stats que le pré-entraînement
         m = DevJEPA(W, da, nv, T0, d, nl, nh, pred_layers).to(dev); enc = copy.deepcopy(m.enc)
-        enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); del m
+        enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); enc.sep = bool(a.sep_enc); del m
         _ENC[a.enc_ckpt] = (enc, st)
     enc, st = _ENC[a.enc_ckpt]
     X = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)); A = torch.from_numpy(w["A"]); n = len(X); out = []
@@ -240,6 +240,7 @@ def main():
     p.add_argument("--dev_ctx", type=str, default="frame", choices=["frame", "causal"], help="encoder chaque frame seule, ou avec tout son PASSÉ")
     p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
+    p.add_argument("--sep_enc", type=int, default=0, help="l'encodeur gelé a été entraîné avec encodeurs séparés")
     p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : SON DE FROTTEMENT (silence à l'arrêt)")
     p.add_argument("--fric", type=float, default=0.0, help="frottement de Coulomb (vitesse perdue / frame ; 0.004 ≈ s'arrête vite)")
     p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")

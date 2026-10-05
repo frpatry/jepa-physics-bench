@@ -140,6 +140,7 @@ def main():
     p.add_argument("--n_probe", type=int, default=3000); p.add_argument("--read_steps", type=int, default=1500)
     p.add_argument("--ckpt", type=str, default="/content/av_dev_long.pt")
     p.add_argument("--sig_w", type=float, default=0.0, help="ANTI-EFFONDREMENT : poids SIGReg (LeJEPA) sur le résumé par scène de l'encodeur en ligne")
+    p.add_argument("--sep_enc", type=int, default=0, help="1 = encodeurs SÉPARÉS image / son (pas d'attention croisée dans l'encodeur)")
     p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : frottement (silence à l'arrêt)")
     p.add_argument("--big_mask", type=int, default=0, help="nb de tirages « grand bloc 5×5 » dans la loterie des masques (0 = recette d'origine)")
     p.add_argument("--ema_const", action="store_true", help="momentum EMA constant (au lieu de 0.996 -> 1 en cosinus)")
@@ -155,7 +156,7 @@ def main():
     print(f"GPU {torch.cuda.get_device_name(0) if dev == 'cuda' else 'cpu'} | {T} frames × {nP * nP} patches {a.P}×{a.P} + {T} audio "
           f"stéréo explicite | tokens {nv + T} × {W}", flush=True)
     probe = build_probe(a, dev, st)
-    torch.manual_seed(a.seed); m = DevJEPA(W, da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev)
+    torch.manual_seed(a.seed); m = DevJEPA(W, da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev); m.enc.sep = bool(a.sep_enc)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)

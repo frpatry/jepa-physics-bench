@@ -167,13 +167,16 @@ class AVEncoder(nn.Module):
     def __init__(s, dv, da, d, ntok, nv, nl, nh):
         super().__init__()
         s.ev, s.ea = nn.Linear(dv, d), nn.Linear(da, d); s.mod = nn.Embedding(2, d); s.pos = nn.Embedding(ntok, d)
-        s.nv, s.da = nv, da
+        s.nv, s.da, s.nh, s.sep = nv, da, nh, False
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
     def forward(s, tok, idx):
         isa = idx >= s.nv
         e = torch.where(isa.unsqueeze(-1), s.ea(tok[..., :s.da]), s.ev(tok))
-        return s.ln(s.tr(e + s.mod(isa.long()) + s.pos(idx)))
+        mask = None
+        if s.sep:                               # ENCODEURS SÉPARÉS (idée user « deux entrées ») : un patch ne voit que
+            mask = (isa.unsqueeze(2) != isa.unsqueeze(1)).repeat_interleave(s.nh, 0)   # l'image, un token audio que le son ;
+        return s.ln(s.tr(e + s.mod(isa.long()) + s.pos(idx), mask=mask))              # la fusion = le PRÉDICTEUR
 
 class AVJEPA(nn.Module):
     def __init__(s, dv, da, nv, T, d, nl, nh, pred_layers, sig_on="token"):
