@@ -29,8 +29,11 @@ def main():
         zv, za = Z[:, :nv], Z[:, nv:]
         sv, sa = zv.std(0).mean().item(), za.std(0).mean().item()      # entre scènes, par position et dimension
         nvn, nan_ = zv.norm(dim=-1).mean().item(), za.norm(dim=-1).mean().item()
+        # GLOBALISATION : part de la variance (centrée par position) commune à TOUS les patches d'une même frame
+        zc = (zv - zv.mean(0, keepdim=True)).reshape(len(zv), T, npf, -1)
+        shared = zc.mean(2).pow(2).sum(-1).mean().item() / zc.pow(2).sum(-1).mean().item()
         print(f"{(c or 'aléatoire').split('/')[-1]:>28s} | écart-type entre scènes : VISION {sv:.3f} | AUDIO {sa:.3f} | ratio V/A {sv / sa:.2f} "
-              f"| normes V {nvn:.1f} A {nan_:.1f}", flush=True)
+              f"| part COMMUNE aux patches d'une frame {shared:.0%} (0 % = chaque patch code son coin ; 100 % = tous codent la même chose)", flush=True)
 
 if __name__ == "__main__":
     main()
