@@ -114,7 +114,7 @@ def step_inputs(w, Tt):
 
 # ---------------------------------------------------------------- NOTRE encodeur bébé GELÉ (phase 1 -> phase 2)
 @torch.no_grad()
-def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=128):
+def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64):
     """encodeur CIBLE (EMA) d'un instantané av_dev_long, appliqué FRAME PAR FRAME (aucune fuite du futur dans
     le latent du pas t, comme l'encodeur image de V-JEPA 2-AC) : 64 patches -> moyenne 2×2 = 4×4 tokens + le
     token audio de la frame -> (n, T, 17, d)."""
@@ -133,7 +133,8 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=128):
         for t in range(T0):
             idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
             z = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)       # (B, 65, d)
-            zv = F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), 2).flatten(2).transpose(1, 2)   # (B, 16, d)
+            zv = z[:, :npf] if a.dev_pool == 1 else \
+                F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), a.dev_pool).flatten(2).transpose(1, 2)   # (B, (8/pool)², d)
             zs.append(torch.cat([zv, z[:, npf:]], 1))
         out.append(torch.stack(zs, 1).half().cpu())
     print(f"  encodeur bébé gelé ({a.enc_ckpt}) -> {tuple(out[0].shape[1:])} par séquence", flush=True)
@@ -179,7 +180,7 @@ class PosReadout(nn.Module):
     latents, puis appliqué aux latents PRÉDITS : erreur en pixels = espace décodé « certifié »."""
     def __init__(s, dv, d=256):
         super().__init__()
-        s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 32, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
+        s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 80, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         s.att = nn.MultiheadAttention(d, 4, batch_first=True); s.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 256), nn.GELU(), nn.Linear(256, 6))
     def forward(s, v):                                                  # v (B, k, dv)
         h = s.proj(v) + s.pos[:, :v.size(1)]
@@ -204,6 +205,7 @@ def main():
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
     p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
+    p.add_argument("--dev_pool", type=int, default=2, help="regroupement des 8×8 patches de notre encodeur (1 = aucun : position fine)")
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
