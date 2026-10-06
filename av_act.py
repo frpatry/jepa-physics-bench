@@ -251,6 +251,7 @@ def main():
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
+    p.add_argument("--diag", type=int, default=0, help="DIAGNOSTIC planif : nb d'épisodes ; sensibilité à l'action + classement imaginé vs réel des gestes candidats")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
     wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
@@ -422,12 +423,35 @@ def main():
               f"{100 * (1 - g['VAT'][first].mean() / g['VA'][first].mean()):+.1f} %")
     if "VA" in g and "V" in g:
         print(f"SON (VA vs V) sur poussée : {100 * (1 - g['VA'][push].mean() / g['V'][push].mean()):+.1f} %")
+    if a.diag > 0:
+        # (a) le prédicteur ÉCOUTE-T-IL ses gestes ? rollout avec les vraies actions futures vs actions d'une AUTRE
+        #     séquence vs main immobile. Main : directement pilotée (facile) ; disques : effet de la poussée (dur).
+        print(f"\n===== DIAG (a) SENSIBILITÉ À L'ACTION : rollout {H} pas, px à l'horizon final (plus bas = mieux) =====")
+        print(f"{'modèle':>6s} | {'actions futures':>22s} | {'main':>6s} | {'disques poussés':>15s} | {'jamais touchés':>14s}")
+        dact = Cte.size(-1); g_ = torch.Generator().manual_seed(0); perm = torch.randperm(n_te, generator=g_)
+        a0 = torch.from_numpy(-st["c"][0] / st["c"][1]).float()
+        for mods, m in trained.items():
+            Cv = torch.cat([Cte, Mte], -1) if "m" in mods else Cte
+            Cs = Cv.clone(); Cs[:, c:, :dact] = Cv[perm, c:, :dact]; Cz = Cv.clone(); Cz[:, c:, :dact] = a0
+            for nm, Cx in [("vraies", Cv), ("d'une autre séquence", Cs), ("main immobile", Cz)]:
+                pr_ = rollout(m, Cx); ed = roll_err(pr_)[:, -1]
+                eh = float(((align(pr_, tr_fut)[:, -1, 4:6] - tr_fut[:, -1, 4:6]).norm(dim=-1) * 32).mean())
+                print(f"{mods.upper():>6s} | {nm:>22s} | {eh:6.2f} | {ed[pushed_fut].mean():15.2f} | {ed[~pushed_fut].mean():14.2f}", flush=True)
+        # (b) les gestes que le planificateur IMAGINE ressemblent-ils à ceux que le bébé a VÉCUS ?
+        vq = float(np.quantile(np.linalg.norm(wtr["ACT"][:, :-1], axis=-1), 0.99))   # vitesse max vécue (99e centile)
+        def astats(Ar):
+            sp = np.linalg.norm(Ar, axis=-1); u = Ar / (sp[..., None] + 1e-9)
+            return sp.mean(), (sp >= 0.09).mean(), (sp < 0.05).mean(), (sp > vq).mean(), (u[:, 1:] * u[:, :-1]).sum(-1).mean()
+        print("\n===== DIAG (b) GESTES : vécus (données) vs proposés (CEM, 1re itération) =====")
+        print(f"{'source':>8s} | {'vitesse moy':>11s} | {'≥ 0.09':>6s} | {'< 0.05':>6s} | {'> max vécu':>10s} | {'persistance (cos)':>17s}")
+        for nm, Ar in [("vécus", wtr["ACT"][:, :-1]), ("CEM", np.clip(np.random.default_rng(0).normal(0, 0.06, (4000, a.plan_h, 2)), -0.1, 0.1))]:
+            r0 = astats(Ar); print(f"{nm:>8s} | {r0[0]:11.3f} | {r0[1]:6.0%} | {r0[2]:6.0%} | {r0[3]:10.0%} | {r0[4]:17.2f}")
     # ================= PLANIFICATION (System 2) : « amène un disque sur la cible » =================
     # Le bébé IMAGINE les conséquences de séquences de gestes avec son modèle du monde (encodeur gelé +
     # prédicteur conditionné par l'action), choisit la meilleure (CEM), joue le 1er geste, regarde, recommence.
     # Coût = distance (lecteur de positions, instrument) d'un disque prédit à la cible. Comparé au hasard et à
     # un ORACLE qui connaît l'état exact.
-    if a.plan > 0 and a.encoder == "dev":
+    if (a.plan > 0 or a.diag > 0) and a.encoder == "dev":
         H0 = 32; r_ = 0.12; vmax = 0.1; damp = 0.96; Ls = SPF // a.a_sub
         yy, xx = (np.mgrid[0:H0, 0:H0].astype(np.float32) + 0.5) / H0
         win = np.hanning(Ls).astype(np.float32); Wb = band_matrix(Ls); tt_all = np.arange(a.T * SPF) / SR
@@ -455,9 +479,53 @@ def main():
                 nonlocal P, V, Hp
                 P, V, Hp = act_physics(P, V, Hp, act, me, r_, damp, t, ev, TOUCH[t], WHO, a.fric)
                 X[t] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[t] = P; ACT[t - 1] = act
+            def imaginer(t, Hh):                                       # encode le vécu (frames 0..t) -> coût IMAGINÉ de gestes candidats
+                Pp = POS.copy(); Pp[t + 1:] = POS[t]
+                extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
+                Aud = render_audio(ev, mat, me, a.T, a.a_sub, arng, Wb, win, tt_all, 1, np.zeros(a.T, bool), extra)
+                Z = encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
+                Vn = ((Z.float() - vmu) / vsd).to(dev)
+                An = (torch.from_numpy(Aud.reshape(1, a.T, -1)).float().to(dev) - smu["a"]) / ssd["a"]
+                Tn = (torch.from_numpy(TOUCH.reshape(1, a.T, -1)).float().to(dev) - smu["t"]) / ssd["t"]
+                An[:, t + 1:] = 0; Tn[:, t + 1:] = 0; gt = torch.from_numpy(g).to(dev)
+                def cost(cand):
+                    out = []
+                    for j in range(0, len(cand), 32):
+                        cc = cand[j:j + 32]; B = len(cc)
+                        Craw = torch.from_numpy(ACT).to(dev).expand(B, -1, -1).clone(); Craw[:, t:t + Hh] = cc
+                        Cn = (Craw - smu["c"]) / ssd["c"]
+                        Vb = Vn.expand(B, -1, -1, -1).clone(); Ab = An.expand(B, -1, -1); Tb = Tn.expand(B, -1, -1)
+                        with torch.no_grad():
+                            for h in range(1, Hh + 1):
+                                o, _ = m(Vb, Ab, Tb, Cn); Vb[:, t + h] = o["v"][:, t + h - 1]
+                            pos = ro(Vb[:, t + Hh])[:, :4].view(-1, 2, 2)
+                        out.append((pos - gt).norm(dim=-1).min(-1).values)
+                    return torch.cat(out)
+                return cost
+            def real_cost(t, cand):                                    # VRAIE physique, sur des copies de l'état
+                out = []
+                for cc in cand.cpu().numpy().astype(np.float32):
+                    P_, V_, H_ = P.copy(), V.copy(), Hp.copy()
+                    for h, ac in enumerate(cc):
+                        P_, V_, H_ = act_physics(P_, V_, H_, ac, me, r_, damp, t + 1 + h, [], np.zeros(4, np.float32), -np.ones(a.T + 16, np.int64), a.fric)
+                    out.append(float(np.linalg.norm(P_ - g, axis=1).min()))
+                return np.array(out)
             for t in range(1, a.plan_c + 1):                            # contexte : le bébé gigote un peu
                 step(t, np.clip(rng.normal(0, 0.03, 2), -vmax, vmax).astype(np.float32))
             for t in range(a.plan_c, a.T - 1):                         # choisir le geste t -> t+1
+                d_now = float(np.linalg.norm(P - g, axis=1).min())
+                if policy == "diag":                                   # (c) classement imaginé vs réel au 1er geste
+                    from scipy.stats import spearmanr
+                    Hh = min(a.plan_h, a.T - 1 - t); imag = imaginer(t, Hh); K = 48; torch.manual_seed(ep)
+                    cem = (torch.randn(K, Hh, 2, device=dev) * 0.06).clamp(-vmax, vmax)
+                    ang = torch.rand(K, 1, device=dev) * 2 * math.pi; spd = 0.03 + 0.07 * torch.rand(K, 1, device=dev)
+                    bb = (spd * torch.cat([ang.cos(), ang.sin()], -1)).unsqueeze(1).expand(K, Hh, 2).contiguous()
+                    res = {}
+                    for fam, cand in [("CEM", cem), ("bébé", bb), ("tous", torch.cat([cem, bb]))]:
+                        ci = imag(cand).cpu().numpy(); cr_ = real_cost(t, cand)
+                        rho = spearmanr(ci, cr_).correlation if cr_.std() > 1e-6 else np.nan
+                        res[fam] = (rho, cr_[ci.argmin()], cr_.min(), np.median(cr_), (cr_ < d_now - 0.01).mean())
+                    return res
                 if policy == "hasard": act = rng.uniform(-vmax, vmax, 2).astype(np.float32)
                 elif policy == "oracle":                               # connaît l'état : CONTOURNE le disque, se place derrière, pousse doucement
                     kk = kt; dg = g - P[kk]; u = dg / (np.linalg.norm(dg) + 1e-6); perp = np.array([-u[1], u[0]])
@@ -470,34 +538,27 @@ def main():
                     d = tgt - Hp; act = (spd * d / max(np.linalg.norm(d), 1e-6)).astype(np.float32)
                     act = np.clip(act, -vmax, vmax)
                 else:                                                  # MPC dans l'IMAGINATION
-                    Pp = POS.copy(); Pp[t + 1:] = POS[t]
-                    extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
-                    Aud = render_audio(ev, mat, me, a.T, a.a_sub, arng, Wb, win, tt_all, 1, np.zeros(a.T, bool), extra)
-                    Z = encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
-                    Vn = ((Z.float() - vmu) / vsd).to(dev)
-                    An = (torch.from_numpy(Aud.reshape(1, a.T, -1)).float().to(dev) - smu["a"]) / ssd["a"]
-                    Tn = (torch.from_numpy(TOUCH.reshape(1, a.T, -1)).float().to(dev) - smu["t"]) / ssd["t"]
-                    An[:, t + 1:] = 0; Tn[:, t + 1:] = 0
-                    Hh = min(a.plan_h, a.T - 1 - t); mu_ = torch.zeros(Hh, 2, device=dev); sd_ = torch.full((Hh, 2), 0.06, device=dev)
-                    gt = torch.from_numpy(g).to(dev)
+                    Hh = min(a.plan_h, a.T - 1 - t); imag = imaginer(t, Hh)
+                    mu_ = torch.zeros(Hh, 2, device=dev); sd_ = torch.full((Hh, 2), 0.06, device=dev)
                     for _ in range(a.plan_iters):
                         cand = (mu_ + sd_ * torch.randn(a.plan_pop, Hh, 2, device=dev)).clamp(-vmax, vmax)
-                        Craw = torch.from_numpy(ACT).to(dev).expand(a.plan_pop, -1, -1).clone(); Craw[:, t:t + Hh] = cand
-                        Cn = (Craw - smu["c"]) / ssd["c"]
-                        Vb = Vn.expand(a.plan_pop, -1, -1, -1).clone(); Ab = An.expand(a.plan_pop, -1, -1); Tb = Tn.expand(a.plan_pop, -1, -1)
-                        with torch.no_grad():
-                            for h in range(1, Hh + 1):
-                                o, _ = m(Vb, Ab, Tb, Cn); Vb[:, t + h] = o["v"][:, t + h - 1]
-                            pos = ro(Vb[:, t + Hh])[:, :4].view(-1, 2, 2)
-                        cost = (pos - gt).norm(dim=-1).min(-1).values
+                        cost = imag(cand)
                         el = cand[cost.argsort()[:max(4, a.plan_pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                     act = mu_[0].cpu().numpy().astype(np.float32)
                 step(t + 1, act)
             dfin = float(np.linalg.norm(P - g, axis=1).min())
             return d0, dfin
-        print(f"\n===== PLANIFICATION : amener un disque sur une cible à {a.plan_dmin}–{a.plan_dmax} ({a.plan} épisodes, {a.T - 1 - a.plan_c} gestes, CEM {a.plan_pop}×{a.plan_iters}, horizon {a.plan_h}) =====", flush=True)
-        print(f"{'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
-        pols = [("hasard", None), ("oracle", None)] + [(f"MPC {mo.upper()}", trained[mo]) for mo in trained]
+        if a.plan > 0: print(f"\n===== PLANIFICATION : amener un disque sur une cible à {a.plan_dmin}–{a.plan_dmax} ({a.plan} épisodes, {a.T - 1 - a.plan_c} gestes, CEM {a.plan_pop}×{a.plan_iters}, horizon {a.plan_h}) =====", flush=True)
+        if a.plan > 0: print(f"{'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
+        if a.diag > 0:
+            for mo, mm in trained.items():
+                tp = time.time(); R = [episode(e, "diag", mm) for e in range(a.diag)]
+                print(f"\n===== DIAG (c) [{mo.upper()}] {a.diag} situations, 48 gestes candidats par famille, horizon {a.plan_h} : l'IMAGINATION classe-t-elle les gestes comme la RÉALITÉ ? ({time.time() - tp:.0f}s) =====")
+                print(f"{'famille':>7s} | {'corr. rang imaginé↔réel':>23s} | {'coût réel du choix du modèle':>28s} | {'meilleur réel':>13s} | {'médiane réelle':>14s} | {'gestes qui rapprochent':>22s}")
+                for fam in ["CEM", "bébé", "tous"]:
+                    x = np.array([r_[fam] for r_ in R], dtype=np.float64)
+                    print(f"{fam:>7s} | {np.nanmean(x[:, 0]):+23.2f} | {x[:, 1].mean():28.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
+        pols = [("hasard", None), ("oracle", None)] + [(f"MPC {mo.upper()}", trained[mo]) for mo in trained] if a.plan > 0 else []
         for name, mm in pols:
             tp = time.time(); res = np.array([episode(e, "mpc" if mm is not None else name, mm) for e in range(a.plan)])
             print(f"{name:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 1] < 0.06):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
