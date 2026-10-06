@@ -246,6 +246,8 @@ def main():
     p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")
     p.add_argument("--plan_c", type=int, default=3, help="frames de contexte avant de planifier")
     p.add_argument("--plan_dmin", type=float, default=0.12); p.add_argument("--plan_dmax", type=float, default=0.22)
+    p.add_argument("--roll_k", type=int, default=0, help="pas de ROLLOUT autorégressif dans la perte (0 = pas suivant seul)")
+    p.add_argument("--roll_w", type=float, default=1.0)
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
@@ -372,6 +374,15 @@ def main():
                 A_in, T_in = A_ * keep[..., None], T_ * keep[..., None]
             else: A_in, T_in = A_, T_
             out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets, a.chg_w)
+            if a.roll_k > 0:                    # ROLLOUT (recette V-JEPA 2-AC) : le prédicteur s'entraîne sur SES PROPRES
+                c = int(torch.randint(1, Tt - a.roll_k, (1,)))      # imaginations — après le pas c, il réinjecte ses
+                Ar, Tr_ = A_in.clone(), T_in.clone(); Ar[:, c + 1:] = 0; Tr_[:, c + 1:] = 0   # prédictions (son/toucher
+                Vc, lr_ = V, 0.0                                   # du futur inconnus) ; gradient À TRAVERS la chaîne
+                for h in range(1, a.roll_k + 1):
+                    o_, _ = m(Vc, Ar, Tr_, C_); pr = o_["v"][:, c + h - 1]
+                    lr_ = lr_ + F.smooth_l1_loss(pr, V[:, c + h])
+                    Vc = torch.cat([Vc[:, :c + h], pr.unsqueeze(1), Vc[:, c + h + 1:]], 1)
+                loss = loss + a.roll_w * lr_ / a.roll_k
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
         if pc and not os.path.exists(pc): torch.save(m.state_dict(), pc)
