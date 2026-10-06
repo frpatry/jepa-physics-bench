@@ -129,11 +129,13 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
     return dict(X=X, A=A, MAT=MAT, LM=LM, IMP=IMP, POS=POS, HAND=HAND, ACT=ACT, TOUCH=TOUCH, WHO=WHO, COL=COL)
 
 # ---------------------------------------------------------------- tokens par pas V-JEPA 2 (2 frames)
-def step_inputs(w, Tt):
+def step_inputs(w, Tt, proprio=0):
     """audio (n,Tt,2*a_sub*2*NB), toucher (n,Tt,8), action (n,Tt,4) alignés sur les pas V-JEPA 2.
     action du pas s = transitions 2s+1 -> 2s+2 et 2s+2 -> 2s+3 (ce qui mène au pas s+1)."""
     n, T = w["ACT"].shape[:2]; f = T // Tt                             # frames par pas (2 : V-JEPA 2 ; 1 : notre encodeur)
     A = w["A"].reshape(n, Tt, -1); Tch = w["TOUCH"].reshape(n, Tt, -1)
+    if proprio:                                 # PROPRIOCEPTION : le bébé SENT où est sa main (sens du corps, à côté du toucher)
+        Tch = np.concatenate([Tch, w["HAND"].reshape(n, Tt, -1)], -1)
     act = np.concatenate([w["ACT"], np.zeros((n, f, 2), np.float32)], 1)       # ACT[t] : t -> t+1
     Act = np.stack([np.concatenate([act[:, f * s + f - 1 + j] for j in range(f)], -1) for s in range(Tt)], 1)
     return A.astype(np.float32), Tch.astype(np.float32), Act.astype(np.float32)
@@ -256,6 +258,7 @@ def main():
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
     p.add_argument("--sep_enc", type=int, default=0, help="l'encodeur gelé a été entraîné avec encodeurs séparés")
     p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : SON DE FROTTEMENT (silence à l'arrêt)")
+    p.add_argument("--proprio", type=int, default=0, help="1 = PROPRIOCEPTION : position sentie de la main jointe au toucher (passé seulement ; le futur s'imagine)")
     p.add_argument("--babble", type=int, default=0, help="1 = données de BABILLAGE moteur (forces/directions variées, arrêts, gigotements)")
     p.add_argument("--fric", type=float, default=0.0, help="frottement de Coulomb (vitesse perdue / frame ; 0.004 ≈ s'arrête vite)")
     p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")
@@ -291,7 +294,7 @@ def main():
     Tt, k, dv = Ztr.shape[1], Ztr.shape[2], Ztr.shape[3]; f = a.T // Tt   # frames par pas
     vmu, vsd = Ztr[:2000].float().mean((0, 1, 2)), Ztr[:2000].float().std((0, 1, 2)) + 1e-4
     Vtr = ((Ztr.float() - vmu) / vsd).half(); Vte = ((Zte.float() - vmu) / vsd).half(); del Ztr, Zte
-    Atr, Ttr, Ctr = step_inputs(wtr, Tt); Ate, Tte_, Cte = step_inputs(wte, Tt)
+    Atr, Ttr, Ctr = step_inputs(wtr, Tt, a.proprio); Ate, Tte_, Cte = step_inputs(wte, Tt, a.proprio)
     st = {n_: (x.mean((0, 1)), x.std((0, 1)) + 1e-4) for n_, x in [("a", Atr), ("t", Ttr), ("c", Ctr)]}
     nz = lambda x, n_: torch.from_numpy((x - st[n_][0]) / st[n_][1])
     Atr, Ttr, Ctr, Ate, Tte_, Cte = nz(Atr, "a"), nz(Ttr, "t"), nz(Ctr, "c"), nz(Ate, "a"), nz(Tte_, "t"), nz(Cte, "c")
@@ -492,13 +495,13 @@ def main():
             for _ in range(500):                                       # cible à portée (0.12–0.22) de ce disque, loin de l'autre
                 ang = rng.uniform(0, 2 * np.pi); g = (P[kt] + rng.uniform(a.plan_dmin, a.plan_dmax) * np.array([np.cos(ang), np.sin(ang)])).astype(np.float32)
                 if np.all((g > r_ + 0.02) & (g < 1 - r_ - 0.02)) and np.linalg.norm(P[1 - kt] - g) > 0.25: break
-            X = np.zeros((a.T, H0, H0, 3), np.float32); POS = np.zeros((a.T, 2, 2), np.float32); TOUCH = np.zeros((a.T, 4), np.float32)
+            X = np.zeros((a.T, H0, H0, 3), np.float32); POS = np.zeros((a.T, 2, 2), np.float32); TOUCH = np.zeros((a.T, 4), np.float32); HANDP = np.zeros((a.T, 2), np.float32); HANDP[0] = Hp
             WHO = -np.ones(a.T, np.int64); ACT = np.zeros((a.T, 2), np.float32); ev = []
             X[0] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[0] = P; d0 = float(np.linalg.norm(P - g, axis=1).min())
             def step(t, act):
                 nonlocal P, V, Hp
                 P, V, Hp = act_physics(P, V, Hp, act, me, r_, damp, t, ev, TOUCH[t], WHO, a.fric)
-                X[t] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[t] = P; ACT[t - 1] = act
+                X[t] = render_act(P, Hp, cols, xx, yy, r_, H0); POS[t] = P; ACT[t - 1] = act; HANDP[t] = Hp
             def imaginer(t, Hh):                                       # encode le vécu (frames 0..t) -> coût IMAGINÉ de gestes candidats
                 Pp = POS.copy(); Pp[t + 1:] = POS[t]
                 extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
@@ -506,7 +509,8 @@ def main():
                 Z = encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
                 Vn = ((Z.float() - vmu) / vsd).to(dev)
                 An = (torch.from_numpy(Aud.reshape(1, a.T, -1)).float().to(dev) - smu["a"]) / ssd["a"]
-                Tn = (torch.from_numpy(TOUCH.reshape(1, a.T, -1)).float().to(dev) - smu["t"]) / ssd["t"]
+                Tsens = np.concatenate([TOUCH, HANDP], -1) if a.proprio else TOUCH
+                Tn = (torch.from_numpy(Tsens.reshape(1, a.T, -1)).float().to(dev) - smu["t"]) / ssd["t"]
                 An[:, t + 1:] = 0; Tn[:, t + 1:] = 0; gt = torch.from_numpy(g).to(dev)
                 def cost(cand):
                     out = []
