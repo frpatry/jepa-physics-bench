@@ -41,21 +41,27 @@ def to_tokens(X, A, P, st, sigma=0.0):
     return tok
 
 def _batch(job):
-    seed, n, hum, mode = job
-    w = gen_world(n, T, H, seed=seed, a_sub=2, hum=hum, hum_mode=mode)
-    return (w["X"] * 255).round().astype(np.uint8), w["A"].astype(np.float16)
+    seed, n, hum, mode, act = job
+    n_act = int(round(n * act["frac"])); Xs, As = [], []
+    if n - n_act > 0:
+        w = gen_world(n - n_act, T, H, seed=seed, a_sub=2, hum=hum, hum_mode=mode); Xs.append(w["X"]); As.append(w["A"])
+    if n_act > 0:                               # MONDE AVEC MAIN : le bébé regarde ses mains (babillage), mêmes disques/sons
+        from av_act import gen_world_act
+        w = gen_world_act(n_act, T, H, seed=seed + 500_000_000, a_sub=2, hum=hum, hum_mode=mode, fric=act["fric"], babble=act["babble"])
+        Xs.append(w["X"]); As.append(w["A"])
+    return (np.concatenate(Xs) * 255).round().astype(np.uint8), np.concatenate(As).astype(np.float16)
 
-def stream(start, bs, workers, prefetch=24, hum=0.0, mode="hum"):
+def stream(start, bs, workers, prefetch=24, hum=0.0, mode="hum", act=None):
     """lots neufs générés en parallèle avec une avance BORNÉE : Pool.imap n'a aucune contre-pression ->
     les workers (plus rapides que le GPU) remplissaient la RAM jusqu'à l'OOM (84 Go)."""
     from collections import deque
     with mp.get_context("fork").Pool(workers) as pool:
         pending, i = deque(), start
         for _ in range(prefetch):
-            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum, mode),))); i += 1
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum, mode, act),))); i += 1
         while True:
             X, A = pending.popleft().get()
-            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum, mode),))); i += 1
+            pending.append(pool.apply_async(_batch, ((10_000_000 + i, bs, hum, mode, act),))); i += 1
             yield torch.from_numpy(X), torch.from_numpy(A)
 
 def build_probe(a, dev, st):
@@ -66,8 +72,17 @@ def build_probe(a, dev, st):
                                for i in range(0, a.n_probe, 250)])
     P2 = w["POS"]; o_ = np.argsort(P2[..., 0], axis=-1)                        # disques indiscernables : gauche puis droite
     pos = torch.from_numpy(np.take_along_axis(P2, o_[..., None], axis=2).reshape(len(P2), T, 4)).float()
-    return dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab, pos=pos,
-                antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
+    out = dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab, pos=pos,
+               antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
+    if a.act_frac > 0:                          # sonde MONDE AVEC MAIN : la vision sait-elle où est SA MAIN ?
+        from av_act import gen_world_act
+        na = min(1500, a.n_probe); wa = gen_world_act(na, T, H, seed=1001, a_sub=2, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
+        Xa, Aa = torch.from_numpy((wa["X"] * 255).round().astype(np.uint8)), torch.from_numpy(wa["A"])
+        P2 = wa["POS"]; o_ = np.argsort(P2[..., 0], axis=-1)
+        pa = np.concatenate([np.take_along_axis(P2, o_[..., None], axis=2).reshape(na, T, 4), wa["HAND"]], -1)
+        out["htok"] = torch.cat([to_tokens(Xa[i:i + 250].to(dev), Aa[i:i + 250].to(dev), a.P, st).half().cpu() for i in range(0, na, 250)])
+        out["hpos"] = torch.from_numpy(pa).float()
+    return out
 
 @torch.no_grad()
 def surprise(pred, enc_c, tgt, tok, toksw, imp, nv, dev, bs=64):
@@ -88,26 +103,27 @@ def surprise(pred, enc_c, tgt, tok, toksw, imp, nv, dev, bs=64):
     return tout, choc
 
 class _PosReader(torch.nn.Module):
-    def __init__(s, d, ntok, h=128):
+    def __init__(s, d, ntok, h=128, nout=4):
         super().__init__()
         s.emb = torch.nn.Linear(d, h); s.pos = torch.nn.Parameter(torch.zeros(1, ntok, h)); s.cls = torch.nn.Parameter(torch.zeros(1, 1, h))
-        s.tr = torch.nn.TransformerEncoder(torch.nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.1), 2); s.out = torch.nn.Linear(h, 4)
+        s.tr = torch.nn.TransformerEncoder(torch.nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.1), 2); s.out = torch.nn.Linear(h, nout)
     def forward(s, x):
         return s.out(s.tr(torch.cat([s.cls.expand(len(x), -1, -1), s.emb(x) + s.pos], 1))[:, 0])
 
-def loc_r2(m, probe, nv, dev, steps, n=1500):
+def loc_r2(m, probe, nv, dev, steps, n=1500, tok_key="tok", y_key="pos", groups=None):
     """LA VISION SAIT-ELLE OÙ SONT LES DISQUES ? encodeur cible sur la séquence complète, tokens visuels d'une
     frame -> positions (triées) des 2 disques ; R² sur 30 % tenus à l'écart (instrument, comme diag (a))."""
-    Z = represent(m, probe["tok"][:n], np.ones(probe["tok"].size(1), bool), dev)[:, :nv]
-    npf = nv // T; Z = Z.reshape(n, T, npf, -1).flatten(0, 1); y = probe["pos"][:n].flatten(0, 1)
+    n = min(n, len(probe[tok_key])); Z = represent(m, probe[tok_key][:n], np.ones(probe[tok_key].size(1), bool), dev)[:, :nv]
+    npf = nv // T; Z = Z.reshape(n, T, npf, -1).flatten(0, 1); y = probe[y_key][:n].flatten(0, 1)
     k = int(0.7 * len(Z)); mu, sd = y[:k].mean(0), y[:k].std(0) + 1e-6
-    torch.manual_seed(0); r = _PosReader(Z.size(-1), npf).to(dev); opt = torch.optim.AdamW(r.parameters(), 3e-4, weight_decay=0.05)
+    torch.manual_seed(0); r = _PosReader(Z.size(-1), npf, nout=y.size(-1)).to(dev); opt = torch.optim.AdamW(r.parameters(), 3e-4, weight_decay=0.05)
     for _ in range(steps):
         bi = torch.randint(0, k, (256,)); l = F.mse_loss(r(Z[bi].to(dev).float()), ((y[bi] - mu) / sd).to(dev))
         opt.zero_grad(); l.backward(); opt.step()
     r.eval()
     with torch.no_grad(): p = torch.cat([r(Z[i:i + 512].to(dev).float()).cpu() for i in range(k, len(Z), 512)]) * sd + mu
-    yt = y[k:]; return float(1 - ((p - yt) ** 2).sum() / ((yt - yt.mean(0)) ** 2).sum())
+    yt = y[k:]; r2 = lambda c: float(1 - ((p[:, c] - yt[:, c]) ** 2).sum() / ((yt[:, c] - yt[:, c].mean(0)) ** 2).sum())
+    return r2(slice(None)) if groups is None else [r2(g) for g in groups]
 
 def exam(m, probe, a, dev, nv, tag):
     N = nv + T; npf = nv // T; frame = np.concatenate([np.arange(nv) // npf, np.arange(T)])
@@ -124,6 +140,9 @@ def exam(m, probe, a, dev, nv, tag):
         msg = f" | SURPRISE stéréo inversée {res['surprise']:.0%} (chocs {res['surprise_choc']:.0%}, 0 étiq.)"
     msg += f" | écart-type latents {res['ecart']:.3f}"
     res["pos_r2"] = loc_r2(m, probe, nv, dev, a.read_steps); msg += f" | VISION positions R² {res['pos_r2']:+.2f}"
+    if "htok" in probe:
+        res["act_disk_r2"], res["hand_r2"] = loc_r2(m, probe, nv, dev, a.read_steps, tok_key="htok", y_key="hpos", groups=[slice(0, 4), slice(4, 6)])
+        msg += f" | monde avec main : disques R² {res['act_disk_r2']:+.2f}, MAIN R² {res['hand_r2']:+.2f}"
     print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}" + msg, flush=True)
     return res
 
@@ -147,6 +166,9 @@ def main():
     p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--act_frac", type=float, default=0.0, help="part de chaque lot tirée du MONDE AVEC MAIN (av_act, babillage) : le bébé regarde ses mains")
+    p.add_argument("--babble", type=int, default=1, help="(avec --act_frac) gestes de babillage variés plutôt que le script viser-pousser")
+    p.add_argument("--fric", type=float, default=0.02, help="(avec --act_frac) frottement du monde avec main (comme la phase 2)")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; nv = T * nP * nP; da = 2 * 2 * NB
@@ -169,11 +191,13 @@ def main():
         ck = torch.load(a.init_from, map_location=dev, weights_only=False)
         m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); state = ck["state"]
         print(f"DÉPART depuis l'instantané {a.init_from} : pas {state['it']} (étape {state['stage']}) | SIGReg poids {a.sig_w}", flush=True)
+        m.eval(); r = exam(type("W", (), {"enc": tgt, "nv": nv, "T": T, "pred": m.pred, "enc_c": m.enc})(), probe, a, dev, nv, f"départ pas {state['it']}")
+        state["exams"].append((f"départ {state['it']}", r)); m.train()
     else:
         class Wrap(torch.nn.Module):
             def __init__(s, enc): super().__init__(); s.enc, s.nv, s.T = enc, nv, T
         state["exams"].append(("init", exam(Wrap(tgt), probe, a, dev, nv, "init (aléatoire)")))
-    data = stream(state["it"], a.bs, a.workers, hum=a.hum, mode=a.hum_mode); ma = msr = None
+    data = stream(state["it"], a.bs, a.workers, hum=a.hum, mode=a.hum_mode, act=dict(frac=a.act_frac, babble=a.babble, fric=a.fric)); ma = msr = None
     def sigma_of(stage, k):
         return {"A": 0.0, "B": a.sig_max, "D": 0.0}.get(stage, a.sig_max * max(0.0, 1 - k / a.blur_down))
     while state["it"] < a.total:

@@ -75,7 +75,10 @@ def render_act(P, Hp, cols, xx, yy, r, H):
     hx = np.clip((R_HAND * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
     return img * (1 - hx) + hx                              # main = carré blanc
 
-def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0, hum_mode="hum", fric=0.0):
+def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1, damp=0.96, hum=0.0, hum_mode="hum", fric=0.0, babble=0):
+    """babble=1 : BABILLAGE MOTEUR (le bébé essaie ses gestes) au lieu du script « viser-pousser à fond » —
+    par segment de 2–6 pas : force tirée au hasard (doux -> fort), et viser un disque (le dépasser plus ou
+    moins) / aller vers un point / rester immobile / filer dans une direction / gigoter."""
     rng = np.random.default_rng(seed); Ls = SPF // a_sub
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -96,17 +99,28 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
             Hp = rng.uniform(R_HAND, 1 - R_HAND, 2).astype(np.float32)
             dd_ = np.linalg.norm(P - Hp, axis=1)                         # main près d'un disque (pas dessus)
             if np.all(dd_ > r + R_HAND + 0.05) and dd_.min() < 0.4: break
-        ev = []; tgt, left = None, 0
+        ev = []; tgt, left, mode, spd, dirv = None, 0, "tgt", vmax, None
         for t in range(T):
             if t > 0:
                 # --- politique « jeu de bébé » : viser un disque (et le dépasser pour le pousser) ou un point
-                if left <= 0:
+                if left <= 0 and babble:
+                    left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
+                    if u_ < 0.45:
+                        k = rng.integers(2); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
+                    elif u_ < 0.6: tgt = rng.uniform(R_HAND, 1 - R_HAND, 2)
+                    elif u_ < 0.7: mode = "immobile"
+                    elif u_ < 0.85: ang = rng.uniform(0, 2 * np.pi); dirv = np.array([np.cos(ang), np.sin(ang)]); mode = "direction"
+                    else: mode = "gigote"
+                elif left <= 0:
                     left = rng.integers(3, 7)
                     if rng.random() < 0.8:
                         k = rng.integers(2); d = P[k] - Hp; tgt = P[k] + 0.15 * d / (np.linalg.norm(d) + 1e-6)
                     else: tgt = rng.uniform(R_HAND, 1 - R_HAND, 2)
                 left -= 1
-                d = tgt - Hp; a = vmax * d / max(np.linalg.norm(d), vmax) + rng.normal(0, 0.015, 2)
+                if mode == "immobile": a = rng.normal(0, 0.004, 2)
+                elif mode == "direction": a = spd * dirv + rng.normal(0, 0.015, 2)
+                elif mode == "gigote": a = rng.normal(0, 0.05, 2)
+                else: d = tgt - Hp; a = spd * d / max(np.linalg.norm(d), spd) + rng.normal(0, 0.015, 2)
                 a = np.clip(a, -vmax, vmax).astype(np.float32); ACT[i, t - 1] = a   # action t-1 : frame t-1 -> t
                 P, V, Hp = act_physics(P, V, Hp, a, m, r, damp, t, ev, TOUCH[i, t], WHO[i], fric)
             X[i, t] = render_act(P, Hp, cols, xx, yy, r, H); POS[i, t] = P; HAND[i, t] = Hp
@@ -242,6 +256,7 @@ def main():
     p.add_argument("--hum", type=float, default=0.0, help="monde v4 : bourdonnement continu des disques (0.15 = comme le pré-entraînement)")
     p.add_argument("--sep_enc", type=int, default=0, help="l'encodeur gelé a été entraîné avec encodeurs séparés")
     p.add_argument("--hum_mode", type=str, default="hum", choices=["hum", "fric"], help="fric = monde v5 : SON DE FROTTEMENT (silence à l'arrêt)")
+    p.add_argument("--babble", type=int, default=0, help="1 = données de BABILLAGE moteur (forces/directions variées, arrêts, gigotements)")
     p.add_argument("--fric", type=float, default=0.0, help="frottement de Coulomb (vitesse perdue / frame ; 0.004 ≈ s'arrête vite)")
     p.add_argument("--plan", type=int, default=0, help="PLANIFICATION : nb d'épisodes « amener un disque sur la cible » (MPC/CEM dans l'imagination)")
     p.add_argument("--plan_c", type=int, default=3, help="frames de contexte avant de planifier")
@@ -253,8 +268,8 @@ def main():
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     p.add_argument("--diag", type=int, default=0, help="DIAGNOSTIC planif : nb d'épisodes ; sensibilité à l'action + classement imaginé vs réel des gestes candidats")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
-    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
-    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric)
+    wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
+    wte = gen_world_act(a.n_test, a.T, seed=a.seed + 5000, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
     cont = (wtr["WHO"] >= 0).any(1).mean()
     print(f"monde v3 : {a.n_train}+{a.n_test} séquences | {cont:.0%} avec poussée | poussées/séq "
           f"{(wtr['WHO'] >= 0).sum(1).mean():.1f} ({time.time() - t0:.0f}s)", flush=True)
