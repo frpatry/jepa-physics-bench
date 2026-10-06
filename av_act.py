@@ -248,7 +248,7 @@ def main():
     p.add_argument("--ctx", type=int, default=3, help="dernier pas de contexte observé avant le rollout")
     p.add_argument("--sens_drop", type=float, default=0.5, help="p de couper son/toucher sur un suffixe (entraînement)")
     p.add_argument("--residual", type=int, default=1, help="ẑ(s+1) = z(s) + Δ, tête zéro-init (leçon pusht_vjepa2 : sinon collé à la moyenne)")
-    p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k)")
+    p.add_argument("--encoder", type=str, default="vjepa2", choices=["vjepa2", "dev", "state"], help="dev = NOTRE JEPA bébé GELÉ (av_dev_long, ex. v4 pas 20k) ; state = CONTRÔLE : l'état exact (disques + main) à la place des latents")
     p.add_argument("--enc_ckpt", type=str, default="/content/drive/MyDrive/jepa_runs/av_dev_v4_20k.pt")
     p.add_argument("--eval_bs", type=int, default=64)
     p.add_argument("--chg_w", type=float, default=0.0, help="poids de l'attention au changement (0 = perte uniforme)")
@@ -288,6 +288,8 @@ def main():
         if os.path.exists(path):
             Z = torch.load(path)["Z"]
             if len(Z) == len(w["X"]): print(f"  cache {path}", flush=True); return Z
+        if a.encoder == "state":                # CONTRÔLE : 1 « token » = positions exactes des 2 disques + main (pipeline sans perception)
+            n_ = len(w["POS"]); return torch.from_numpy(np.concatenate([w["POS"].reshape(n_, -1, 4), w["HAND"]], -1)[:, :, None]).half()
         Z = encode_vjepa2(w["X"], a, dev) if a.encoder == "vjepa2" else encode_dev(w, a, dev)
         torch.save(dict(Z=Z), path); return Z
     Ztr, Zte = feats(a.train_cache, wtr), feats(a.test_cache, wte)
@@ -474,7 +476,7 @@ def main():
     # prédicteur conditionné par l'action), choisit la meilleure (CEM), joue le 1er geste, regarde, recommence.
     # Coût = distance (lecteur de positions, instrument) d'un disque prédit à la cible. Comparé au hasard et à
     # un ORACLE qui connaît l'état exact.
-    if (a.plan > 0 or a.diag > 0) and a.encoder == "dev":
+    if (a.plan > 0 or a.diag > 0) and a.encoder in ("dev", "state"):
         H0 = 32; r_ = 0.12; vmax = 0.1; damp = 0.96; Ls = SPF // a.a_sub
         yy, xx = (np.mgrid[0:H0, 0:H0].astype(np.float32) + 0.5) / H0
         win = np.hanning(Ls).astype(np.float32); Wb = band_matrix(Ls); tt_all = np.arange(a.T * SPF) / SR
@@ -506,7 +508,8 @@ def main():
                 Pp = POS.copy(); Pp[t + 1:] = POS[t]
                 extra = hum_signal(Pp, mat, me, a.T, a.hum, 1, a.hum_mode) if a.hum > 0 else None
                 Aud = render_audio(ev, mat, me, a.T, a.a_sub, arng, Wb, win, tt_all, 1, np.zeros(a.T, bool), extra)
-                Z = encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
+                Z = torch.from_numpy(np.concatenate([POS.reshape(1, a.T, 4), HANDP[None]], -1)[:, :, None]).half() if a.encoder == "state" \
+                    else encode_dev(dict(X=X[None], A=Aud[None].astype(np.float32)), a, dev, quiet=True)
                 Vn = ((Z.float() - vmu) / vsd).to(dev)
                 An = (torch.from_numpy(Aud.reshape(1, a.T, -1)).float().to(dev) - smu["a"]) / ssd["a"]
                 Tsens = np.concatenate([TOUCH, HANDP], -1) if a.proprio else TOUCH
