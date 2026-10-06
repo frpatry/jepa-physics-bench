@@ -375,13 +375,13 @@ def main():
             else: A_in, T_in = A_, T_
             out, _ = m(V, A_in, T_in, C_); loss = loss_fn(out, V, A_, T_, a.targets, a.chg_w)
             if a.roll_k > 0:                    # ROLLOUT (recette V-JEPA 2-AC) : le prédicteur s'entraîne sur SES PROPRES
-                c = int(torch.randint(1, Tt - a.roll_k, (1,)))      # imaginations — après le pas c, il réinjecte ses
-                Ar, Tr_ = A_in.clone(), T_in.clone(); Ar[:, c + 1:] = 0; Tr_[:, c + 1:] = 0   # prédictions (son/toucher
+                cr = int(torch.randint(1, Tt - a.roll_k, (1,)))     # imaginations — après le pas cr, il réinjecte ses
+                Ar, Tr_ = A_in.clone(), T_in.clone(); Ar[:, cr + 1:] = 0; Tr_[:, cr + 1:] = 0   # prédictions (son/toucher
                 Vc, lr_ = V, 0.0                                   # du futur inconnus) ; gradient À TRAVERS la chaîne
                 for h in range(1, a.roll_k + 1):
-                    o_, _ = m(Vc, Ar, Tr_, C_); pr = o_["v"][:, c + h - 1]
-                    lr_ = lr_ + F.smooth_l1_loss(pr, V[:, c + h])
-                    Vc = torch.cat([Vc[:, :c + h], pr.unsqueeze(1), Vc[:, c + h + 1:]], 1)
+                    o_, _ = m(Vc, Ar, Tr_, C_); pr = o_["v"][:, cr + h - 1]
+                    lr_ = lr_ + F.smooth_l1_loss(pr, V[:, cr + h])
+                    Vc = torch.cat([Vc[:, :cr + h], pr.unsqueeze(1), Vc[:, cr + h + 1:]], 1)
                 loss = loss + a.roll_w * lr_ / a.roll_k
             opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
             if it % (a.steps // 5) == 0: print(f"  [{mods}] step {it}  loss {loss.item():.4f}  ({time.time() - tt0:.0f}s)", flush=True)
