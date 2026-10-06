@@ -12,6 +12,7 @@ import argparse, copy, time
 import numpy as np, torch
 from av_jepa import gen_world, NB
 from av_act import gen_world_act
+from av_world5 import gen_world_v5
 from av_dev import DevJEPA
 import torch.nn.functional as F
 from vjepa import _gather
@@ -59,9 +60,14 @@ def main():
         y = np.concatenate([np.take_along_axis(P2, o_[..., None], axis=2).reshape(a.n, T, 4), w["HAND"]], -1)
         tok = torch.cat([to_tokens(X[i:i + 250].to(dev), A[i:i + 250].to(dev), P, st).half().cpu() for i in range(0, a.n, 250)])
         mv = np.linalg.norm(np.diff(w["HAND"], axis=1), axis=-1).mean() * 32
-        probes[name] = dict(htok=tok, hpos=torch.from_numpy(y).float()); print(f"monde {name:>14s} : main bouge {mv:.2f} px/frame ({time.time() - t0:.0f}s)", flush=True)
-    G = [slice(0, 4), slice(4, 6)]
-    print(f"\n{'encodeur':>28s} | " + " | ".join(f"{n_:>26s}" for n_ in probes)); print(" " * 28 + " | " + " | ".join(f"{'disques R²':>12s} {'MAIN R²':>13s}" for _ in probes))
+        probes[name] = dict(htok=tok, hpos=torch.from_numpy(y).float(), G=[slice(0, 4), slice(4, 6)]); print(f"monde {name:>14s} : main bouge {mv:.2f} px/frame ({time.time() - t0:.0f}s)", flush=True)
+    # sonde du T (monde v5, UN seul T parmi d'autres formes) : position (2) | orientation (cos, sin)
+    wt = gen_world_v5(a.n, T, H, seed=1003, a_sub=2, hum=a.hum, force_T=True)
+    Xt, At = torch.from_numpy((wt["X"] * 255).round().astype(np.uint8)), torch.from_numpy(wt["A"])
+    tt = torch.cat([to_tokens(Xt[i:i + 250].to(dev), At[i:i + 250].to(dev), P, st).half().cpu() for i in range(0, a.n, 250)])
+    yt = np.concatenate([wt["POS"][:, :, 0], np.cos(wt["ANG"][:, :, :1]), np.sin(wt["ANG"][:, :, :1])], -1)
+    probes["T (pos | orient.)"] = dict(htok=tt, hpos=torch.from_numpy(yt).float(), G=[slice(0, 2), slice(2, 4)])
+    print(f"\n{'encodeur':>28s} | " + " | ".join(f"{n_:>26s}" for n_ in probes)); print(" " * 28 + " | " + " | ".join(f"{'objets R²':>12s} {'MAIN/orient. R²':>13s}" for _ in probes))
     rows = [("PIXELS bruts (référence)", None)] + [(c.split("/")[-1][-12:] + f" [{md}]", c, md) for c in a.ckpts.split(",") for md in a.modes.split(",")]
     rows[0] = rows[0] + ("-",)
     for name, c, md in rows:
@@ -72,8 +78,8 @@ def main():
             m = type("W", (), {"enc": enc})()
         res = []
         for pr in probes.values():              # m None : patches bruts (represent renvoie les tokens tels quels)
-            if m is None: res.append(loc_r2(m, pr, nv, dev, a.steps, tok_key="htok", y_key="hpos", groups=G))
-            else: res.append(fit_r2(encode(m.enc, pr["htok"], md, nv, nP * nP, dev), pr["hpos"], dev, a.steps, G))
+            if m is None: res.append(loc_r2(m, pr, nv, dev, a.steps, tok_key="htok", y_key="hpos", groups=pr["G"]))
+            else: res.append(fit_r2(encode(m.enc, pr["htok"], md, nv, nP * nP, dev), pr["hpos"], dev, a.steps, pr["G"]))
         print(f"{name:>28s} | " + " | ".join(f"{d:+12.2f} {h:+13.2f}" for d, h in res) + f"  ({time.time() - t0:.0f}s)", flush=True)
 
 if __name__ == "__main__":

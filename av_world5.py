@@ -46,7 +46,7 @@ def gen_world_v5(n, T=16, H=32, seed=0, a_sub=2, hum=0.0, hum_mode="hum", p_hand
     win = np.hanning(Ls).astype(np.float32); W = band_matrix(Ls); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
         N = 1 if force_T and rng.random() < 0.3 else int(rng.integers(1, K + 1)); NOBJ[i] = N
-        kind = rng.integers(0, 4, N); kind[0] = 3 if force_T else kind[0]; SHAPE[i, :N] = kind
+        kind = rng.integers(0, 3 if force_T else 4, N); kind[0] = 3 if force_T else kind[0]; SHAPE[i, :N] = kind   # force_T : UN seul T (pas d'ambiguïté pour la sonde)
         s = np.where(kind == 3, rng.uniform(0.12, 0.16, N), rng.uniform(0.08, 0.14, N)); rc = np.where(kind == 3, 0.95, 0.9) * s     # rayon de collision (cercle englobant)
         cols = np.clip(PAL[rng.choice(len(PAL), N, replace=False)] * rng.uniform(0.7, 1.0, (N, 1)) + rng.normal(0, 0.08, (N, 3)), 0.1, 0.95).astype(np.float32)
         m = np.exp(rng.uniform(np.log(1 / 3), np.log(3), N)); mat = rng.integers(0, 3, N)
