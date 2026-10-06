@@ -355,7 +355,9 @@ def main():
     extreme = np.abs(lm_te) > 0.7                                       # masse < 0.5 ou > 2
     rollouts = {"copie": readout(Vte[:, c:c + 1].expand(-1, H, -1, -1).contiguous()), "vrai futur": readout(Vte[:, c + 1:])}
     pf = pushed & first[..., None]; pr = pushed & retouch[..., None]
-    print(f"lecteur de positions (vrais latents) : disques poussés {px(e_ceil, pushed):.2f} px (plafond) ; copie {px(e_copy, pushed):.2f} px", flush=True)
+    hand_px = lambda pr_: float(((pr_[..., 4:6] - true_next[..., 4:6]).norm(dim=-1) * 32).mean())   # la MAIN (pilotée par l'action)
+    print(f"lecteur de positions (vrais latents) : disques poussés {px(e_ceil, pushed):.2f} px (plafond) ; copie {px(e_copy, pushed):.2f} px"
+          f" | MAIN {hand_px(ceil):.2f} px (plafond) ; copie {hand_px(readout(Vte[:, :-1])):.2f} px", flush=True)
     dec = [("lecture vrai futur", e_ceil), ("copie", e_copy)]
     rows = [("copie", copy_err)]; trained = {}
     for mods in a.variants.split(","):
@@ -428,6 +430,9 @@ def main():
         #     séquence vs main immobile. Main : directement pilotée (facile) ; disques : effet de la poussée (dur).
         print(f"\n===== DIAG (a) SENSIBILITÉ À L'ACTION : rollout {H} pas, px à l'horizon final (plus bas = mieux) =====")
         print(f"{'modèle':>6s} | {'actions futures':>22s} | {'main':>6s} | {'disques poussés':>15s} | {'jamais touchés':>14s}")
+        for nm, pr_ in [("copie", rollouts["copie"]), ("vrai futur", rollouts["vrai futur"])]:     # repères : sans modèle / lecteur sur le vrai futur
+            ed = roll_err(pr_)[:, -1]; eh = float(((align(pr_, tr_fut)[:, -1, 4:6] - tr_fut[:, -1, 4:6]).norm(dim=-1) * 32).mean())
+            print(f"{'repère':>6s} | {nm:>22s} | {eh:6.2f} | {ed[pushed_fut].mean():15.2f} | {ed[~pushed_fut].mean():14.2f}")
         dact = Cte.size(-1); g_ = torch.Generator().manual_seed(0); perm = torch.randperm(n_te, generator=g_)
         a0 = torch.from_numpy(-st["c"][0] / st["c"][1]).float()
         for mods, m in trained.items():
