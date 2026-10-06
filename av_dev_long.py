@@ -44,7 +44,11 @@ def _batch(job):
     seed, n, hum, mode, act = job
     n_act = int(round(n * act["frac"])); Xs, As = [], []
     if n - n_act > 0:
-        w = gen_world(n - n_act, T, H, seed=seed, a_sub=2, hum=hum, hum_mode=mode); Xs.append(w["X"]); As.append(w["A"])
+        if act.get("world") == "v5":            # MONDE VARIÉ : formes (dont le T), rotation, objets au repos, main qui babille
+            from av_world5 import gen_world_v5
+            w = gen_world_v5(n - n_act, T, H, seed=seed, a_sub=2, hum=hum, hum_mode=mode)
+        else: w = gen_world(n - n_act, T, H, seed=seed, a_sub=2, hum=hum, hum_mode=mode)
+        Xs.append(w["X"]); As.append(w["A"])
     if n_act > 0:                               # MONDE AVEC MAIN : le bébé regarde ses mains (babillage), mêmes disques/sons
         from av_act import gen_world_act
         w = gen_world_act(n_act, T, H, seed=seed + 500_000_000, a_sub=2, hum=hum, hum_mode=mode, fric=act["fric"], babble=act["babble"])
@@ -74,7 +78,13 @@ def build_probe(a, dev, st):
     pos = torch.from_numpy(np.take_along_axis(P2, o_[..., None], axis=2).reshape(len(P2), T, 4)).float()
     out = dict(sw=mk(Asw), tok=mk(A), swall=mk(A[:, :, [1, 0, 3, 2]]), imp=torch.from_numpy(w["IMP"]), lab=lab, pos=pos,
                antic=torch.from_numpy((w["IMP"][:, 8] | w["IMP"][:, 9]).astype(np.int64)))
-    if a.act_frac > 0:                          # sonde MONDE AVEC MAIN : la vision sait-elle où est SA MAIN ?
+    if a.world == "v5":                         # sonde du T (Push-T) : la vision sait-elle OÙ est le T et COMMENT il est orienté ?
+        from av_world5 import gen_world_v5
+        nt = min(1500, a.n_probe); wt = gen_world_v5(nt, T, H, seed=1002, a_sub=2, hum=a.hum, hum_mode=a.hum_mode, force_T=True)
+        Xt, At = torch.from_numpy((wt["X"] * 255).round().astype(np.uint8)), torch.from_numpy(wt["A"])
+        out["ttok"] = torch.cat([to_tokens(Xt[i:i + 250].to(dev), At[i:i + 250].to(dev), a.P, st).half().cpu() for i in range(0, nt, 250)])
+        out["tpos"] = torch.from_numpy(np.concatenate([wt["POS"][:, :, 0], np.cos(wt["ANG"][:, :, :1]), np.sin(wt["ANG"][:, :, :1])], -1)).float()
+    if a.act_frac > 0 or a.world == "v5":       # sonde MONDE AVEC MAIN : la vision sait-elle où est SA MAIN ?
         from av_act import gen_world_act
         na = min(1500, a.n_probe); wa = gen_world_act(na, T, H, seed=1001, a_sub=2, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
         Xa, Aa = torch.from_numpy((wa["X"] * 255).round().astype(np.uint8)), torch.from_numpy(wa["A"])
@@ -143,6 +153,9 @@ def exam(m, probe, a, dev, nv, tag):
     if "htok" in probe:
         res["act_disk_r2"], res["hand_r2"] = loc_r2(m, probe, nv, dev, a.read_steps, tok_key="htok", y_key="hpos", groups=[slice(0, 4), slice(4, 6)])
         msg += f" | monde avec main : disques R² {res['act_disk_r2']:+.2f}, MAIN R² {res['hand_r2']:+.2f}"
+    if "ttok" in probe:
+        res["T_pos_r2"], res["T_ang_r2"] = loc_r2(m, probe, nv, dev, a.read_steps, tok_key="ttok", y_key="tpos", groups=[slice(0, 2), slice(2, 4)])
+        msg += f" | T : position R² {res['T_pos_r2']:+.2f}, ORIENTATION R² {res['T_ang_r2']:+.2f}"
     print(f"  EXAMEN {tag:>18s} | localisation {res['localisation']:.0%} (plafond 96 %) | anticipation {res['anticipation']:.0%}" + msg, flush=True)
     return res
 
@@ -166,6 +179,7 @@ def main():
     p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--world", type=str, default="v4", choices=["v4", "v5"], help="v5 = MONDE VARIÉ (av_world5 : formes dont le T, rotation, repos, main)")
     p.add_argument("--act_frac", type=float, default=0.0, help="part de chaque lot tirée du MONDE AVEC MAIN (av_act, babillage) : le bébé regarde ses mains")
     p.add_argument("--babble", type=int, default=1, help="(avec --act_frac) gestes de babillage variés plutôt que le script viser-pousser")
     p.add_argument("--fric", type=float, default=0.02, help="(avec --act_frac) frottement du monde avec main (comme la phase 2)")
@@ -197,7 +211,7 @@ def main():
         class Wrap(torch.nn.Module):
             def __init__(s, enc): super().__init__(); s.enc, s.nv, s.T = enc, nv, T
         state["exams"].append(("init", exam(Wrap(tgt), probe, a, dev, nv, "init (aléatoire)")))
-    data = stream(state["it"], a.bs, a.workers, hum=a.hum, mode=a.hum_mode, act=dict(frac=a.act_frac, babble=a.babble, fric=a.fric)); ma = msr = None
+    data = stream(state["it"], a.bs, a.workers, hum=a.hum, mode=a.hum_mode, act=dict(frac=a.act_frac, babble=a.babble, fric=a.fric, world=a.world)); ma = msr = None
     def sigma_of(stage, k):
         return {"A": 0.0, "B": a.sig_max, "D": 0.0}.get(stage, a.sig_max * max(0.0, 1 - k / a.blur_down))
     while state["it"] < a.total:
