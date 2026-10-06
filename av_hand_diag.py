@@ -13,12 +13,40 @@ import numpy as np, torch
 from av_jepa import gen_world, NB
 from av_act import gen_world_act
 from av_dev import DevJEPA
-from av_dev_long import to_tokens, stereo, loc_r2, T, H
+import torch.nn.functional as F
+from vjepa import _gather
+from av_dev_long import to_tokens, stereo, loc_r2, _PosReader, T, H
+
+@torch.no_grad()
+def encode(enc, tok, mode, nv, npf, dev, bs=64):
+    """full = séquence entière (examen) | causal = frames 0..t (phase 2) | frame = la frame t SEULE -> (n, T, npf, d)"""
+    out = []
+    for i in range(0, len(tok), bs):
+        o = tok[i:i + bs].to(dev).float(); B = len(o); zs = []
+        if mode == "full":
+            idx = torch.arange(o.size(1), device=dev).expand(B, -1); z = enc(o, idx)[:, :nv]
+            out.append(z.reshape(B, T, npf, -1).half().cpu()); continue
+        for t in range(T):
+            if mode == "causal": idx = torch.cat([torch.arange((t + 1) * npf), nv + torch.arange(t + 1)]).to(dev)
+            else: idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev)
+            idx = idx.expand(B, -1); z = enc(_gather(o, idx), idx)
+            zs.append(z[:, t * npf:(t + 1) * npf] if mode == "causal" else z[:, :npf])
+        out.append(torch.stack(zs, 1).half().cpu())
+    return torch.cat(out)
+
+def fit_r2(Z, y, dev, steps, groups):
+    Z = Z.flatten(0, 1); y = y.flatten(0, 1); k = int(0.7 * len(Z)); mu, sd = y[:k].mean(0), y[:k].std(0) + 1e-6
+    torch.manual_seed(0); r = _PosReader(Z.size(-1), Z.size(1), nout=y.size(-1)).to(dev); opt = torch.optim.AdamW(r.parameters(), 3e-4, weight_decay=0.05)
+    for _ in range(steps):
+        bi = torch.randint(0, k, (256,)); l = F.mse_loss(r(Z[bi].to(dev).float()), ((y[bi] - mu) / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
+    r.eval()
+    with torch.no_grad(): p = torch.cat([r(Z[i:i + 512].to(dev).float()).cpu() for i in range(k, len(Z), 512)]) * sd + mu
+    yt = y[k:]; return [float(1 - ((p[:, c] - yt[:, c]) ** 2).sum() / ((yt[:, c] - yt[:, c].mean(0)) ** 2).sum()) for c in groups]
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpts", type=str, required=True); p.add_argument("--sep_enc", type=int, default=1)
-    p.add_argument("--hum", type=float, default=0.15); p.add_argument("--n", type=int, default=1500); p.add_argument("--steps", type=int, default=1500)
+    p.add_argument("--modes", type=str, default="full,causal,frame"); p.add_argument("--hum", type=float, default=0.15); p.add_argument("--n", type=int, default=1500); p.add_argument("--steps", type=int, default=1500)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     P = 4; nP = H // P; nv = T * nP * nP; da = 2 * 2 * NB; W = max(P * P * 3, da)
     w0 = gen_world(2000, T, H, seed=0, a_sub=2, hum=a.hum); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T, -1)
@@ -34,8 +62,9 @@ def main():
         probes[name] = dict(htok=tok, hpos=torch.from_numpy(y).float()); print(f"monde {name:>14s} : main bouge {mv:.2f} px/frame ({time.time() - t0:.0f}s)", flush=True)
     G = [slice(0, 4), slice(4, 6)]
     print(f"\n{'encodeur':>28s} | " + " | ".join(f"{n_:>26s}" for n_ in probes)); print(" " * 28 + " | " + " | ".join(f"{'disques R²':>12s} {'MAIN R²':>13s}" for _ in probes))
-    rows = [("PIXELS bruts (référence)", None)] + [(c.split("/")[-1], c) for c in a.ckpts.split(",")]
-    for name, c in rows:
+    rows = [("PIXELS bruts (référence)", None)] + [(c.split("/")[-1][-12:] + f" [{md}]", c, md) for c in a.ckpts.split(",") for md in a.modes.split(",")]
+    rows[0] = rows[0] + ("-",)
+    for name, c, md in rows:
         if c is None: m = None
         else:
             m0 = DevJEPA(W, da, nv, T, 192, 6, 6, 3).to(dev); enc = copy.deepcopy(m0.enc)
@@ -43,7 +72,8 @@ def main():
             m = type("W", (), {"enc": enc})()
         res = []
         for pr in probes.values():              # m None : patches bruts (represent renvoie les tokens tels quels)
-            res.append(loc_r2(m, pr, nv, dev, a.steps, tok_key="htok", y_key="hpos", groups=G))
+            if m is None: res.append(loc_r2(m, pr, nv, dev, a.steps, tok_key="htok", y_key="hpos", groups=G))
+            else: res.append(fit_r2(encode(m.enc, pr["htok"], md, nv, nP * nP, dev), pr["hpos"], dev, a.steps, G))
         print(f"{name:>28s} | " + " | ".join(f"{d:+12.2f} {h:+13.2f}" for d, h in res) + f"  ({time.time() - t0:.0f}s)", flush=True)
 
 if __name__ == "__main__":
