@@ -104,7 +104,7 @@ def gen_world_act(n, T=16, H=32, r=0.12, seed=0, a_sub=2, pitch_mass=1, vmax=0.1
             if t > 0:
                 # --- politique « jeu de bébé » : viser un disque (et le dépasser pour le pousser) ou un point
                 if left <= 0 and babble:
-                    left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
+                    left = rng.integers(2, 7); u_ = rng.random() if babble == 1 else 0.65; spd = rng.uniform(0.015, vmax); mode = "tgt"   # babble=2 : main IMMOBILE (contrôle)
                     if u_ < 0.45:
                         k = rng.integers(2); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
                     elif u_ < 0.6: tgt = rng.uniform(R_HAND, 1 - R_HAND, 2)
