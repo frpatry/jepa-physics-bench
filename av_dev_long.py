@@ -181,6 +181,7 @@ def main():
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
     p.add_argument("--local_att", type=int, default=0, help="v6 VISION LOCALE : rayon (en cases) de l'attention entre patches (0 = globale)")
     p.add_argument("--local_t", type=int, default=2, help="(avec --local_att) rayon temporel en frames")
+    p.add_argument("--local_layers", type=int, default=99, help="(avec --local_att) nb de couches à rayon local_att ; ensuite rayon 0 (v7 STRICT : 2)")
     p.add_argument("--world", type=str, default="v4", choices=["v4", "v5"], help="v5 = MONDE VARIÉ (av_world5 : formes dont le T, rotation, repos, main)")
     p.add_argument("--act_frac", type=float, default=0.0, help="part de chaque lot tirée du MONDE AVEC MAIN (av_act, babillage) : le bébé regarde ses mains")
     p.add_argument("--babble", type=int, default=1, help="(avec --act_frac) gestes de babillage variés plutôt que le script viser-pousser")
@@ -195,8 +196,8 @@ def main():
           f"stéréo explicite | tokens {nv + T} × {W}", flush=True)
     probe = build_probe(a, dev, st)
     torch.manual_seed(a.seed); m = DevJEPA(W, da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev); m.enc.sep = bool(a.sep_enc)
-    m.enc.local, m.enc.local_t, m.enc.nP = a.local_att, a.local_t, nP
-    cfg = dict(sep=int(a.sep_enc), local=a.local_att, local_t=a.local_t)                  # enregistrée dans chaque instantané
+    m.enc.local, m.enc.local_t, m.enc.nP, m.enc.local_layers = a.local_att, a.local_t, nP, a.local_layers
+    cfg = dict(sep=int(a.sep_enc), local=a.local_att, local_t=a.local_t, local_layers=a.local_layers)   # enregistrée dans chaque instantané
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
