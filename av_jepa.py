@@ -175,6 +175,7 @@ def enc_config(enc, ck, sep_default=0):
     """applique la config d'encodeur enregistrée dans un instantané (sep, attention locale) ; sinon valeurs par défaut."""
     cfg = ck.get("cfg", {}) if isinstance(ck, dict) else {}
     enc.sep = bool(cfg.get("sep", sep_default)); enc.local = int(cfg.get("local", 0)); enc.local_t = int(cfg.get("local_t", 2))
+    enc.local_layers = int(cfg.get("local_layers", 99))
     return enc
 
 class AVEncoder(nn.Module):
@@ -184,6 +185,7 @@ class AVEncoder(nn.Module):
         s.ev, s.ea = nn.Linear(dv, d), nn.Linear(da, d); s.mod = nn.Embedding(2, d); s.pos = nn.Embedding(ntok, d)
         s.nv, s.da, s.nh, s.sep = nv, da, nh, False
         s.local, s.local_t, s.nP = 0, 2, 8      # VISION LOCALE (v6) : un patch n'attend que ses voisins (rayon local en cases, local_t en frames)
+        s.local_layers = 99                     # couches à rayon `local` ; au-delà : rayon 0 (chaque patch n'écoute que LUI-MÊME dans le temps)
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
     def forward(s, tok, idx):
@@ -192,13 +194,15 @@ class AVEncoder(nn.Module):
         x = e + s.mod(isa.long()) + s.pos(idx)
         if s.local > 0:                         # ATTENTION LOCALE : les tokens restent attachés à LEUR coin de l'image
             npf = s.nP * s.nP; fr, cell = idx // npf, idx % npf; ry, rx = cell // s.nP, cell % s.nP
-            near = ((ry.unsqueeze(2) - ry.unsqueeze(1)).abs() <= s.local) & ((rx.unsqueeze(2) - rx.unsqueeze(1)).abs() <= s.local) \
-                & ((fr.unsqueeze(2) - fr.unsqueeze(1)).abs() <= s.local_t)
+            dyx = torch.maximum((ry.unsqueeze(2) - ry.unsqueeze(1)).abs(), (rx.unsqueeze(2) - rx.unsqueeze(1)).abs())
+            near_t = (fr.unsqueeze(2) - fr.unsqueeze(1)).abs() <= s.local_t
             vv = (~isa).unsqueeze(2) & (~isa).unsqueeze(1); aa = isa.unsqueeze(2) & isa.unsqueeze(1)
-            allow = (vv & near) | aa
-            if not s.sep: allow = allow | isa.unsqueeze(2) | isa.unsqueeze(1)                 # séparé : pas d'attention croisée image/son
-            allow = allow.unsqueeze(1)                                                       # (B, 1, N, N) -> noyau SDPA efficace
-            for L in s.tr.layers: x = _layer_masked(L, x, allow)
+            def mk(R):
+                allow = (vv & near_t & (dyx <= R)) | aa
+                if not s.sep: allow = allow | isa.unsqueeze(2) | isa.unsqueeze(1)             # séparé : pas d'attention croisée image/son
+                return allow.unsqueeze(1)                                                    # (B, 1, N, N) -> noyau SDPA efficace
+            m_loc, m_self = mk(s.local), (mk(0) if s.local_layers < len(s.tr.layers) else None)
+            for j, L in enumerate(s.tr.layers): x = _layer_masked(L, x, m_loc if j < s.local_layers else m_self)
             return s.ln(x)
         if s.sep:                               # ENCODEURS SÉPARÉS (idée user « deux entrées ») : un patch ne voit que l'image,
             kv = int((~isa[0]).sum())           # un token audio que le son ; la fusion = le PRÉDICTEUR. Indices triés -> vision

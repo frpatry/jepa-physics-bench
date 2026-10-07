@@ -18,9 +18,25 @@ from av_dev import DevJEPA
 from av_dev_long import to_tokens, stereo, T, H
 from av_hand_diag import encode
 
-def stats(Z, w, nP):
+@torch.no_grad()
+def pair_change(enc, tok, nv, npf, dev, bs=64):
+    """|z(frame t+1) - z(frame t)| avec LES DEUX frames encodées à la MÊME position temporelle t (sinon le plongement
+    de position temporelle change TOUS les tokens d'une frame à l'autre et noie la mesure) -> (n, T-1, npf)."""
+    from vjepa import _gather
+    out = []
+    for i in range(0, len(tok), bs):
+        o = tok[i:i + bs].to(dev).float(); B = len(o); ds = []
+        for t in range(T - 1):
+            idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
+            nxt = torch.cat([torch.arange((t + 1) * npf, (t + 2) * npf), torch.tensor([nv + t + 1])]).to(dev).expand(B, -1)
+            z0 = enc(_gather(o, idx), idx)[:, :npf]; z1 = enc(_gather(o, nxt), idx)[:, :npf]       # contenu t+1, position t
+            ds.append((z1 - z0).float().abs().sum(-1))
+        out.append(torch.stack(ds, 1).cpu())
+    return torch.cat(out)
+
+def stats(Z, w, nP, dz=None):
     """Z (n, T, npf, d) -> concentration du changement autour de la main, part commune."""
-    n = len(Z); dz = (Z[:, 1:].float() - Z[:, :-1].float()).abs().sum(-1)            # (n, T-1, npf)
+    n = len(Z); dz = (Z[:, 1:].float() - Z[:, :-1].float()).abs().sum(-1) if dz is None else dz   # (n, T-1, npf)
     hp = np.clip((w["HAND"] * nP).astype(int), 0, nP - 1)                              # (n, T, 2) cellule (x, y)
     mv = np.linalg.norm(np.diff(w["HAND"], axis=1), axis=-1) * 32 > 1.0                 # la main a bougé > 1 px
     still = (w["WHO"][:, 1:] < 0)                                                      # sans pousser de disque
@@ -54,7 +70,7 @@ def main():
     for ck in a.ckpts.split(","):
         enc = copy.deepcopy(m0.enc); c_ = torch.load(ck, map_location=dev, weights_only=False); enc.load_state_dict(c_["tgt"]); enc.eval(); enc_config(enc, c_, a.sep_enc)
         for md in a.modes.split(","):
-            c, u, s, _ = stats(encode(enc, tok, md, nv, npf, dev), w, nP)
+            c, u, s, _ = stats(encode(enc, tok, md, nv, npf, dev), w, nP, pair_change(enc, tok, nv, npf, dev) if md == "frame" else None)
             print(f"{ck.split('/')[-1][-16:] + ' [' + md + ']':>30s} | {c:26.0%} | {u:13.0%} | {s:24.0%}", flush=True)
 
 if __name__ == "__main__":
