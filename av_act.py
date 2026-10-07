@@ -271,6 +271,8 @@ def main():
     p.add_argument("--roll_k", type=int, default=0, help="pas de ROLLOUT autorégressif dans la perte (0 = pas suivant seul)")
     p.add_argument("--roll_w", type=float, default=1.0)
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
+    p.add_argument("--viz", type=str, default="", help="figure : réalité / ce qu'il voit (latents projetés) / ce qu'il imagine")
+    p.add_argument("--viz_n", type=int, default=3)
     p.add_argument("--plan_seg", type=int, default=0, help="planif : nb de segments à geste CONSTANT sur l'horizon (0 = un geste par pas)")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
@@ -427,6 +429,46 @@ def main():
         e = rows[-1][1]
         print(f"  {mods.upper():>4s} | erreur latents pas suivant : tous {e.mean():.4f} | poussée {e[push].mean():.4f} "
               f"| 1re poussée {e[first].mean():.4f} | disque déjà touché {e[retouch].mean():.4f}", flush=True)
+    if a.viz:                                   # CE QU'IL VOIT / CE QU'IL IMAGINE vs la RÉALITÉ (pas de décodeur : on projette les latents)
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        mods0 = list(trained)[0]; m0 = trained[mods0]
+        Cv = torch.cat([Cte, Mte], -1) if "m" in mods0 else Cte
+        Cz = Cv.clone(); Cz[:, c:, :Cte.size(-1)] = torch.from_numpy(-st["c"][0] / st["c"][1]).float()
+        pr_true = align(rollouts[mods0.upper()], tr_fut); pr_still = align(rollout(m0, Cz), tr_fut)
+        cand = [i for i in range(n_te) if pushed_fut[i].any()][:a.viz_n]
+        sl = torch.tensor(cand)
+        with torch.no_grad():                   # latents IMAGINÉS (vrais gestes) des séquences montrées
+            Vim = Vte[sl].to(dev).float().clone(); A_, T_ = Ate[sl].to(dev).clone(), Tte_[sl].to(dev).clone(); A_[:, c + 1:] = 0; T_[:, c + 1:] = 0
+            for h in range(1, H + 1):
+                o, _ = m0(Vim, A_, T_, Cv[sl].to(dev)); Vim[:, c + h] = o["v"][:, c + h - 1]
+            Vim = Vim.cpu()
+        nvt = Vte.size(2) - 1                   # tokens visuels (le dernier = son)
+        Zs = Vte[:300, :, :nvt].float().reshape(-1, Vte.size(-1)); zmu = Zs.mean(0)
+        _, _, Vh = torch.linalg.svd((Zs - zmu)[torch.randperm(len(Zs))[:20000]], full_matrices=False); pcs = Vh[:3]
+        proj = (Zs - zmu) @ pcs.T; lo, hi = proj.quantile(0.02, 0), proj.quantile(0.98, 0)
+        g = int(round(nvt ** 0.5))
+        def lmap(z): return (((z.float() - zmu) @ pcs.T - lo) / (hi - lo)).clamp(0, 1).reshape(g, g, 3).numpy()
+        steps = [-1] + list(range(0, H, 2))[:5]
+        fig, ax = plt.subplots(3 * len(cand), len(steps), figsize=(1.9 * len(steps), 5.8 * len(cand)))
+        for r, i in enumerate(cand):
+            for j, h in enumerate(steps):
+                t = c + 1 + h if h >= 0 else c
+                a0, a1, a2 = ax[3 * r, j], ax[3 * r + 1, j], ax[3 * r + 2, j]
+                a0.imshow(wte["X"][i, t]); a1.imshow(lmap(Vte[i, t, :nvt]))
+                a2.imshow(lmap(Vim[r, t, :nvt]) if h >= 0 else np.zeros((g, g, 3)))
+                for x in (a0, a1, a2): x.set_xticks([]); x.set_yticks([])
+                if h >= 0:
+                    P, Q, R_ = (tr_fut[i, h].numpy() * 32 - 0.5), (pr_true[i, h].numpy() * 32 - 0.5), (pr_still[i, h].numpy() * 32 - 0.5)
+                    a0.scatter(P[[0, 2]], P[[1, 3]], s=90, facecolors="none", edgecolors="w", lw=1.3)
+                    a0.scatter([P[4]], [P[5]], s=90, facecolors="none", edgecolors="w", lw=1.3, marker="s")
+                    a0.scatter(Q[[0, 2]], Q[[1, 3]], s=45, c="r", marker="x"); a0.scatter([Q[4]], [Q[5]], s=60, c="yellow", marker="+")
+                    a0.scatter(R_[[0, 2]], R_[[1, 3]], s=20, c="deepskyblue", marker="o")
+                    a0.set_title(f"futur +{h + 1}", fontsize=8)
+                else: a0.set_title("dernier vu", fontsize=8)
+            ax[3 * r, 0].set_ylabel("réalité", fontsize=8); ax[3 * r + 1, 0].set_ylabel("ce qu'il VOIT", fontsize=8); ax[3 * r + 2, 0].set_ylabel("ce qu'il IMAGINE", fontsize=8)
+        fig.suptitle("cercles blancs = vraies positions ; × rouges / + jaune = disques / main lus dans son IMAGINATION (vrais gestes) ;\n"
+                     "points bleus = s'il imaginait sa main IMMOBILE ; cartes = 3 axes principaux de ses latents de patches (couleurs)", fontsize=8)
+        plt.tight_layout(); plt.savefig(a.viz, dpi=110); plt.close(); print(f"figure -> {a.viz}", flush=True)
     print("\n========== PRÉDICTION DU PAS SUIVANT (latents V-JEPA 2, jeu tenu à l'écart ; plus bas = mieux) ==========")
     print(f"{'modèle':>6s} | {'tous':>7s} | {'poussée':>7s} | {'1re pouss.':>10s} | {'déjà touché':>11s}")
     for name, e in rows:
