@@ -443,11 +443,12 @@ def main():
                 o, _ = m0(Vim, A_, T_, Cv[sl].to(dev)); Vim[:, c + h] = o["v"][:, c + h - 1]
             Vim = Vim.cpu()
         nvt = Vte.size(2) - 1                   # tokens visuels (le dernier = son)
-        Zs = Vte[:300, :, :nvt].float().reshape(-1, Vte.size(-1)); zmu = Zs.mean(0)
-        _, _, Vh = torch.linalg.svd((Zs - zmu)[torch.randperm(len(Zs))[:20000]], full_matrices=False); pcs = Vh[:3]
-        proj = (Zs - zmu) @ pcs.T; lo, hi = proj.quantile(0.02, 0), proj.quantile(0.98, 0)
+        zpos = Vte[:300, :, :nvt].float().mean((0, 1))                # moyenne PAR PATCH : on retire « où je suis » pour ne garder
+        Zs = (Vte[:300, :, :nvt].float() - zpos).reshape(-1, Vte.size(-1))   # que « ce qu'il y a ici » (le contenu)
+        _, _, Vh = torch.linalg.svd(Zs[torch.randperm(len(Zs))[:20000]], full_matrices=False); pcs = Vh[:3]
+        proj = Zs @ pcs.T; lo, hi = proj.quantile(0.02, 0), proj.quantile(0.98, 0)
         g = int(round(nvt ** 0.5))
-        def lmap(z): return (((z.float() - zmu) @ pcs.T - lo) / (hi - lo)).clamp(0, 1).reshape(g, g, 3).numpy()
+        def lmap(z): return (((z.float() - zpos) @ pcs.T - lo) / (hi - lo)).clamp(0, 1).reshape(g, g, 3).numpy()
         steps = [-1] + list(range(0, H, 2))[:5]
         fig, ax = plt.subplots(3 * len(cand), len(steps), figsize=(1.9 * len(steps), 5.8 * len(cand)))
         for r, i in enumerate(cand):
