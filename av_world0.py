@@ -51,11 +51,13 @@ def cont_sound(amp, x, T, rng, kind, f0=1000.0):
         src = sum(np.sin(2 * math.pi * f0 * r * tt + r) / (1 + j) for j, r in enumerate((1.0, 2.32, 4.25)) if f0 * r < 0.95 * SR / 2)
     return np.stack([a * np.sqrt(1 - xc) * src, a * np.sqrt(xc) * src]).astype(np.float32)
 
-def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08):
+def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
+               force_mtype=None, force_tcut=None):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
-    2 relié puis coupé, -1 aucun]. mobile_delay > 0 : le mobile répond au geste avec retard (test « direct / différé »)."""
+    2 relié puis coupé, -1 aucun]. mobile_delay > 0 : le mobile répond au geste avec retard (test « direct / différé »).
+    force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -97,7 +99,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             Hp = place(rng.uniform(lo_c, hi_c, 2) if out else rng.uniform(max(lo_c, 0.05), min(hi_c, 0.95), 2))
             if N == 0 or np.all(np.linalg.norm(P - Hp, axis=1) > rc + Rh + 0.02): break
         if cf["mobile"]:                                             # MOBILE (hochet suspendu) hors de portée
-            mt = int(rng.choice(3, p=[0.55, 0.25, 0.20])); MTYPE[i] = mt; tcut = int(rng.integers(5, T - 4)) if mt == 2 else T
+            mt = int(rng.choice(3, p=[0.55, 0.25, 0.20])); tcut = int(rng.integers(5, T - 4))   # tirages FIXES (paires appariées)
+            mt = mt if force_mtype is None else force_mtype; tcut = (tcut if force_tcut is None else force_tcut) if mt == 2 else T; MTYPE[i] = mt
             M0 = np.array([rng.uniform(0.25, 0.75), rng.uniform(0.15, 0.3)], np.float32); off = np.zeros(2, np.float32); mv = np.zeros(2, np.float32)
             mkind = int(rng.integers(0, 3)); mcol = PAL[rng.integers(len(PAL))]; mf0 = rng.uniform(850, 1150)
         vact = np.zeros((T, 2), np.float32); mspd = np.zeros(T, np.float32); ev = []
