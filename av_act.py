@@ -273,7 +273,7 @@ def main():
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
-    p.add_argument("--ro_layers", type=int, default=2, help="couches d'attention du lecteur avant mise en commun (0 = ancien lecteur à 1 requête)")
+    p.add_argument("--ro_layers", type=int, default=0, help="couches d attention du lecteur avant mise en commun (0 = lecteur à 1 requête ; 2 couches SOUS-ENTRAÎNÉES en 3000 pas : disques 3.80 px vs 2.85 -> défaut 0)")
     p.add_argument("--diag", type=int, default=0, help="DIAGNOSTIC planif : nb d'épisodes ; sensibilité à l'action + classement imaginé vs réel des gestes candidats")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
