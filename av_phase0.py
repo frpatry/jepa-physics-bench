@@ -89,10 +89,18 @@ class InvHead(nn.Module):
         x = s.inp(torch.cat([z0, z1], 1)) + s.pos
         return s.out(s.tr(torch.cat([s.cls.expand(len(x), -1, -1), x], 1))[:, 0])
 
+class DiffHead(nn.Module):
+    """CONTINGENCE, version DIFFÉRENCE : par patch [z_t − z_{t−1}, z_t] -> MLP -> moyenne -> commande.
+    Diag av_inv_diag (instantané 0a 6k, latents gelés) : R² 0.73–0.75 vs 0.66 pour InvHead neuve (0.07 entraînée en conjoint)."""
+    def __init__(s, d, npf, h=256):
+        super().__init__(); s.pos = nn.Parameter(torch.zeros(1, npf, 2 * d)); s.mlp = nn.Sequential(nn.Linear(2 * d, h), nn.GELU(), nn.Linear(h, h), nn.GELU()); s.out = nn.Linear(h, 2)
+    def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
+
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn"):
         super().__init__()
-        s.enc = Enc4(din, d, nv, T, nl, nh, sep); s.pred = PredAC(d, nv + 3 * T, T, pl, nh); s.inv = InvHead(d, npf)
+        s.enc = Enc4(din, d, nv, T, nl, nh, sep); s.pred = PredAC(d, nv + 3 * T, T, pl, nh)
+        s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -262,6 +270,8 @@ def main():
     p.add_argument("--lr", type=float, default=2e-4); p.add_argument("--ema", type=float, default=0.996); p.add_argument("--n_masks", type=int, default=3)
     p.add_argument("--sig_w", type=float, default=0.005); p.add_argument("--inv_w", type=float, default=0.1, help="poids de la CONTINGENCE (deviner son geste)")
     p.add_argument("--inv_k", type=int, default=4, help="paires de frames par séquence pour la contingence")
+    p.add_argument("--inv_head", type=str, default="attn", choices=["attn", "diff"], help="diff = tête DIFFÉRENCE (run 1 : la tête attn conjointe restait à R² ≈ 0)")
+    p.add_argument("--inv_clip", type=int, default=0, help="1 = la tête de contingence hors de l'écrêtage global des gradients (dominé par le JEPA)")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
@@ -280,11 +290,11 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
-    cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0")
+    cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -315,7 +325,8 @@ def main():
         if a.sig_w > 0:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
         loss = jl + a.inv_w * il + a.sig_w * sr
-        opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step()
+        opt.zero_grad(); loss.backward()
+        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
