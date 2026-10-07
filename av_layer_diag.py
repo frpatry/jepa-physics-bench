@@ -45,6 +45,9 @@ def layer_feats(enc, X, P, dev, bs=256):
 def read(Z, y, dev, steps):
     """-> erreur (% de la largeur) main, disques (invariant à l'ordre)."""
     k = int(0.8 * len(Z)); mu, sd = y[:k].mean(0), y[:k].std(0) + 1e-6
+    Zf = Z[:k].float(); Z = ((Z.float() - Zf.mean(0)) / (Zf.std(0) + 1e-4)).half()   # standardisé PAR position de patch et dimension :
+    # retire la composante « où est ce patch » (souvent dominante) pour ne garder que le CONTENU — sinon le lecteur échoue sur des
+    # couches pourtant informatives (ex. plongement d'entrée v7 lu à 20 % alors qu'il est linéaire en pixels)
     torch.manual_seed(0); r = _PosReader(Z.size(-1), Z.size(1), nout=6).to(dev)
     opt = torch.optim.AdamW(r.parameters(), 3e-4, weight_decay=0.05); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
     sw = [2, 3, 0, 1, 4, 5]
