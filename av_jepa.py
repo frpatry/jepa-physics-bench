@@ -204,6 +204,10 @@ class AVEncoder(nn.Module):
             m_loc, m_self = mk(s.local), (mk(0) if s.local_layers < len(s.tr.layers) else None)
             for j, L in enumerate(s.tr.layers): x = _layer_masked(L, x, m_loc if j < s.local_layers else m_self)
             return s.ln(x)
+        if getattr(s, "upto", 0) > 0:           # COUCHE INTERMÉDIAIRE (diag : les couches basses gardent la position fine,
+            assert bool((~isa).all()), "upto : tokens visuels seulement"   # les hautes l'effacent) — vision seule
+            for L in s.tr.layers[:s.upto]: x = L(x)
+            return x
         if s.sep:                               # ENCODEURS SÉPARÉS (idée user « deux entrées ») : un patch ne voit que l'image,
             kv = int((~isa[0]).sum())           # un token audio que le son ; la fusion = le PRÉDICTEUR. Indices triés -> vision
             if bool(((~isa).sum(1) == kv).all()) and bool((~isa[:, :kv]).all()):     # puis audio, même nombre par ligne :

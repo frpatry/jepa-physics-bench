@@ -170,6 +170,10 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64, quiet=Fa
             else:                               # frame seule
                 idx = torch.cat([torch.arange(t * npf, (t + 1) * npf), torch.tensor([nv + t])]).to(dev).expand(B, -1)
                 z = enc(torch.gather(tok, 1, idx.unsqueeze(-1).expand(-1, -1, tok.size(-1))), idx)   # (B, 65, d)
+                if a.enc_layer > 0:             # vision lue à une COUCHE INTERMÉDIAIRE (plus précise) ; son = sortie normale
+                    iv = idx[:, :npf]; enc.upto = a.enc_layer
+                    zv_ = enc(torch.gather(tok, 1, iv.unsqueeze(-1).expand(-1, -1, tok.size(-1))), iv); enc.upto = 0
+                    z = torch.cat([zv_, z[:, npf:]], 1)
             zv = z[:, :npf] if a.dev_pool == 1 else \
                 F.avg_pool2d(z[:, :npf].reshape(B, nP, nP, d).permute(0, 3, 1, 2), a.dev_pool).flatten(2).transpose(1, 2)   # (B, (8/pool)², d)
             zs.append(torch.cat([zv, z[:, npf:]], 1))
@@ -271,6 +275,7 @@ def main():
     p.add_argument("--roll_k", type=int, default=0, help="pas de ROLLOUT autorégressif dans la perte (0 = pas suivant seul)")
     p.add_argument("--roll_w", type=float, default=1.0)
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
+    p.add_argument("--enc_layer", type=int, default=0, help="(--dev_ctx frame) vision lue après k couches de l'encodeur (0 = sortie)")
     p.add_argument("--viz", type=str, default="", help="figure : réalité / ce qu'il voit (latents projetés) / ce qu'il imagine")
     p.add_argument("--viz_n", type=int, default=3)
     p.add_argument("--plan_seg", type=int, default=0, help="planif : nb de segments à geste CONSTANT sur l'horizon (0 = un geste par pas)")
