@@ -223,12 +223,16 @@ def loss_fn(out, V, A, Tch, targets="v", chg_w=0.0):
 class PosReadout(nn.Module):
     """lecteur GELÉ latents V-JEPA 2 d'un pas -> positions (2 disques + main). Entraîné sur les VRAIS
     latents, puis appliqué aux latents PRÉDITS : erreur en pixels = espace décodé « certifié »."""
-    def __init__(s, dv, d=256):
+    def __init__(s, dv, d=256, nl=0):
         super().__init__()
         s.proj = nn.Linear(dv, d); s.pos = nn.Parameter(torch.zeros(1, 80, d)); s.q = nn.Parameter(torch.randn(1, 1, d) * 0.02)
         s.att = nn.MultiheadAttention(d, 4, batch_first=True); s.out = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, 256), nn.GELU(), nn.Linear(256, 6))
+        # nl > 0 : quelques couches d'attention AVANT la mise en commun — un encodeur LOCAL met chaque objet dans SON token,
+        # une seule requête ne peut pas regarder 3 endroits à la fois (instrument, comme le lecteur des examens)
+        s.tr = nn.TransformerEncoder(nn.TransformerEncoderLayer(d, 4, 2 * d, batch_first=True, dropout=0.0), nl) if nl > 0 else None
     def forward(s, v):                                                  # v (B, k, dv)
         h = s.proj(v) + s.pos[:, :v.size(1)]
+        if s.tr is not None: h = s.tr(h)
         return s.out(s.att(s.q.expand(len(v), -1, -1), h, h)[0][:, 0])
 
 def main():
@@ -269,6 +273,7 @@ def main():
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
+    p.add_argument("--ro_layers", type=int, default=2, help="couches d'attention du lecteur avant mise en commun (0 = ancien lecteur à 1 requête)")
     p.add_argument("--diag", type=int, default=0, help="DIAGNOSTIC planif : nb d'épisodes ; sensibilité à l'action + classement imaginé vs réel des gestes candidats")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     wtr = gen_world_act(a.n_train, a.T, seed=a.seed, a_sub=a.a_sub, hum=a.hum, hum_mode=a.hum_mode, fric=a.fric, babble=a.babble)
@@ -323,7 +328,7 @@ def main():
         P = w["POS"][:, f - 1::f].reshape(len(w["POS"]), Tt, 4); Hh = w["HAND"][:, f - 1::f]
         return torch.from_numpy(np.concatenate([P, Hh], -1))           # (n, Tt, 6)
     Ptr, Pte = pos_target(wtr), pos_target(wte); torch.manual_seed(0)
-    ro = PosReadout(dv).to(dev); opt = torch.optim.AdamW(ro.parameters(), 1e-3, weight_decay=1e-2)
+    ro = PosReadout(dv, nl=a.ro_layers).to(dev); opt = torch.optim.AdamW(ro.parameters(), 1e-3, weight_decay=1e-2)
     for it in range(a.ro_steps):
         bi = torch.randint(0, len(Vtr), (128,)); sj = torch.randint(0, Tt, (128,))
         pr_, y_ = ro(Vtr[bi, sj].to(dev).float()), Ptr[bi, sj].to(dev)
