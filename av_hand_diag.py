@@ -10,7 +10,7 @@ saillance, plus d'exposition).
 """
 import argparse, copy, time
 import numpy as np, torch
-from av_jepa import gen_world, NB
+from av_jepa import gen_world, NB, enc_config
 from av_act import gen_world_act
 from av_world5 import gen_world_v5
 from av_dev import DevJEPA
@@ -74,7 +74,7 @@ def main():
         if c is None: m = None
         else:
             m0 = DevJEPA(W, da, nv, T, 192, 6, 6, 3).to(dev); enc = copy.deepcopy(m0.enc)
-            enc.load_state_dict(torch.load(c, map_location=dev, weights_only=False)["tgt"]); enc.eval(); enc.sep = bool(a.sep_enc)
+            ck = torch.load(c, map_location=dev, weights_only=False); enc.load_state_dict(ck["tgt"]); enc.eval(); enc_config(enc, ck, a.sep_enc)
             m = type("W", (), {"enc": enc})()
         res = []
         for pr in probes.values():              # m None : patches bruts (represent renvoie les tokens tels quels)

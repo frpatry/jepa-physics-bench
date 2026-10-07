@@ -179,6 +179,8 @@ def main():
     p.add_argument("--lr_decay", action="store_true", help="taux d'apprentissage en cosinus (au lieu de constant)")
     p.add_argument("--init_from", type=str, default="", help="démarrer depuis un instantané (m, tgt, state) si --ckpt n'existe pas encore")
     p.add_argument("--hum", type=float, default=0.0, help="MONDE v4 : son continu par objet (0 = v2, chocs seuls)"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--local_att", type=int, default=0, help="v6 VISION LOCALE : rayon (en cases) de l'attention entre patches (0 = globale)")
+    p.add_argument("--local_t", type=int, default=2, help="(avec --local_att) rayon temporel en frames")
     p.add_argument("--world", type=str, default="v4", choices=["v4", "v5"], help="v5 = MONDE VARIÉ (av_world5 : formes dont le T, rotation, repos, main)")
     p.add_argument("--act_frac", type=float, default=0.0, help="part de chaque lot tirée du MONDE AVEC MAIN (av_act, babillage) : le bébé regarde ses mains")
     p.add_argument("--babble", type=int, default=1, help="(avec --act_frac) gestes de babillage variés plutôt que le script viser-pousser")
@@ -193,6 +195,8 @@ def main():
           f"stéréo explicite | tokens {nv + T} × {W}", flush=True)
     probe = build_probe(a, dev, st)
     torch.manual_seed(a.seed); m = DevJEPA(W, da, nv, T, a.d, a.nl, a.nh, a.pred_layers).to(dev); m.enc.sep = bool(a.sep_enc)
+    m.enc.local, m.enc.local_t, m.enc.nP = a.local_att, a.local_t, nP
+    cfg = dict(sep=int(a.sep_enc), local=a.local_att, local_t=a.local_t)                  # enregistrée dans chaque instantané
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
@@ -259,9 +263,9 @@ def main():
             m.eval(); r = exam(type("W", (), {"enc": tgt, "nv": nv, "T": T, "pred": m.pred, "enc_c": m.enc})(), probe, a, dev, nv, f"pas {it} étape {stage}")
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
             # INSTANTANÉ à chaque examen (le run v2 s'est EFFONDRÉ vers 80k : la sauvegarde unique écrasait l'état sain)
-            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state), a.ckpt.replace(".pt", f"_{it // 1000}k.pt"))
+            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg), a.ckpt.replace(".pt", f"_{it // 1000}k.pt"))
         if it % a.ckpt_every == 0 or it == a.total:
-            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state), a.ckpt + ".tmp")
+            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state, cfg=cfg), a.ckpt + ".tmp")
             os.replace(a.ckpt + ".tmp", a.ckpt)
     print("\n========== EXAMENS AU FIL DU DÉVELOPPEMENT (hasard 50 % ; plafond localisation 96 %) ==========")
     for tag, r in state["exams"]: print(f"  {tag:>20s} | localisation {r['localisation']:.0%} | anticipation {r['anticipation']:.0%}")

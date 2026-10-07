@@ -24,7 +24,7 @@ Variantes (mêmes données/pas) : V+action | V+son+action | V+son+TOUCHER+action
 """
 import argparse, math, os, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
-from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio, hum_signal
+from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio, hum_signal, enc_config
 from av_vjepa2 import encode_vjepa2
 
 M_HAND, R_HAND = 1.0, 0.07
@@ -156,7 +156,7 @@ def encode_dev(w, a, dev, P=4, d=192, nl=6, nh=6, pred_layers=3, bs=64, quiet=Fa
         w0 = gen_world(2000, T0, H0, seed=0, a_sub=2, hum=a.hum, hum_mode=a.hum_mode); A0 = stereo(torch.from_numpy(w0["A"])).reshape(2000, T0, -1)
         st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev)); del w0     # mêmes stats que le pré-entraînement
         m = DevJEPA(W, da, nv, T0, d, nl, nh, pred_layers).to(dev); enc = copy.deepcopy(m.enc)
-        enc.load_state_dict(torch.load(a.enc_ckpt, map_location=dev, weights_only=False)["tgt"]); enc.eval(); enc.sep = bool(a.sep_enc); del m
+        ck = torch.load(a.enc_ckpt, map_location=dev, weights_only=False); enc.load_state_dict(ck["tgt"]); enc.eval(); enc_config(enc, ck, a.sep_enc); del m, ck
         _ENC[a.enc_ckpt] = (enc, st)
     enc, st = _ENC[a.enc_ckpt]
     X = torch.from_numpy((w["X"] * 255).round().astype(np.uint8)); A = torch.from_numpy(w["A"]); n = len(X); out = []
