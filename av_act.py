@@ -271,6 +271,7 @@ def main():
     p.add_argument("--roll_k", type=int, default=0, help="pas de ROLLOUT autorégressif dans la perte (0 = pas suivant seul)")
     p.add_argument("--roll_w", type=float, default=1.0)
     p.add_argument("--pred_cache", type=str, default="", help="préfixe de sauvegarde/rechargement des prédicteurs entraînés")
+    p.add_argument("--plan_seg", type=int, default=0, help="planif : nb de segments à geste CONSTANT sur l'horizon (0 = un geste par pas)")
     p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_pop", type=int, default=64); p.add_argument("--plan_iters", type=int, default=3)
     p.add_argument("--ro_steps", type=int, default=3000, help="pas du lecteur de positions")
     p.add_argument("--ro_layers", type=int, default=0, help="couches d attention du lecteur avant mise en commun (0 = lecteur à 1 requête ; 2 couches SOUS-ENTRAÎNÉES en 3000 pas : disques 3.80 px vs 2.85 -> défaut 0)")
@@ -571,11 +572,14 @@ def main():
                     act = np.clip(act, -vmax, vmax)
                 else:                                                  # MPC dans l'IMAGINATION
                     Hh = min(a.plan_h, a.T - 1 - t); imag = imaginer(t, Hh)
-                    mu_ = torch.zeros(Hh, 2, device=dev); sd_ = torch.full((Hh, 2), 0.06, device=dev)
+                    K = a.plan_seg if a.plan_seg > 0 else Hh     # plan_seg > 0 : gestes PERSISTANTS (K segments à vitesse constante,
+                    rep = -(-Hh // K)                            # comme le babillage vécu) au lieu d'un geste différent à chaque pas
+                    mu_ = torch.zeros(K, 2, device=dev); sd_ = torch.full((K, 2), 0.06, device=dev)
                     for _ in range(a.plan_iters):
-                        cand = (mu_ + sd_ * torch.randn(a.plan_pop, Hh, 2, device=dev)).clamp(-vmax, vmax)
+                        seg = (mu_ + sd_ * torch.randn(a.plan_pop, K, 2, device=dev)).clamp(-vmax, vmax)
+                        cand = seg.repeat_interleave(rep, 1)[:, :Hh]
                         cost = imag(cand)
-                        el = cand[cost.argsort()[:max(4, a.plan_pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
+                        el = seg[cost.argsort()[:max(4, a.plan_pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                     act = mu_[0].cpu().numpy().astype(np.float32)
                 step(t + 1, act)
             dfin = float(np.linalg.norm(P - g, axis=1).min())
