@@ -189,16 +189,16 @@ def ridge_err(Z, Y, dev):
     return float((X[v:] @ best[1] + tm - t[v:]).norm(dim=-1).mean() * 100)
 
 def probe_frames(pr, nP, P, npf, rng):
-    """(séquence, frame) où la main est VISIBLE (4 par séquence) et où il y a UN seul objet (pour la sonde objet)."""
+    """(séquence, frame) où la main est VISIBLE (8 par séquence) et où il y a UN seul objet (8 frames, sonde objet)."""
     n = len(pr["X"]); hs, os_ = [], []
     for i in range(n):
         ok = np.where(pr["INVIEW"][i])[0]
-        for t in rng.choice(ok, min(4, len(ok)), replace=False): hs.append((i, t))
+        for t in rng.choice(ok, min(8, len(ok)), replace=False): hs.append((i, t))
         if pr["NOBJ"][i] == 1:
-            for t in rng.choice(T, 2, replace=False): os_.append((i, t))
+            for t in rng.choice(T, 8, replace=False): os_.append((i, t))
     return np.array(hs), np.array(os_)
 
-def exam(m, tgt, probes, st, v, a, dev, nv, npf, tag):
+def exam(m, tgt, probes, st, v, a, dev, nv, npf, tag, ref=None):
     P, d = a.P, a.d; md, fr = layout(nv, npf); res = {}; ctrl = probes["ctrl"]; tb = to_torch(ctrl)
     # 1 ÉCOUTE SES GESTES : futur imaginé avec SES gestes vs ceux d'une autre séquence
     cm, tm = fr <= 7, fr > 7; e0 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d); e1 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d, lie=True)
@@ -230,9 +230,10 @@ def exam(m, tgt, probes, st, v, a, dev, nv, npf, tag):
     res["ecart"] = float(Z[:, :, :4].float().std(0).mean())
     res["main_px"] = ridge_err(Z[hs[:, 0], hs[:, 1]], torch.from_numpy(ctrl["HAND"][hs[:, 0], hs[:, 1]]), dev)
     os_ = probes["os"]; res["objet_px"] = ridge_err(Z[os_[:, 0], os_[:, 1]], torch.from_numpy(ctrl["POS"][os_[:, 0], os_[:, 1], 0]), dev)
+    r0 = ref or res; sp = lambda k: f"{res[k]:.0%} (init {r0[k]:.0%})"   # les paires comparées n'ont pas la même difficulté : juger le PROGRÈS
     print(f"  EXAMEN {tag} | 1 ÉCOUTE SES GESTES (erreur si on lui ment) : {', '.join(msg)}\n"
-          f"      SURPRISE (50 % = ne remarque rien) : 2 ruban coupé {res['ruban']:.0%}, retard {res['retard']:.0%} | 3 vu ici/senti là {res['bras']:.0%} "
-          f"| 4 contact non senti {res['toucher']:.0%}\n"
+          f"      SURPRISE (50 % = ne remarque rien) : 2 ruban coupé {sp('ruban')}, retard {sp('retard')} | 3 vu ici/senti là {sp('bras')} "
+          f"| 4 contact non senti {sp('toucher')}\n"
           f"      5 devine son geste (vision) R² {res['inverse_r2']:+.2f} | 6 sonde : main {res['main_px']:.1f} %, objet {res['objet_px']:.1f} % "
           f"(pixels {probes['pix'][0]:.1f} / {probes['pix'][1]:.1f}) | écart-type latents {res['ecart']:.3f}", flush=True)
     return res
@@ -325,7 +326,7 @@ def main():
                   f"| SIGReg {ma[2]:.3f} | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
-            m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""))
+            m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg, norm=st), a.ckpt.replace(".pt", f"_{stage}_{it // 1000}k.pt"))
         if it % a.ckpt_every == 0 or it == a.total:
