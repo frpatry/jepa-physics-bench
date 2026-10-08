@@ -78,8 +78,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure).
     p_out : part des séquences où la TABLE DÉBORDE du champ de vision (murs à `table` au-delà du bord, idée user) : un objet poussé
     peut SORTIR du champ (on l'entend encore glisser et cogner le mur extérieur, atténué) puis parfois revenir. VIS (n,T,3) = visible.
-    calm (0..1) : COMPLEXITÉ PROGRESSIVE (idée user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba 0.8·calm,
-    3–6 images, main immobile) et les objets s'arrêtent plus vite (frottement 0.008 avec proba calm) : geste -> contact -> effet LISIBLE."""
+    calm (0..1) : MONDE LISIBLE / COMPLEXITÉ PROGRESSIVE (idées user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba
+    0.8·calm, 3–6 images) ; il fait aussi des pauses sans contact (0.35·calm des changements de geste) ; les objets sont AU REPOS par
+    défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -111,7 +112,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 P[k] = rng.uniform(rc[k], 1 - rc[k], 2)
                 ok = all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k))
                 if ok and (stage != "0d" or np.linalg.norm(P[k] - SHOULDER) < Lr - rc[k] - 0.03): break
-        moving = rng.random(N) >= cf["rest"]
+        p_mov = 1 - cf["rest"] if calm <= 0 else (1 - calm) * (1 - cf["rest"]) + calm * 0.03   # monde LISIBLE : objets AU REPOS par défaut
+        moving = rng.random(N) < p_mov
         th = rng.uniform(0, 2 * math.pi, N); sp = rng.uniform(smin, smax, N) * moving
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
         ang = rng.uniform(0, 2 * math.pi, N); om = rng.normal(0, 0.15, N) * moving
@@ -133,7 +135,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             if t > 0:
                 if left <= 0:                                        # BABILLAGE (modes de v5)
                     left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
-                    if N > 0 and u_ < p_obj:                          # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
+                    if N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
+                    elif N > 0 and u_ < p_obj:                          # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
                         k = rng.integers(N); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
                     else:
                         if N > 0: u_ = 0.45 + (u_ - p_obj) / (1 - p_obj) * 0.55   # le reste garde les proportions d'origine

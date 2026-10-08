@@ -311,7 +311,7 @@ def main():
     p.add_argument("--loss", type=str, default="l1", choices=["l1", "mse"], help="mse (I-JEPA) : avec le résiduel, L1 donne le même poids à chaque case -> les cases immobiles votent « pas de changement » (run 2A sourd à la commande)")
     p.add_argument("--act_w", type=float, default=0.0, help="poids du CONTRASTE D'ACTION : l'avenir imaginé avec SES gestes doit être plus proche du vrai qu'avec ceux d'un autre")
     p.add_argument("--act_margin", type=float, default=0.2, help="écart exigé (fraction de l'erreur avec ses vrais gestes)")
-    p.add_argument("--calm", type=int, default=0, help="1 = COMPLEXITÉ PROGRESSIVE : pauses pour regarder + objets qui s'arrêtent, fréquents au début de 0d puis de plus en plus rares (0 à la fin de 0e)")
+    p.add_argument("--calm", type=int, default=0, help="1 = COMPLEXITÉ PROGRESSIVE (calme 1 -> 0) ; 2 = monde LISIBLE à progression LENTE (1 -> 0.7 en 0d, 0.7 -> 0.3 en 0e)")
     p.add_argument("--outside", type=int, default=0, help="1 = la TABLE DÉBORDE du champ dans une part croissante des séquences (0d 10 % -> 30 %, 0e 30 % -> 70 %) : objets qui sortent, entendus hors champ")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
@@ -352,8 +352,10 @@ def main():
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
-        if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + 0.4 * min(1.0, (it - starts[4]) / max(1, a.total - starts[4]))}.get(stage, 0.0)
-        if a.calm: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - min(1.0, (it - starts[4]) / max(1, a.total - starts[4])))}.get(stage, 1.0)
+        fe = min(1.0, (it - starts[4]) / max(1, a.total - starts[4]))          # avancement dans 0e
+        if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + (0.3 if a.calm == 2 else 0.4) * fe}.get(stage, 0.0)
+        if a.calm == 1: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - fe)}.get(stage, 1.0)
+        if a.calm == 2: S.wkw["calm"] = {"0d": 1 - 0.3 * f, "0e": 0.7 - 0.4 * fe}.get(stage, 1.0)   # LENT : jamais chaotique (1 -> 0.7 -> 0.3)
         lr_f = min(1.0, it / 3000) * (0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
