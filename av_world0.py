@@ -24,7 +24,7 @@ l'entraînement selon VIEW[étape], pas ici. Étiquettes (HAND, POS, LINK, TSRC,
 """
 import math
 import numpy as np
-from av_jepa import PAL, NB, SPF, SR, band_matrix, render_audio, hum_signal
+from av_jepa import PAL, NB, SPF, SR, F_MAT, band_matrix, render_audio, hum_signal
 from av_world5 import shape_alpha
 
 SHOULDER = np.array([0.5, 1.15], np.float32)          # épaule sous le bas de l'image (table vue de dessus) -> portée du bras
@@ -51,13 +51,33 @@ def cont_sound(amp, x, T, rng, kind, f0=1000.0):
         src = sum(np.sin(2 * math.pi * f0 * r * tt + r) / (1 + j) for j, r in enumerate((1.0, 2.32, 4.25)) if f0 * r < 0.95 * SR / 2)
     return np.stack([a * np.sqrt(1 - xc) * src, a * np.sqrt(xc) * src]).astype(np.float32)
 
+def att_out(p):
+    """volume d'un son produit HORS DU CHAMP : décroît avec la distance au bord de l'image (1 dans le champ)."""
+    d = float(np.linalg.norm(np.maximum(0, np.maximum(-np.asarray(p), np.asarray(p) - 1))))
+    return 1.0 / (1.0 + 6.0 * d)
+
+def fric_sound(pos, mat, m, T, level):
+    """FROTTEMENT des objets (comme hum_signal mode « fric ») mais AUDIBLE HORS CHAMP : pano saturé au bord, volume atténué
+    avec la distance au champ (on entend l'objet sorti s'éloigner, puis cogner le mur extérieur). pos (T, N, 2) -> (2, T*SPF)."""
+    n_s = T * SPF; tt = np.arange(n_s) / SR; fr = np.arange(n_s) / SPF; sig = np.zeros((2, n_s), np.float32)
+    vel = np.linalg.norm(np.diff(pos, axis=0, prepend=pos[:1]), axis=-1)
+    for k in range(pos.shape[1]):
+        x = np.interp(fr, np.arange(T), pos[:, k, 0]); sp = np.interp(fr, np.arange(T), vel[:, k])
+        g = np.interp(fr, np.arange(T), np.array([att_out(q) for q in pos[:, k]]))
+        f0 = 0.5 * F_MAT[mat[k]] * m[k] ** (-1 / 3); tone = sum(np.sin(2 * math.pi * f0 * h * tt + 1.3 * h * k) / h for h in (1, 2, 3))
+        amp = level * (sp / 0.08) * math.sqrt(m[k]) * g; xc = np.clip(x, 0, 1)
+        sig[0] += amp * np.sqrt(1 - xc) * tone; sig[1] += amp * np.sqrt(xc) * tone
+    return sig
+
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
     2 relié puis coupé, -1 aucun]. mobile_delay > 0 : le mobile répond au geste avec retard (test « direct / différé »).
     force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure).
+    p_out : part des séquences où la TABLE DÉBORDE du champ de vision (murs à `table` au-delà du bord, idée user) : un objet poussé
+    peut SORTIR du champ (on l'entend encore glisser et cogner le mur extérieur, atténué) puis parfois revenir. VIS (n,T,3) = visible.
     calm (0..1) : COMPLEXITÉ PROGRESSIVE (idée user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba 0.8·calm,
     3–6 images, main immobile) et les objets s'arrêtent plus vite (frottement 0.008 avec proba calm) : geste -> contact -> effet LISIBLE."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
@@ -67,7 +87,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     HAND = np.zeros((n, T, 2), np.float32); RH = np.zeros(n, np.float32); INVIEW = np.zeros((n, T), bool)
     POS = np.full((n, T, K, 2), np.nan, np.float32); ANG = np.full((n, T, K), np.nan, np.float32)
     SHAPE = -np.ones((n, K), np.int64); NOBJ = np.zeros(n, np.int64); IMP = np.zeros((n, T), bool); TSRC = np.zeros((n, T), np.int8)
-    MOB = np.full((n, T, 2), np.nan, np.float32); LINK = np.zeros((n, T), bool); MTYPE = -np.ones(n, np.int64)
+    MOB = np.full((n, T, 2), np.nan, np.float32); LINK = np.zeros((n, T), bool); MTYPE = -np.ones(n, np.int64); VIS = np.zeros((n, T, K), bool)
     win = np.hanning(SPF // a_sub).astype(np.float32); W = band_matrix(SPF // a_sub); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
         Rh = rng.uniform(*cf["hand"]); RH[i] = Rh; Lr = rng.uniform(*cf["reach"]) if cf["reach"] else None
@@ -96,6 +116,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
         ang = rng.uniform(0, 2 * math.pi, N); om = rng.normal(0, 0.15, N) * moving
         fric = (0.008 if calm > 0 and rng.random() < calm else rng.choice([0.0015, 0.004])) if N else 0.0   # calm : l'objet s'arrête dans la séquence
+        mg = table if (p_out > 0 and N and rng.random() < p_out) else 0.0                  # marge de la table au-delà du champ
         for _ in range(200):
             out = lo < 0 and rng.random() < 0.3                     # 0b : la main commence parfois HORS du champ
             Hp = place(rng.uniform(lo_c, hi_c, 2) if out else rng.uniform(max(lo_c, 0.05), min(hi_c, 0.95), 2))
@@ -128,14 +149,15 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 CMD[i, t] = np.clip(a, -vmax, vmax)
                 H0 = Hp.copy(); Hp = place(Hp + CMD[i, t])
                 P0 = P.copy(); P = P + V; ang = ang + om
-                for k in range(N):                                   # murs
+                for k in range(N):                                   # murs (au bord du champ, ou plus loin si la table déborde)
+                    lo_w, hi_w = rc[k] - mg, 1 - rc[k] + mg
                     for dd in range(2):
-                        if P[k, dd] < rc[k] or P[k, dd] > 1 - rc[k]:
-                            wall = rc[k] if P[k, dd] < rc[k] else 1 - rc[k]
+                        if P[k, dd] < lo_w or P[k, dd] > hi_w:
+                            wall = lo_w if P[k, dd] < lo_w else hi_w
                             fr_ = float(np.clip((wall - P0[k, dd]) / (V[k, dd] + 1e-9), 0, 0.999))
                             J = 2 * m[k] * abs(V[k, dd]); V[k, dd] = -V[k, dd]; om[k] += rng.normal(0, 0.05)
-                            P[k, dd] = 2 * rc[k] - P[k, dd] if P[k, dd] < rc[k] else 2 * (1 - rc[k]) - P[k, dd]
-                            if J > 1e-4: ev.append((t - 1 + fr_, k, J, P[k, 0]))
+                            P[k, dd] = 2 * lo_w - P[k, dd] if P[k, dd] < lo_w else 2 * hi_w - P[k, dd]
+                            if J > 1e-4: ev.append((t - 1 + fr_, k, J * att_out(P[k]), P[k, 0]))   # choc hors champ : plus faible
                 vh = Hp - H0
                 for k in range(N):                                   # main <-> objet : choc + PEAU + le lourd repousse la main
                     dv = P[k] - Hp; dist = float(np.linalg.norm(dv)); lim = rc[k] + Rh
@@ -148,7 +170,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                             ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
                         TSRC[i, t] = max(TSRC[i, t], 1 if vh_n >= -vo_n else 2)  # qui est allé vers qui : moi (actif) / le monde (passif)
                         ov = lim - dist; w_ = m[k] / (1 + m[k])
-                        Hp = place(Hp - nv * ov * w_); P[k] = np.clip(P[k] + nv * ov * (1 - w_), rc[k], 1 - rc[k])
+                        Hp = place(Hp - nv * ov * w_); P[k] = np.clip(P[k] + nv * ov * (1 - w_), rc[k] - mg, 1 - rc[k] + mg)
                         TOUCH[i, t, 2 * side] += J; TOUCH[i, t, 2 * side + 1] = max(TOUCH[i, t, 2 * side + 1], w_)
                 for k in range(N):                                   # objet <-> objet
                     for j in range(k + 1, N):
@@ -158,9 +180,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                             if s_ < 0:
                                 J = -2 * s_ * m[k] * m[j] / (m[k] + m[j]); V[k] += J / m[k] * nv; V[j] -= J / m[j] * nv
                                 om[k] += rng.normal(0, 0.1); om[j] += rng.normal(0, 0.1)
-                                xc = float((P[k, 0] + P[j, 0]) / 2); ev += [(t - 0.5, k, J, xc), (t - 0.5, j, J, xc)]
+                                xc = float((P[k, 0] + P[j, 0]) / 2); ga = att_out((P[k] + P[j]) / 2); ev += [(t - 0.5, k, J * ga, xc), (t - 0.5, j, J * ga, xc)]
                             push = (rc[k] + rc[j] - dist) / 2
-                            P[k] = np.clip(P[k] + push * nv, rc[k], 1 - rc[k]); P[j] = np.clip(P[j] - push * nv, rc[j], 1 - rc[j])
+                            P[k] = np.clip(P[k] + push * nv, rc[k] - mg, 1 - rc[k] + mg); P[j] = np.clip(P[j] - push * nv, rc[j] - mg, 1 - rc[j] + mg)
                 if fric > 0:
                     v_ = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (v_ + 1e-9), 0, 1)
                     om *= 0.97 if fric < 0.003 else 0.9
@@ -183,13 +205,13 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 img = img * (1 - al) + mcol * al
             hx = np.clip((Rh * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
             X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp; INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))
-            POS[i, t, :N] = P; ANG[i, t, :N] = ang
+            POS[i, t, :N] = P; ANG[i, t, :N] = ang; VIS[i, t, :N] = np.all((P > -s[:, None]) & (P < 1 + s[:, None]), axis=-1)
         extra = cont_sound(2 * hum * np.linalg.norm(vact, axis=1) / 0.08, HAND[i, :, 0], T, rng, "froisse")
-        if N > 0 and hum > 0: extra = extra + hum_signal(POS[i, :, :N], mat, m, T, hum, 1, "fric")
+        if N > 0 and hum > 0: extra = extra + fric_sound(POS[i, :, :N], mat, m, T, hum)          # identique à hum « fric » dans le champ, atténué hors champ
         if cf["mobile"]: extra = extra + cont_sound(2 * hum * mspd / 0.03, MOB[i, :, 0], T, rng, "tinte", mf0)
         A[i] = render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, 1, IMP[i], extra)
     return dict(X=X, A=A, TOUCH=TOUCH, PROP=PROP, CMD=CMD, HAND=HAND, RH=RH, INVIEW=INVIEW, POS=POS, ANG=ANG, SHAPE=SHAPE,
-                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE)
+                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS)
 
 def baby_view(X, stage):
     """ce que le bébé VOIT à cette étape (numpy, pour les figures) : flou gaussien UNIFORME + gris + contraste réduit."""
