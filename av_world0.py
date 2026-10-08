@@ -52,7 +52,7 @@ def cont_sound(amp, x, T, rng, kind, f0=1000.0):
     return np.stack([a * np.sqrt(1 - xc) * src, a * np.sqrt(xc) * src]).astype(np.float32)
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -110,12 +110,14 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             if t > 0:
                 if left <= 0:                                        # BABILLAGE (modes de v5)
                     left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
-                    if N > 0 and u_ < 0.45:
+                    if N > 0 and u_ < p_obj:                          # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
                         k = rng.integers(N); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
-                    elif u_ < 0.6: tgt = rng.uniform(lo_c, hi_c, 2)  # 0b : la cible peut être HORS du champ
-                    elif u_ < 0.7: mode = "immobile"
-                    elif u_ < 1 - pg: a_ = rng.uniform(0, 2 * math.pi); dirv = np.array([math.cos(a_), math.sin(a_)]); mode = "direction"
-                    else: mode = "gigote"
+                    else:
+                        if N > 0: u_ = 0.45 + (u_ - p_obj) / (1 - p_obj) * 0.55   # le reste garde les proportions d'origine
+                        if u_ < 0.6: tgt = rng.uniform(lo_c, hi_c, 2)  # 0b : la cible peut être HORS du champ
+                        elif u_ < 0.7: mode = "immobile"
+                        elif u_ < 1 - pg: a_ = rng.uniform(0, 2 * math.pi); dirv = np.array([math.cos(a_), math.sin(a_)]); mode = "direction"
+                        else: mode = "gigote"
                 left -= 1
                 if mode == "immobile": a = rng.normal(0, 0.004, 2)
                 elif mode == "direction": a = spd * dirv + rng.normal(0, 0.015, 2)
@@ -173,7 +175,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 al = shape_alpha(kind[k], s[k], ang[k], P[k, 0], P[k, 1], xx, yy, H)[..., None]
                 img = img * (1 - al) + cols[k] * al
             if cf["mobile"]:
-                MOB[i, t] = M0 + off; al = shape_alpha(mkind, 0.10, 3.0 * off[0], *MOB[i, t], xx, yy, H)[..., None]
+                MOB[i, t] = M0 + off; al = shape_alpha(mkind, mob_size, 3.0 * off[0], *MOB[i, t], xx, yy, H)[..., None]
                 img = img * (1 - al) + mcol * al
             hx = np.clip((Rh * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
             X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp; INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))

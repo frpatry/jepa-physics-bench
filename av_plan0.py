@@ -21,7 +21,7 @@ from av_jepa import PAL, SPF, SR, band_matrix, render_audio, hum_signal
 from av_world0 import gen_world0, cont_sound, SHOULDER
 from av_world5 import shape_alpha
 from av_dev_long import _PosReader
-from av_phase0 import Baby0, to_tok0, to_np, to_torch, layout, VIEW, T, H
+from av_phase0 import Baby0, baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, T, H
 
 VMAX = 0.1
 
@@ -111,7 +111,7 @@ def main():
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; md, fr = layout(nv, npf); v = VIEW["0e"]; d = cfg["d"]
-    m = Baby0(cfg["din"], nv, npf, d, cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn")).to(dev)
+    m = baby_from_cfg(cfg, dev)
     m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     print(f"bébé de phase 0, pas {ck['state']['it']} | {time.time() - t0:.0f}s", flush=True)
 
@@ -123,7 +123,7 @@ def main():
             out.append(F.layer_norm(tgt(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d).half().cpu())
         return torch.cat(out)
     # ---------- 1 LECTEUR (instrument) : objet + main, monde 0e à UN objet
-    w = gen_world0(a.n_read, "0e", T, H, seed=777); keep = np.where(w["NOBJ"] == 1)[0]
+    w = gen_world0(a.n_read, "0e", T, H, seed=777, **cfg.get("wkw", {})); keep = np.where(w["NOBJ"] == 1)[0]
     wb = to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]); b = to_torch(wb); n = len(keep)
     Y = torch.from_numpy(np.concatenate([w["POS"][keep, :, 0], w["HAND"][keep]], -1)).float()       # (n, T, 4)
     Z = vis_lat(b); ntr = int(0.8 * n); Ztr, Ytr = Z[:ntr].flatten(0, 1), Y[:ntr].flatten(0, 1)
@@ -148,7 +148,7 @@ def main():
                 tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bt.items()}, st, v, P_, dev); B = len(tok)
                 if lie: cmd = cmd.roll(1, 0)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                zp = m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd).float()
+                zp = m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float()
                 out.append(read(zp.view(B * 8, npf, d)).view(B, 8, 4).cpu())
         return torch.cat(out)
     with torch.no_grad():
@@ -185,7 +185,7 @@ def main():
             with torch.no_grad():
                 for i in range(0, len(bb["X"]), 50):
                     tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd).float().view(B, 8, npf, d).half().cpu())
+                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, 8, npf, d).half().cpu())
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
         Ytr_i, Yte_i = Y[:ntr, 8:].flatten(0, 1), Yt[:, 8:].flatten(0, 1)
@@ -216,7 +216,7 @@ def main():
         gt = torch.from_numpy(env.g).to(dev)
         def cost(cand):                         # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
-            with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd))[:, :2] - gt).norm(dim=-1)
+            with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, :2] - gt).norm(dim=-1)
         return cost
     def real_cost(env, cand):
         out = []

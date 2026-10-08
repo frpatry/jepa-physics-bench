@@ -12,7 +12,7 @@ Bébé de l'instantané vs même bébé à l'INIT (graine 0 = mêmes poids initi
 import argparse, copy
 import numpy as np, torch
 from av_world0 import gen_world0
-from av_phase0 import Baby0, errs, layout, to_np, to_torch, view_at, T, H
+from av_phase0 import Baby0, baby_from_cfg, errs, layout, to_np, to_torch, view_at, T, H
 
 def near_mobile(MOB, cols, nv, npf, nP, R=1):
     """(n, len(cols)) : patch (frame, case) à ≤ R case du mobile."""
@@ -25,10 +25,10 @@ def main():
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     P = cfg["P"]; nP = H // P; npf = nP * nP; nv = T * npf; md, fr = layout(nv, npf); v = view_at("0c", 1.0)
-    mk = lambda: Baby0(cfg["din"], nv, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn")).to(dev)
+    mk = lambda: baby_from_cfg(cfg, dev)
     torch.manual_seed(0); m0 = mk().eval(); t0 = copy.deepcopy(m0.enc).eval()
     m1 = mk(); m1.load_state_dict(ck["m"]); m1.eval(); t1 = copy.deepcopy(m1.enc); t1.load_state_dict(ck["tgt"]); t1.eval()
-    W = {k: gen_world0(a.n, "0c", T, H, seed=3003, **kw) for k, kw in
+    ms = dict(mob_size=cfg.get("wkw", {}).get("mob_size", 0.10)); W = {k: gen_world0(a.n, "0c", T, H, seed=3003, **ms, **kw) for k, kw in
          dict(relie=dict(force_mtype=0), auto=dict(force_mtype=1), coupe=dict(force_mtype=2, force_tcut=8), retard=dict(force_mtype=0, mobile_delay=3)).items()}
     B = {k: to_torch(to_np([w])) for k, w in W.items()}
     cm, tm = fr <= 7, (fr > 7) & (md == 0); cols = np.where(tm)[0]

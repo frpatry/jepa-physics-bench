@@ -67,16 +67,35 @@ class Enc4(nn.Module):
         return s.ln(x)
 
 class PredAC(nn.Module):
-    """prédicteur conditionné par la VOLONTÉ : [contexte | commandes des T frames | requêtes] -> latents des requêtes."""
-    def __init__(s, d, ntok, T, nl, nh):
+    """prédicteur conditionné par la VOLONTÉ : [contexte | commandes des T frames | requêtes] -> latents des requêtes.
+    resid (run 2) : prédiction = DERNIER latent VU de la même case (même sens, frame la plus récente ≤ cible, normalisé)
+    + changement (tête zéro-init) — run 1 : l'imagination PERDAIT l'objet, même immobile (diag av_plan0 --obj_diag)."""
+    def __init__(s, d, ntok, T, nl, nh, resid=False, nv=0, npf=1):
         super().__init__()
+        s.resid = resid
+        if resid:                                                      # case (0..npf-1 vue, npf ouïe, npf+1 toucher, npf+2 bras) et frame de chaque token
+            idx = torch.arange(ntok); cell = torch.where(idx < nv, idx % npf, npf + (idx - nv) // T); fr = torch.where(idx < nv, idx // npf, (idx - nv) % T)
+            s.register_buffer("cell_of", cell, persistent=False); s.register_buffer("frame_of", fr, persistent=False); s.ncell = npf + 3
         s.mask_token = nn.Parameter(torch.zeros(d)); s.pos = nn.Embedding(ntok, d); s.tpos = nn.Embedding(T, d)
         s.ec = nn.Sequential(nn.Linear(2, d), nn.GELU(), nn.Linear(d, d))
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d); s.head = nn.Linear(d, d)
-    def forward(s, ctx, tgt_idx, cmd):
+    def base(s, ctx, ctx_idx, tgt_idx):
+        """latent du contexte à la même case, frame visible la plus récente ≤ frame cible (0 si aucune)."""
+        B, kc, d = ctx.shape; Tn = s.tpos.num_embeddings; b_ = torch.arange(B, device=ctx.device)[:, None]
+        pos = torch.full((B, s.ncell, Tn), -1, dtype=torch.long, device=ctx.device)
+        pos[b_, s.cell_of[ctx_idx], s.frame_of[ctx_idx]] = torch.arange(kc, device=ctx.device).expand(B, -1)
+        fr_ = torch.arange(Tn, device=ctx.device).expand_as(pos); last = torch.where(pos >= 0, fr_, -1).cummax(-1).values
+        q = torch.gather(pos, 2, last.clamp_min(0)); q = torch.where(last >= 0, q, -1)[b_, s.cell_of[tgt_idx], s.frame_of[tgt_idx]]
+        z = F.layer_norm(torch.gather(ctx, 1, q.clamp_min(0).unsqueeze(-1).expand(-1, -1, d)).float(), (d,))
+        return z * (q >= 0).unsqueeze(-1)
+    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None):
         c = s.ec(cmd) + s.tpos.weight[:cmd.size(1)]; tg = s.mask_token + s.pos(tgt_idx)
-        x = s.tr(torch.cat([ctx, c, tg], 1)); return s.head(s.ln(x[:, -tgt_idx.size(1):]))
+        x = s.tr(torch.cat([ctx, c, tg], 1)); out = s.head(s.ln(x[:, -tgt_idx.size(1):]))
+        if s.resid:
+            assert ctx_idx is not None, "prédicteur résiduel : passer ctx_idx"
+            out = s.base(ctx, ctx_idx, tgt_idx) + out
+        return out
 
 class InvHead(nn.Module):
     """CONTINGENCE : deviner son geste en VOYANT l'avant et l'après (patches de 2 frames consécutives -> commande)."""
@@ -97,10 +116,18 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn"):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False):
         super().__init__()
-        s.enc = Enc4(din, d, nv, T, nl, nh, sep); s.pred = PredAC(d, nv + 3 * T, T, pl, nh)
+        s.enc = Enc4(din, d, nv, T, nl, nh, sep); s.pred = PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
+        if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
         s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
+        if std_tgt: s.register_buffer("tstd", torch.ones(4, d))       # écart-type courant des latents CIBLES par sens et par dimension
+
+def baby_from_cfg(cfg, dev):
+    """reconstruit le bébé d'un instantané (toutes options) — pour les scripts d'examen / de planification."""
+    P = cfg["P"]; npf = (H // P) ** 2
+    return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -132,26 +159,29 @@ def to_np(ws):
 def to_torch(w, sl=slice(None)): return {k: torch.from_numpy(np.ascontiguousarray(w[k][sl])) for k in KEYS}
 
 def _batch0(job):
-    seed, mix = job
-    return to_np([gen_world0(n, s_, T, H, seed=seed * 8 + j) for j, (s_, n) in enumerate(mix) if n > 0])
+    seed, mix, wkw = job
+    return to_np([gen_world0(n, s_, T, H, seed=seed * 8 + j, **wkw) for j, (s_, n) in enumerate(mix) if n > 0])
 
 class Stream:
     """lots NEUFS générés en parallèle (avance bornée) ; mélange = étape courante + RAPPEL des étapes déjà vécues."""
-    def __init__(s, start, bs, workers, replay, prefetch=16):
+    def __init__(s, start, bs, workers, replay, prefetch=16, wkw=None):
         s.pool = mp.get_context("fork").Pool(workers); s.i, s.bs, s.replay, s.prefetch, s.stage, s.q = start, bs, replay, prefetch, "0a", deque()
+        s.wkw = wkw or {}
     def mix(s):
         i = ORDER.index(s.stage); nr = int(round(s.bs * s.replay)) if i > 0 else 0; m = {s.stage: s.bs - nr}
         for j in range(nr): k = ORDER[(s.i + j) % i]; m[k] = m.get(k, 0) + 1
         return list(m.items())
     def next(s):
-        while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix()),))); s.i += 1
+        while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks):
-    """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne."""
+def masks0(B, nP, nv, rng, n_masks, touch=0):
+    """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
+    « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes)."""
     md, fr = layout(nv, nP * nP); N = len(md); pairs = []
     for _ in range(n_masks):
-        st = rng.choice(["tube", "vblock", "future", "future", "cross"]); tg = np.zeros((B, N), bool)
+        st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch); tg = np.zeros((B, N), bool)
+        if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
         if st == "future":                                           # IMAGINER : tous les sens après t0, avec les gestes prévus
             t0 = rng.integers(3, T - 2); pairs.append((np.broadcast_to(fr <= t0, (B, N)).copy(), np.broadcast_to(fr > t0, (B, N)).copy())); continue
         if st == "tube": tg[:, :nv] = tube_masks(B, T, nP, 0.5, 1, rng)[0].numpy()
@@ -175,7 +205,7 @@ def errs(m, tgt, b, st, v, P, ctx_m, tgt_m, dev, d, b_tgt=None, lie=False, bs=50
         if lie: cmd = cmd.roll(1, 0)
         z = F.layer_norm(tgt(ttok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,))
         ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-        out.append((m.pred(m.enc(_gather(tok, ci), ci), ti, cmd).float() - _gather(z, ti)).abs().mean(-1).cpu())
+        out.append((m.pred(m.enc(_gather(tok, ci), ci), ti, cmd, ci).float() - _gather(z, ti)).abs().mean(-1).cpu())
     return torch.cat(out)
 
 @torch.no_grad()
@@ -247,12 +277,12 @@ def exam(m, tgt, probes, st, v, a, dev, nv, npf, tag, ref=None):
     return res
 
 def build_probes(a, nv, npf, dev):
-    n = a.n_probe; rng = np.random.default_rng(7)
+    n = a.n_probe; rng = np.random.default_rng(7); ms = dict(mob_size=a.mob_size)
     wd, we = gen_world0(n, "0d", T, H, seed=2001), gen_world0(n, "0e", T, H, seed=2002)
     ctrl = to_np([wd, we]); ctrl.update({k: np.concatenate([wd[k], we[k]]) for k in ("HAND", "INVIEW", "POS", "NOBJ", "TSRC")})
-    pr = dict(ctrl=ctrl, mob_n=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0)]),
-              mob_c=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=2, force_tcut=8)]),
-              mob_d=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0, mobile_delay=3)]))
+    pr = dict(ctrl=ctrl, mob_n=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0, **ms)]),
+              mob_c=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=2, force_tcut=8, **ms)]),
+              mob_d=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0, mobile_delay=3, **ms)]))
     pr["hs"], pr["os"] = probe_frames(ctrl, H // a.P, a.P, npf, rng)
     Xp = torch.from_numpy(ctrl["X"]).float() / 255; nP = H // a.P
     Xp = Xp.reshape(len(Xp), T, nP, a.P, nP, a.P, 3).permute(0, 1, 2, 4, 3, 5, 6).reshape(len(Xp), T, npf, -1)
@@ -272,6 +302,12 @@ def main():
     p.add_argument("--inv_k", type=int, default=4, help="paires de frames par séquence pour la contingence")
     p.add_argument("--inv_head", type=str, default="attn", choices=["attn", "diff"], help="diff = tête DIFFÉRENCE (run 1 : la tête attn conjointe restait à R² ≈ 0)")
     p.add_argument("--inv_clip", type=int, default=0, help="1 = la tête de contingence hors de l'écrêtage global des gradients (dominé par le JEPA)")
+    p.add_argument("--resid", type=int, default=0, help="1 = prédicteur RÉSIDUEL (dernier latent vu de la même case + changement)")
+    p.add_argument("--std_tgt", type=int, default=0, help="1 = erreur sur cibles STANDARDISÉES par sens et par dimension (les détails discrets comptent autant que la main)")
+    p.add_argument("--touch_masks", type=int, default=0, help="tirages supplémentaires « devine ce que tu sens » dans la loterie des masques")
+    p.add_argument("--contact_w", type=float, default=0.0, help="poids en plus sur les tokens des frames AVEC CONTACT (toucher non nul)")
+    p.add_argument("--p_obj", type=float, default=0.45, help="part des gestes de babillage dirigés VERS un objet (contacts)")
+    p.add_argument("--mob_size", type=float, default=0.10, help="taille du mobile (run 1 : 0.10 ≈ 6 px, trop petit)")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
@@ -283,18 +319,20 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    ws = to_np([gen_world0(300, s_, T, H, seed=99 + j) for j, s_ in enumerate(ORDER)])          # normalisation des sens
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size)
+    ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
     print(f"GPU {torch.cuda.get_device_name(0) if dev == 'cuda' else 'cpu'} | {T} frames × ({npf} patches + ouïe + toucher + bras) = {nv + 3 * T} tokens "
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
-    cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head)
+    cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -302,20 +340,28 @@ def main():
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
-    S = Stream(state["it"], a.bs, a.workers, a.replay); md_np, _ = layout(nv, npf); ma = None
+    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None
+    md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
         lr_f = min(1.0, it / 3000) * (0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
-        tok, cmd = to_tok0(S.next(), st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks); full = torch.arange(N, device=dev).expand(B, -1)
+        bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
+        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks); full = torch.arange(N, device=dev).expand(B, -1)
+        contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
-            with torch.no_grad(): z = F.layer_norm(tgt(tok, full).float(), (a.d,))
+            with torch.no_grad():
+                z = F.layer_norm(tgt(tok, full).float(), (a.d,))
+                if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
+                    for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
             jl = 0.0; summ = []
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
-                jl = jl + F.l1_loss(m.pred(zc, tidx, cmd).float(), _gather(z, tidx))
+                dif = (m.pred(zc, tidx, cmd, cidx).float() - _gather(z, tidx)).abs()
+                if a.std_tgt: dif = dif / m.tstd[md_t[tidx]].clamp_min(0.05)   # plancher : une dimension quasi constante ne doit pas exploser
+                w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
+                jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
             jl = jl / len(pairs); il = torch.zeros((), device=dev)
             if a.inv_w > 0:                                          # CONTINGENCE : vision SEULE (le bras serait un raccourci)
                 ts = torch.from_numpy(rng.choice(np.arange(1, T), a.inv_k, replace=False)).to(dev)

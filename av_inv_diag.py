@@ -15,7 +15,7 @@ le mouvement fin.
 import argparse, copy
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from av_world0 import gen_world0
-from av_phase0 import Baby0, InvHead, to_tok0, to_np, to_torch, view_at, T, H
+from av_phase0 import Baby0, baby_from_cfg, InvHead, to_tok0, to_np, to_torch, view_at, T, H
 
 def r2(p, y): return float(1 - ((p - y) ** 2).sum() / ((y - y.mean(0)) ** 2).sum())
 
@@ -42,7 +42,7 @@ def main():
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     P = cfg["P"]; nP = H // P; npf = nP * nP; nv = T * npf
-    m = Baby0(cfg["din"], nv, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn")).to(dev); m.load_state_dict(ck["m"]); m.eval()
+    m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
     tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     w = to_np([gen_world0(a.n, a.stage, T, H, seed=4242)]); b = to_torch(w); v = view_at(a.stage, 1.0)
     print(f"instantané pas {ck['state']['it']} | monde {a.stage} | vue σ={v['sigma']:.1f} gris {v['gray']:.1f}", flush=True)
