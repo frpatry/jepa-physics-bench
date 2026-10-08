@@ -308,6 +308,7 @@ def main():
     p.add_argument("--contact_w", type=float, default=0.0, help="poids en plus sur les tokens des frames AVEC CONTACT (toucher non nul)")
     p.add_argument("--p_obj", type=float, default=0.45, help="part des gestes de babillage dirigés VERS un objet (contacts)")
     p.add_argument("--mob_size", type=float, default=0.10, help="taille du mobile (run 1 : 0.10 ≈ 6 px, trop petit)")
+    p.add_argument("--loss", type=str, default="l1", choices=["l1", "mse"], help="mse (I-JEPA) : avec le résiduel, L1 donne le même poids à chaque case -> les cases immobiles votent « pas de changement » (run 2A sourd à la commande)")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -359,7 +360,8 @@ def main():
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
-                dif = (m.pred(zc, tidx, cmd, cidx).float() - _gather(z, tidx)).abs()
+                dif = m.pred(zc, tidx, cmd, cidx).float() - _gather(z, tidx)
+                dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
                 w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
