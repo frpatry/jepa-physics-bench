@@ -309,6 +309,8 @@ def main():
     p.add_argument("--p_obj", type=float, default=0.45, help="part des gestes de babillage dirigés VERS un objet (contacts)")
     p.add_argument("--mob_size", type=float, default=0.10, help="taille du mobile (run 1 : 0.10 ≈ 6 px, trop petit)")
     p.add_argument("--loss", type=str, default="l1", choices=["l1", "mse"], help="mse (I-JEPA) : avec le résiduel, L1 donne le même poids à chaque case -> les cases immobiles votent « pas de changement » (run 2A sourd à la commande)")
+    p.add_argument("--act_w", type=float, default=0.0, help="poids du CONTRASTE D'ACTION : l'avenir imaginé avec SES gestes doit être plus proche du vrai qu'avec ceux d'un autre")
+    p.add_argument("--act_margin", type=float, default=0.2, help="écart exigé (fraction de l'erreur avec ses vrais gestes)")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -338,7 +340,8 @@ def main():
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
-        m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); opt.load_state_dict(ck["opt"]); state = ck["state"]
+        m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); state = ck["state"]
+        if "opt" in ck: opt.load_state_dict(ck["opt"])                    # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
@@ -371,20 +374,31 @@ def main():
                 ts = torch.from_numpy(rng.choice(np.arange(1, T), a.inv_k, replace=False)).to(dev)
                 zv = m.enc(tok[:, :nv], full[:, :nv]).view(B, T, npf, -1)
                 il = F.smooth_l1_loss(m.inv(zv[:, ts - 1].flatten(0, 1), zv[:, ts].flatten(0, 1)).float(), cmd[:, ts].flatten(0, 1))
+            al, gap = torch.zeros((), device=dev), torch.zeros((), device=dev)
+            if a.act_w > 0:                                          # CONTRASTE D'ACTION (« compare avec un autre geste »)
+                t0_ = int(rng.integers(3, T - 2)); cm_ = torch.from_numpy(fr_np <= t0_).to(dev)
+                cidx_ = torch.where(cm_)[0].expand(B, -1); tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)   # futur, sans l'ouïe
+                zc_ = m.enc(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
+                cmd_l = cmd.clone(); cmd_l[:, t0_ + 1:] = cmd.roll(1, 0)[:, t0_ + 1:]                    # mêmes souvenirs, AUTRES gestes futurs
+                def err_(c):
+                    d_ = m.pred(zc_, tidx_, c, cidx_).float() - zt_
+                    return (d_ ** 2 if a.loss == "mse" else d_.abs()).mean((1, 2))
+                e_t, e_l = err_(cmd), err_(cmd_l)
+                al = F.relu(e_t - e_l + a.act_margin * e_t.detach()).mean(); gap = ((e_l - e_t) / e_t.clamp_min(1e-6)).mean().detach()
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr
+        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean())]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%}) | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
-                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f} | {time.time() - t0:.0f}s", flush=True)
+                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
