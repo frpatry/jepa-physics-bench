@@ -52,12 +52,14 @@ def cont_sound(amp, x, T, rng, kind, f0=1000.0):
     return np.stack([a * np.sqrt(1 - xc) * src, a * np.sqrt(xc) * src]).astype(np.float32)
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
     2 relié puis coupé, -1 aucun]. mobile_delay > 0 : le mobile répond au geste avec retard (test « direct / différé »).
-    force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure)."""
+    force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure).
+    calm (0..1) : COMPLEXITÉ PROGRESSIVE (idée user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba 0.8·calm,
+    3–6 images, main immobile) et les objets s'arrêtent plus vite (frottement 0.008 avec proba calm) : geste -> contact -> effet LISIBLE."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -93,7 +95,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         th = rng.uniform(0, 2 * math.pi, N); sp = rng.uniform(smin, smax, N) * moving
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
         ang = rng.uniform(0, 2 * math.pi, N); om = rng.normal(0, 0.15, N) * moving
-        fric = rng.choice([0.0015, 0.004]) if N else 0.0
+        fric = (0.008 if calm > 0 and rng.random() < calm else rng.choice([0.0015, 0.004])) if N else 0.0   # calm : l'objet s'arrête dans la séquence
         for _ in range(200):
             out = lo < 0 and rng.random() < 0.3                     # 0b : la main commence parfois HORS du champ
             Hp = place(rng.uniform(lo_c, hi_c, 2) if out else rng.uniform(max(lo_c, 0.05), min(hi_c, 0.95), 2))
@@ -163,6 +165,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     v_ = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (v_ + 1e-9), 0, 1)
                     om *= 0.97 if fric < 0.003 else 0.9
                 vact[t] = Hp - H0
+                if calm > 0 and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
+                    mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire
                 if cf["mobile"]:                                     # le ruban : le mobile suit le geste RÉEL (avec retard si test)
                     LINK[i, t] = mt == 0 or (mt == 2 and t < tcut)
                     if mt == 1: drive = rng.normal(0, 0.05, 2) if rng.random() < 0.4 else np.zeros(2)
