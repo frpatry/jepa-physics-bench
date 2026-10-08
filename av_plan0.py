@@ -177,6 +177,27 @@ def main():
               f"| erreur imaginée {err(im_t, still, 0):.2f} vs copie {err(copy_r, still, 0):.2f}")
         eh = lambda pr: ((pr - tgt_y)[moved].view(-1, 8, 2, 2).norm(dim=-1)[..., 0] * 32).mean(0)
         print("   objet poussé, erreur par horizon 1..8 : imaginé " + " ".join(f"{x:.1f}" for x in eh(im_t)) + " | copie " + " ".join(f"{x:.1f}" for x in eh(copy_r)))
+        # 2c L'OBJET EST-IL DANS L'IMAGINATION ? lecteur NEUF entraîné sur des latents IMAGINÉS (séquences d'entraînement),
+        #    testé sur les imaginés tenus à l'écart : s'il lit bien l'objet -> l'info y est (décalage de distribution du lecteur) ;
+        #    sinon -> l'imagination a vraiment perdu l'objet.
+        def imag_lat(bb):
+            out = []
+            with torch.no_grad():
+                for i in range(0, len(bb["X"]), 50):
+                    tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
+                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd).float().view(B, 8, npf, d).half().cpu())
+            return torch.cat(out)
+        Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
+        Ytr_i, Yte_i = Y[:ntr, 8:].flatten(0, 1), Yt[:, 8:].flatten(0, 1)
+        torch.manual_seed(0); r2_ = _PosReader(d, npf, nout=4).to(dev); o2 = torch.optim.AdamW(r2_.parameters(), 3e-4, weight_decay=0.05)
+        s2 = torch.optim.lr_scheduler.CosineAnnealingLR(o2, a.read_steps)
+        for _ in range(a.read_steps):
+            bi = torch.randint(0, len(Ztr_i), (256,)); l = F.mse_loss(r2_(Ztr_i[bi].to(dev).float()), ((Ytr_i[bi] - mu.cpu()) / sd.cpu()).to(dev))
+            o2.zero_grad(); l.backward(); o2.step(); s2.step()
+        r2_.eval()
+        with torch.no_grad(): p2 = torch.cat([(r2_(Zte_i[i:i + 512].to(dev).float()) * sd + mu).cpu() for i in range(0, len(Zte_i), 512)]).view(-1, 8, 4)
+        print(f"2c lecteur NEUF entraîné sur l'IMAGINATION : objet poussé {err(p2, moved, 0):.2f} px, objet immobile {err(p2, still, 0):.2f} px, "
+              f"main {err(p2, slice(None), 1):.2f} px (copie : {err(copy_r, moved, 0):.2f} / {err(copy_r, still, 0):.2f} / {err(copy_r, slice(None), 1):.2f})", flush=True)
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         idx = torch.where(moved)[0][:8].numpy(); fig, ax = plt.subplots(2, 4, figsize=(13, 6.8))
         for j, i in enumerate(idx):
