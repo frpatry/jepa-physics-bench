@@ -106,6 +106,8 @@ def main():
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
+    p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
+    p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; md, fr = layout(nv, npf); v = VIEW["0e"]; d = cfg["d"]
@@ -160,6 +162,31 @@ def main():
         sl = moved if k == 0 else slice(None)
         print(f"   {nm:>15s} | lecture du vrai futur {err(true_r, sl, k):5.2f} | COPIE {err(copy_r, sl, k):5.2f} | imaginé avec SES gestes {err(im_t, sl, k):5.2f} "
               f"| avec les gestes d'un AUTRE {err(im_l, sl, k):5.2f}", flush=True)
+    if a.obj_diag:                              # 2b QUE FAIT L'IMAGINATION DE L'OBJET ? (positions lues, px ; départ = frame 7 lue)
+        cos = lambda u, w: float((F.cosine_similarity(u, w, dim=-1)).mean())
+        st0 = copy_r[:, 0]; Tdisp, Idisp = (Yt[:, 15] - Yt[:, 7]) * 32, (im_t[:, -1] - st0) * 32
+        still = (Yt[:, 8:, :2] - Yt[:, 7:8, :2]).norm(dim=-1).amax(1) * 32 < 0.3
+        print(f"2b L'OBJET DANS L'IMAGINATION (frames 7 -> 15) :")
+        print(f"   objet POUSSÉ ({int(moved.sum())}) : déplacement réel {Tdisp[moved, :2].norm(dim=-1).mean():.2f} px | imaginé {Idisp[moved, :2].norm(dim=-1).mean():.2f} px "
+              f"| cos(imaginé, réel) {cos(Idisp[moved, :2], Tdisp[moved, :2]):+.2f} | cos(objet imaginé, MAIN réelle) {cos(Idisp[moved, :2], Tdisp[moved, 2:]):+.2f} "
+              f"| cos(objet réel, main réelle) {cos(Tdisp[moved, :2], Tdisp[moved, 2:]):+.2f}")
+        di, dr = (im_t[:, -1, :2] - im_t[:, -1, 2:]).norm(dim=-1) * 32, (Yt[:, 15, :2] - Yt[:, 15, 2:]).norm(dim=-1) * 32
+        print(f"   distance objet–main à la frame 15 : imaginée {di[moved].mean():.2f} px vs réelle {dr[moved].mean():.2f} px (poussé) ; "
+              f"{di[still].mean():.2f} vs {dr[still].mean():.2f} (immobile)")
+        print(f"   objet IMMOBILE ({int(still.sum())}) : dérive imaginée {Idisp[still, :2].norm(dim=-1).mean():.2f} px (réelle 0) "
+              f"| erreur imaginée {err(im_t, still, 0):.2f} vs copie {err(copy_r, still, 0):.2f}")
+        eh = lambda pr: ((pr - tgt_y)[moved].view(-1, 8, 2, 2).norm(dim=-1)[..., 0] * 32).mean(0)
+        print("   objet poussé, erreur par horizon 1..8 : imaginé " + " ".join(f"{x:.1f}" for x in eh(im_t)) + " | copie " + " ".join(f"{x:.1f}" for x in eh(copy_r)))
+        import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+        idx = torch.where(moved)[0][:8].numpy(); fig, ax = plt.subplots(2, 4, figsize=(13, 6.8))
+        for j, i in enumerate(idx):
+            A_ = ax.flat[j]; A_.imshow(bt["X"][i, 15].numpy(), extent=(0, 1, 1, 0), alpha=0.45)
+            A_.plot(Yt[i, 7:, 0], Yt[i, 7:, 1], "w.-", lw=2, label="objet réel"); A_.plot(im_t[i, :, 0], im_t[i, :, 1], "r.-", label="objet imaginé")
+            A_.plot(Yt[i, 7:, 2], Yt[i, 7:, 3], "c.-", label="main réelle"); A_.plot(im_t[i, :, 2], im_t[i, :, 3], "y.--", label="main imaginée")
+            A_.plot(*Yt[i, 7, :2], "wo", ms=9, mfc="none"); A_.set_xlim(0, 1); A_.set_ylim(1, 0); A_.set_xticks([]); A_.set_yticks([])
+        ax.flat[0].legend(fontsize=7, loc="lower left"); fig.suptitle("frames 7 -> 15 : l'objet poussé, réel (blanc) vs imaginé (rouge) ; la main, réelle (cyan) vs imaginée (jaune) ; image = frame 15")
+        plt.tight_layout(); plt.savefig(a.obj_diag_fig, dpi=80); print(f"   figure -> {a.obj_diag_fig}  ({time.time() - t0:.0f}s)", flush=True)
+        return
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         t = env.t; b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
