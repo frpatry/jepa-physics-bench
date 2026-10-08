@@ -124,8 +124,9 @@ class Baby0(nn.Module):
         if std_tgt: s.register_buffer("tstd", torch.ones(4, d))       # écart-type courant des latents CIBLES par sens et par dimension
 
 def baby_from_cfg(cfg, dev):
-    """reconstruit le bébé d'un instantané (toutes options) — pour les scripts d'examen / de planification."""
-    P = cfg["P"]; npf = (H // P) ** 2
+    """reconstruit le bébé d'un instantané (toutes options) — pour les scripts d'examen / de planification.
+    Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
+    global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
                  bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0))).to(dev)
 
@@ -239,7 +240,7 @@ def probe_frames(pr, nP, P, npf, rng):
 def exam(m, tgt, probes, st, v, a, dev, nv, npf, tag, ref=None):
     P, d = a.P, a.d; md, fr = layout(nv, npf); res = {}; ctrl = probes["ctrl"]; tb = to_torch(ctrl)
     # 1 ÉCOUTE SES GESTES : futur imaginé avec SES gestes vs ceux d'une autre séquence
-    cm, tm = fr <= 7, fr > 7; e0 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d); e1 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d, lie=True)
+    hT = T // 2; cm, tm = fr < hT, fr >= hT; e0 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d); e1 = errs(m, tgt, tb, st, v, P, cm, tm, dev, d, lie=True)   # 1re moitié vue -> 2e imaginée
     tmd, tfr = md[tm], fr[tm]; nP = H // P; msg = []
     for k, nm in enumerate(SENS):
         c = tmd == k; res[f"geste_{nm}"] = float(e1[:, c].mean() / e0[:, c].mean() - 1)
@@ -281,7 +282,7 @@ def build_probes(a, nv, npf, dev):
     wd, we = gen_world0(n, "0d", T, H, seed=2001), gen_world0(n, "0e", T, H, seed=2002)
     ctrl = to_np([wd, we]); ctrl.update({k: np.concatenate([wd[k], we[k]]) for k in ("HAND", "INVIEW", "POS", "NOBJ", "TSRC")})
     pr = dict(ctrl=ctrl, mob_n=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0, **ms)]),
-              mob_c=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=2, force_tcut=8, **ms)]),
+              mob_c=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=2, force_tcut=T // 2, **ms)]),
               mob_d=to_np([gen_world0(n, "0c", T, H, seed=2003, force_mtype=0, mobile_delay=3, **ms)]))
     pr["hs"], pr["os"] = probe_frames(ctrl, H // a.P, a.P, npf, rng)
     Xp = torch.from_numpy(ctrl["X"]).float() / 255; nP = H // a.P
@@ -313,12 +314,14 @@ def main():
     p.add_argument("--act_margin", type=float, default=0.2, help="écart exigé (fraction de l'erreur avec ses vrais gestes)")
     p.add_argument("--calm", type=int, default=0, help="1 = COMPLEXITÉ PROGRESSIVE (calme 1 -> 0) ; 2 = monde LISIBLE à progression LENTE (1 -> 0.7 en 0d, 0.7 -> 0.3 en 0e)")
     p.add_argument("--outside", type=int, default=0, help="1 = la TABLE DÉBORDE du champ dans une part croissante des séquences (0d 10 % -> 30 %, 0e 30 % -> 70 %) : objets qui sortent, entendus hors champ")
+    p.add_argument("--T", type=int, default=16, help="images par séquence (16 ≈ 1 s ; 32 = 2 s : il faut repartir de zéro)")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
     p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
+    global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; npf = nP * nP; nv = T * npf; din = (a.P * a.P * 3, 4 * NB, 8, 4)
     bud = [int(x) for x in a.budgets.split(",")]; starts = np.cumsum([0] + bud)          # début de 0a, 0b, 0c, 0d, 0e
@@ -338,7 +341,7 @@ def main():
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
