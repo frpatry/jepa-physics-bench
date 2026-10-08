@@ -87,7 +87,7 @@ class PredAC(nn.Module):
         pos[b_, s.cell_of[ctx_idx], s.frame_of[ctx_idx]] = torch.arange(kc, device=ctx.device).expand(B, -1)
         fr_ = torch.arange(Tn, device=ctx.device).expand_as(pos); last = torch.where(pos >= 0, fr_, -1).cummax(-1).values
         q = torch.gather(pos, 2, last.clamp_min(0)); q = torch.where(last >= 0, q, -1)[b_, s.cell_of[tgt_idx], s.frame_of[tgt_idx]]
-        z = F.layer_norm(torch.gather(ctx, 1, q.clamp_min(0).unsqueeze(-1).expand(-1, -1, d)).float(), (d,))
+        z = F.layer_norm(torch.gather(ctx.detach(), 1, q.clamp_min(0).unsqueeze(-1).expand(-1, -1, d)).float(), (d,))   # base SANS gradient (run 2a : effondrement)
         return z * (q >= 0).unsqueeze(-1)
     def forward(s, ctx, tgt_idx, cmd, ctx_idx=None):
         c = s.ec(cmd) + s.tpos.weight[:cmd.size(1)]; tg = s.mask_token + s.pos(tgt_idx)
@@ -308,6 +308,7 @@ def main():
     p.add_argument("--contact_w", type=float, default=0.0, help="poids en plus sur les tokens des frames AVEC CONTACT (toucher non nul)")
     p.add_argument("--p_obj", type=float, default=0.45, help="part des gestes de babillage dirigés VERS un objet (contacts)")
     p.add_argument("--mob_size", type=float, default=0.10, help="taille du mobile (run 1 : 0.10 ≈ 6 px, trop petit)")
+    p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
@@ -359,7 +360,8 @@ def main():
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
                 dif = (m.pred(zc, tidx, cmd, cidx).float() - _gather(z, tidx)).abs()
-                if a.std_tgt: dif = dif / m.tstd[md_t[tidx]].clamp_min(0.05)   # plancher : une dimension quasi constante ne doit pas exploser
+                if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
+                    ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
                 w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
                 jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
             jl = jl / len(pairs); il = torch.zeros((), device=dev)
@@ -376,19 +378,21 @@ def main():
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean())]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%}) | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
-                  f"| SIGReg {ma[2]:.3f} | {time.time() - t0:.0f}s", flush=True)
+                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f} | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg, norm=st), a.ckpt.replace(".pt", f"_{stage}_{it // 1000}k.pt"))
-        if it % a.ckpt_every == 0 or it == a.total:
+        stop = a.stop_at and it >= a.stop_at
+        if it % a.ckpt_every == 0 or it == a.total or stop:
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state, cfg=cfg, norm=st), a.ckpt + ".tmp")
             os.replace(a.ckpt + ".tmp", a.ckpt)
+        if stop: print(f"ARRÊT demandé au pas {it} (relancer sans --stop_at pour prolonger)", flush=True); break
     print("\n========== EXAMENS AU FIL DU DÉVELOPPEMENT ==========")
     for tag, r in state["exams"]:
         print(f"  {tag:>14s} | gestes (vue main) {r['geste_main']:+.0%} bras {r['geste_bras']:+.0%} | ruban {r['ruban']:.0%} retard {r['retard']:.0%} "
