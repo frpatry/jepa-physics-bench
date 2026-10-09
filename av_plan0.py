@@ -104,12 +104,14 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--episodes", type=int, default=60); p.add_argument("--diag", type=int, default=30)
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
-    p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
+    p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
+    global T; T = int(cfg.get("T", 16)); import av_phase0; av_phase0.T = T                 # longueur des séquences de l'instantané
+    h = T // 2; nf = min(8, T - h)                                                   # contexte frames < h, imaginé h .. h+nf-1 (8 images comme à T=16)
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; md, fr = layout(nv, npf); v = VIEW["0e"]; d = cfg["d"]
     m = baby_from_cfg(cfg, dev)
     m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
@@ -139,7 +141,7 @@ def main():
     e = (pt - Y[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32
     print(f"1 LECTEUR sur vrais latents ({n} séq. à 1 objet) : objet {e[:, 0].mean():.2f} px, main {e[:, 1].mean():.2f} px  ({time.time() - t0:.0f}s)", flush=True)
     # ---------- 2 IMAGINATION DÉCODÉE : contexte 0..7, futur 8..15
-    te = slice(ntr, n); bt = {k: x[te] for k, x in b.items()}; Yt = Y[te]; cm, tm = fr <= 7, (fr > 7) & (md == 0)
+    te = slice(ntr, n); bt = {k: x[te] for k, x in b.items()}; Yt = Y[te]; cm, tm = fr < h, (fr >= h) & (fr < h + nf) & (md == 0)
     ci0, ti0 = torch.from_numpy(np.where(cm)[0]).to(dev), torch.from_numpy(np.where(tm)[0]).to(dev)
     def imagined(lie):
         out = []
@@ -149,14 +151,14 @@ def main():
                 if lie: cmd = cmd.roll(1, 0)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
                 zp = m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float()
-                out.append(read(zp.view(B * 8, npf, d)).view(B, 8, 4).cpu())
+                out.append(read(zp.view(B * nf, npf, d)).view(B, nf, 4).cpu())
         return torch.cat(out)
     with torch.no_grad():
-        Zt = Z[te]; true_r = torch.cat([read(Zt[:, 8:].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, len(Zt) * 8, 512)]).view(-1, 8, 4)
-        copy_r = read(Zt[:, 7].to(dev)).cpu()[:, None].expand(-1, 8, -1)
-    im_t, im_l = imagined(False), imagined(True); tgt_y = Yt[:, 8:]
-    moved = (Yt[:, 15, :2] - Yt[:, 7, :2]).norm(dim=-1) * 32 > 1.5                   # l'objet a bougé (poussé) entre 7 et 15
-    def err(pr, sl, k): return float(((pr - tgt_y)[sl].view(-1, 8, 2, 2).norm(dim=-1)[..., k] * 32).mean())
+        Zt = Z[te]; true_r = torch.cat([read(Zt[:, h:h + nf].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, len(Zt) * nf, 512)]).view(-1, nf, 4)
+        copy_r = read(Zt[:, h - 1].to(dev)).cpu()[:, None].expand(-1, nf, -1)
+    im_t, im_l = imagined(False), imagined(True); tgt_y = Yt[:, h:h + nf]
+    moved = (Yt[:, h + nf - 1, :2] - Yt[:, h - 1, :2]).norm(dim=-1) * 32 > 1.5                   # l'objet a bougé (poussé) entre 7 et 15
+    def err(pr, sl, k): return float(((pr - tgt_y)[sl].view(-1, nf, 2, 2).norm(dim=-1)[..., k] * 32).mean())
     print(f"2 IMAGINATION DÉCODÉE (px, frames 8–15 ; {int(moved.sum())} séq. où l'objet est poussé) :")
     for nm, k in (("objet (poussé)", 0), ("main", 1)):
         sl = moved if k == 0 else slice(None)
@@ -164,18 +166,18 @@ def main():
               f"| avec les gestes d'un AUTRE {err(im_l, sl, k):5.2f}", flush=True)
     if a.obj_diag:                              # 2b QUE FAIT L'IMAGINATION DE L'OBJET ? (positions lues, px ; départ = frame 7 lue)
         cos = lambda u, w: float((F.cosine_similarity(u, w, dim=-1)).mean())
-        st0 = copy_r[:, 0]; Tdisp, Idisp = (Yt[:, 15] - Yt[:, 7]) * 32, (im_t[:, -1] - st0) * 32
-        still = (Yt[:, 8:, :2] - Yt[:, 7:8, :2]).norm(dim=-1).amax(1) * 32 < 0.3
+        st0 = copy_r[:, 0]; Tdisp, Idisp = (Yt[:, h + nf - 1] - Yt[:, h - 1]) * 32, (im_t[:, -1] - st0) * 32
+        still = (Yt[:, h:h + nf, :2] - Yt[:, h - 1:h, :2]).norm(dim=-1).amax(1) * 32 < 0.3
         print(f"2b L'OBJET DANS L'IMAGINATION (frames 7 -> 15) :")
         print(f"   objet POUSSÉ ({int(moved.sum())}) : déplacement réel {Tdisp[moved, :2].norm(dim=-1).mean():.2f} px | imaginé {Idisp[moved, :2].norm(dim=-1).mean():.2f} px "
               f"| cos(imaginé, réel) {cos(Idisp[moved, :2], Tdisp[moved, :2]):+.2f} | cos(objet imaginé, MAIN réelle) {cos(Idisp[moved, :2], Tdisp[moved, 2:]):+.2f} "
               f"| cos(objet réel, main réelle) {cos(Tdisp[moved, :2], Tdisp[moved, 2:]):+.2f}")
-        di, dr = (im_t[:, -1, :2] - im_t[:, -1, 2:]).norm(dim=-1) * 32, (Yt[:, 15, :2] - Yt[:, 15, 2:]).norm(dim=-1) * 32
+        di, dr = (im_t[:, -1, :2] - im_t[:, -1, 2:]).norm(dim=-1) * 32, (Yt[:, h + nf - 1, :2] - Yt[:, h + nf - 1, 2:]).norm(dim=-1) * 32
         print(f"   distance objet–main à la frame 15 : imaginée {di[moved].mean():.2f} px vs réelle {dr[moved].mean():.2f} px (poussé) ; "
               f"{di[still].mean():.2f} vs {dr[still].mean():.2f} (immobile)")
         print(f"   objet IMMOBILE ({int(still.sum())}) : dérive imaginée {Idisp[still, :2].norm(dim=-1).mean():.2f} px (réelle 0) "
               f"| erreur imaginée {err(im_t, still, 0):.2f} vs copie {err(copy_r, still, 0):.2f}")
-        eh = lambda pr: ((pr - tgt_y)[moved].view(-1, 8, 2, 2).norm(dim=-1)[..., 0] * 32).mean(0)
+        eh = lambda pr: ((pr - tgt_y)[moved].view(-1, nf, 2, 2).norm(dim=-1)[..., 0] * 32).mean(0)
         print("   objet poussé, erreur par horizon 1..8 : imaginé " + " ".join(f"{x:.1f}" for x in eh(im_t)) + " | copie " + " ".join(f"{x:.1f}" for x in eh(copy_r)))
         # 2c L'OBJET EST-IL DANS L'IMAGINATION ? lecteur NEUF entraîné sur des latents IMAGINÉS (séquences d'entraînement),
         #    testé sur les imaginés tenus à l'écart : s'il lit bien l'objet -> l'info y est (décalage de distribution du lecteur) ;
@@ -185,26 +187,26 @@ def main():
             with torch.no_grad():
                 for i in range(0, len(bb["X"]), 50):
                     tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, 8, npf, d).half().cpu())
+                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
-        Ytr_i, Yte_i = Y[:ntr, 8:].flatten(0, 1), Yt[:, 8:].flatten(0, 1)
+        Ytr_i, Yte_i = Y[:ntr, h:h + nf].flatten(0, 1), Yt[:, h:h + nf].flatten(0, 1)
         torch.manual_seed(0); r2_ = _PosReader(d, npf, nout=4).to(dev); o2 = torch.optim.AdamW(r2_.parameters(), 3e-4, weight_decay=0.05)
         s2 = torch.optim.lr_scheduler.CosineAnnealingLR(o2, a.read_steps)
         for _ in range(a.read_steps):
             bi = torch.randint(0, len(Ztr_i), (256,)); l = F.mse_loss(r2_(Ztr_i[bi].to(dev).float()), ((Ytr_i[bi] - mu.cpu()) / sd.cpu()).to(dev))
             o2.zero_grad(); l.backward(); o2.step(); s2.step()
         r2_.eval()
-        with torch.no_grad(): p2 = torch.cat([(r2_(Zte_i[i:i + 512].to(dev).float()) * sd + mu).cpu() for i in range(0, len(Zte_i), 512)]).view(-1, 8, 4)
+        with torch.no_grad(): p2 = torch.cat([(r2_(Zte_i[i:i + 512].to(dev).float()) * sd + mu).cpu() for i in range(0, len(Zte_i), 512)]).view(-1, nf, 4)
         print(f"2c lecteur NEUF entraîné sur l'IMAGINATION : objet poussé {err(p2, moved, 0):.2f} px, objet immobile {err(p2, still, 0):.2f} px, "
               f"main {err(p2, slice(None), 1):.2f} px (copie : {err(copy_r, moved, 0):.2f} / {err(copy_r, still, 0):.2f} / {err(copy_r, slice(None), 1):.2f})", flush=True)
         import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
         idx = torch.where(moved)[0][:8].numpy(); fig, ax = plt.subplots(2, 4, figsize=(13, 6.8))
         for j, i in enumerate(idx):
-            A_ = ax.flat[j]; A_.imshow(bt["X"][i, 15].numpy(), extent=(0, 1, 1, 0), alpha=0.45)
-            A_.plot(Yt[i, 7:, 0], Yt[i, 7:, 1], "w.-", lw=2, label="objet réel"); A_.plot(im_t[i, :, 0], im_t[i, :, 1], "r.-", label="objet imaginé")
-            A_.plot(Yt[i, 7:, 2], Yt[i, 7:, 3], "c.-", label="main réelle"); A_.plot(im_t[i, :, 2], im_t[i, :, 3], "y.--", label="main imaginée")
-            A_.plot(*Yt[i, 7, :2], "wo", ms=9, mfc="none"); A_.set_xlim(0, 1); A_.set_ylim(1, 0); A_.set_xticks([]); A_.set_yticks([])
+            A_ = ax.flat[j]; A_.imshow(bt["X"][i, h + nf - 1].numpy(), extent=(0, 1, 1, 0), alpha=0.45)
+            A_.plot(Yt[i, h - 1:h + nf, 0], Yt[i, h - 1:h + nf, 1], "w.-", lw=2, label="objet réel"); A_.plot(im_t[i, :, 0], im_t[i, :, 1], "r.-", label="objet imaginé")
+            A_.plot(Yt[i, h - 1:h + nf, 2], Yt[i, h - 1:h + nf, 3], "c.-", label="main réelle"); A_.plot(im_t[i, :, 2], im_t[i, :, 3], "y.--", label="main imaginée")
+            A_.plot(*Yt[i, h - 1, :2], "wo", ms=9, mfc="none"); A_.set_xlim(0, 1); A_.set_ylim(1, 0); A_.set_xticks([]); A_.set_yticks([])
         ax.flat[0].legend(fontsize=7, loc="lower left"); fig.suptitle("frames 7 -> 15 : l'objet poussé, réel (blanc) vs imaginé (rouge) ; la main, réelle (cyan) vs imaginée (jaune) ; image = frame 15")
         plt.tight_layout(); plt.savefig(a.obj_diag_fig, dpi=80); print(f"   figure -> {a.obj_diag_fig}  ({time.time() - t0:.0f}s)", flush=True)
         return
@@ -228,7 +230,7 @@ def main():
     def run(ep, policy):
         env = Push0(ep); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
-        while env.t < T - 1:
+        while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
             Hh = min(a.plan_h, T - 1 - env.t)
             if policy == "diag":
                 from scipy.stats import spearmanr
@@ -259,7 +261,7 @@ def main():
         for fam in ("CEM", "bébé", "tous"):
             x = np.array([r[fam] for r in R], dtype=np.float64)
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
-    print(f"4 PLANIFICATION : pousser l'objet sur une cible à 0.12–0.22 ({a.episodes} épisodes, {T - 1 - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
+    print(f"4 PLANIFICATION : pousser l'objet sur une cible à 0.12–0.22 ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
     for pol in ("hasard", "oracle", "MPC bébé"):
         tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
