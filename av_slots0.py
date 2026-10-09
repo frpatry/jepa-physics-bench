@@ -82,11 +82,14 @@ class PairDyn(nn.Module):
         e_body = s.body(torch.cat([sl, pos, bt], -1))
         st = torch.cat([touch * sf, audio * sf, sf], -1).unsqueeze(1).expand(B, K, -1)
         e_sens = s.sens(torch.cat([sl, pos, st], -1))
-        return sl + s.upd(torch.cat([e_self, e_pair, e_body, e_sens], -1))
+        return F.layer_norm(sl + s.upd(torch.cat([e_self, e_pair, e_body, e_sens], -1)), (ds,))   # boîtes BORNÉES (essai 1 : divergence)
 
 class Boxes(nn.Module):
-    def __init__(s, d, npf, K=4, ds=64):
-        super().__init__(); s.sa = SlotAttn(d, ds, K); s.dec = Decoder(ds, d, npf); s.dyn = PairDyn(ds)
+    """feat = dimension de ce que lisent les boîtes : petits carrés de l'image RÉTINOTOPIQUES (pixels du carré + sa position)
+    — essai 1 : sur le résumé GLOBAL de l'œil, rien n'émerge (chaque carré y décrit toute la scène) puis divergence."""
+    def __init__(s, feat, npf, K=4, ds=64, din=64):
+        super().__init__(); s.inp = nn.Sequential(nn.Linear(feat + 2, din), nn.ReLU(), nn.Linear(din, din))
+        s.sa = SlotAttn(din, ds, K); s.dec = Decoder(ds, feat, npf); s.dyn = PairDyn(ds)
     def pos(s, al, gxy): return (al @ gxy) / al.sum(-1, keepdim=True).clamp_min(1e-6)     # (B, K, 2) centre de ce que la boîte « prend »
     def slot_pos(s, sl, gxy): return s.pos(s.dec(sl)[2], gxy)                       # position d'une boîte = centre de ce qu'elle explique (même règle vue / imaginée)
 
@@ -96,12 +99,13 @@ def senses(tok, cmd, nv, T):
 
 def track(bx, Z, cmd, prop, touch, audio, gxy, drop=0.0):
     """suivi « prédire puis corriger » sur T images -> boîtes (B,T,K,ds), attention (B,T,npf,K), prédictions (B,T-1,K,ds)."""
-    B, T = Z.shape[:2]; sl, att = bx.sa(Z[:, 0], None, iters=3); S, A, Pr = [sl], [att], []
+    B, T = Z.shape[:2]; X = bx.inp(torch.cat([Z, gxy.expand(B, T, -1, -1)], -1))      # carrés rétinotopiques + leur position
+    sl, att = bx.sa(X[:, 0], None, iters=3); sl = F.layer_norm(sl, (sl.size(-1),)); S, A, Pr = [sl], [att], []
     for t in range(1, T):
         pos = bx.slot_pos(sl, gxy)
         pf = (torch.rand(B, 1, device=Z.device) >= drop).float(); sf = (torch.rand(B, 1, device=Z.device) >= drop).float()
         pred = bx.dyn(sl, pos, cmd[:, t], prop[:, t - 1], pf, touch[:, t - 1], audio[:, t - 1], sf); Pr.append(pred)
-        sl, att = bx.sa(Z[:, t], pred, iters=2); S.append(sl); A.append(att)
+        sl, att = bx.sa(X[:, t], pred, iters=2); sl = F.layer_norm(sl, (sl.size(-1),)); S.append(sl); A.append(att)
     return torch.stack(S, 1), torch.stack(A, 1), torch.stack(Pr, 1)
 
 def imagine(bx, sl0, att0, cmd, t0, H_, gxy):
@@ -114,9 +118,10 @@ def imagine(bx, sl0, att0, cmd, t0, H_, gxy):
 
 @torch.no_grad()
 def eye(enc, b, st, P, dev, nv, npf, d, T):
-    tok, cmd = to_tok0(b, st, VIEW["0e"], P, dev); ix = torch.arange(nv, device=dev).expand(len(tok), -1)
-    Z = F.layer_norm(enc(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d)
-    return Z, tok, cmd
+    """-> Z (B,T,npf,P*P*3) : les petits carrés de l'image tels que le bébé les voit (RÉTINOTOPIQUES, comme le cortex visuel
+    précoce ; essai 1 sur le résumé global de l'œil : rien n'émerge) ; sens et commande = tokens de la phase 0."""
+    tok, cmd = to_tok0(b, st, VIEW["0e"], P, dev)
+    return tok[:, :nv, :P * P * 3].reshape(len(tok), T, npf, P * P * 3), tok, cmd
 
 @torch.no_grad()
 def exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, tag):
@@ -171,7 +176,7 @@ def exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, tag):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--eye", required=True, help="instantané de phase 0 (œil figé)"); p.add_argument("--ckpt", default="/content/slots0.pt")
-    p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32); p.add_argument("--lr", type=float, default=4e-4)
+    p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32); p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--K", type=int, default=5, help="5 = 3 objets + main + marge pour le fond (recherche : 4 ou 5)"); p.add_argument("--ds", type=int, default=64); p.add_argument("--H", type=int, default=8)
     p.add_argument("--w_dyn", type=float, default=1.0); p.add_argument("--w_img", type=float, default=1.0)
     p.add_argument("--workers", type=int, default=6); p.add_argument("--n_probe", type=int, default=300); p.add_argument("--exam_every", type=int, default=5000)
@@ -180,7 +185,7 @@ def main():
     baby = baby_from_cfg(cfg, dev); T = P0.T; enc = copy.deepcopy(baby.enc); enc.load_state_dict(ck["tgt"]); enc.eval()
     for q in enc.parameters(): q.requires_grad_(False)
     P = cfg["P"]; nP = H // P; npf = nP * nP; nv = T * npf; d = cfg["d"]; gxy = grid_xy(nP, dev); wkw = dict(cfg.get("wkw", {}))
-    bx = Boxes(d, npf, a.K, a.ds).to(dev); opt = torch.optim.AdamW(bx.parameters(), a.lr, weight_decay=0.01)
+    bx = Boxes(P * P * 3, npf, a.K, a.ds).to(dev); opt = torch.optim.AdamW(bx.parameters(), a.lr, weight_decay=0.01)
     wA = gen_world0(a.n_probe, "0e", T, H, seed=5101); wC = gen_world0(3 * a.n_probe, "0e", T, H, seed=5102); keep = np.where(wC["NOBJ"] == 1)[0]
     probes = dict(A={**to_np([wA]), **{k: wA[k] for k in ("HAND", "POS", "NOBJ", "VIS")}},
                   C={**to_np([{k: wC[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]), **{k: wC[k][keep] for k in ("HAND", "POS", "TSRC")}})
@@ -204,7 +209,7 @@ def main():
         t0 = int(np.random.randint(3, T - 2)); Hh = min(a.H, T - 1 - t0)
         Si, _ = imagine(bx, S[:, t0], A[:, t0], cmd, t0, Hh, gxy)
         l_dyn = F.mse_loss(Si, S[:, t0 + 1:t0 + 1 + Hh].detach())                         # JEPA : rejoindre les boîtes que l'œil trouvera
-        ai, _, _ = bx.dec(Si.flatten(0, 1)); l_img = F.mse_loss(ai.view(len(Z), Hh, npf, d), Z[:, t0 + 1:t0 + 1 + Hh])   # ancrage dans la scène
+        ai, _, _ = bx.dec(Si.flatten(0, 1)); l_img = F.mse_loss(ai.view(len(Z), Hh, npf, -1), Z[:, t0 + 1:t0 + 1 + Hh])   # ancrage dans la scène
         loss = w_app * l_app + w_mot * l_mot + a.w_dyn * l_dyn + a.w_img * l_img
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(bx.parameters(), 1.0); opt.step()
         cur = np.array([l_app.item(), l_mot.item(), l_dyn.item(), l_img.item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
