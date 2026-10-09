@@ -51,6 +51,13 @@ class Push0:
                 s.Hp = s.place(rng.uniform(0.15, 0.85, 2)); a_ = rng.uniform(0, 2 * math.pi)
                 s.g = (s.Hp + rng.uniform(lo, hi) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
                 if np.all((s.g > 0.12) & (s.g < 0.88)) and np.linalg.norm(s.g - SHOULDER) < s.Lr - 0.03: break
+        s.P0 = s.P.copy(); s.u = np.zeros(2, np.float32)
+        if task in ("bouger", "direction"):                             # FAIRE BOUGER l'objet (n'importe comment / dans une direction donnée)
+            for _ in range(2000):
+                s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
+                if s.rc + s.Rh + 0.03 < dd < 0.3: break
+            a_ = rng.integers(0, 4) * math.pi / 2; s.u = np.array([math.cos(a_), math.sin(a_)], np.float32)   # gauche/droite/haut/bas
+            s.g = (s.P + 0.2 * s.u).astype(np.float32)
         if task == "toucher":                                           # TOUCHER un objet immobile : la main part à 0.25–0.45 de lui
             for _ in range(2000):
                 s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
@@ -65,6 +72,8 @@ class Push0:
         return (SHOULDER + d * s.Lr / nd if nd > s.Lr else h).astype(np.float32)
     def dist(s):
         if s.task == "toucher": return max(0.0, float(np.linalg.norm(s.Hp - s.P)) - (s.rc + s.Rh))   # écart avant le contact
+        if s.task == "bouger": return max(0.0, 0.05 - float(np.linalg.norm(s.P - s.P0)))                 # il reste à le déplacer de…
+        if s.task == "direction": return max(0.0, 0.05 - float((s.P - s.P0) @ s.u))                       # …dans la bonne direction
         return float(np.linalg.norm((s.Hp if s.task.startswith("main") else s.P) - s.g))
     def record(s, t, render=True):
         s.POS[t], s.HAND[t] = s.P, s.Hp
@@ -107,6 +116,8 @@ class Push0:
         return to_torch(to_np([w]))
 
 def oracle(env):
+    if env.task == "bouger":                                            # foncer dans l'objet
+        d = env.P - env.Hp; n_ = float(np.linalg.norm(d)); return np.clip(d / max(n_, 1e-6) * VMAX, -VMAX, VMAX).astype(np.float32)
     if env.task == "toucher":                                           # aller droit vers l'objet jusqu'au contact
         d = env.P - env.Hp; n_ = float(np.linalg.norm(d)); spd = min(VMAX, env.dist() + 0.02)
         return np.clip(d / max(n_, 1e-6) * spd, -VMAX, VMAX).astype(np.float32)
@@ -129,7 +140,7 @@ def main():
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
-    p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
+    p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -240,15 +251,18 @@ def main():
         ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]; ti = torch.from_numpy(np.where((fr == t + Hh) & (md == 0))[0]).to(dev)[None]
         with torch.no_grad(): ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
         gt = torch.from_numpy(env.g).to(dev)
-        if a.task == "toucher":                                          # où est l'objet MAINTENANT (perception, pas imagination)
+        if a.task in ("toucher", "bouger", "direction"):                 # où est l'objet MAINTENANT (perception, pas imagination)
             vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
             with torch.no_grad():
                 zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
                 gt = read(zt)[0, :2]
         def cost(cand):                         # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
+            with torch.no_grad(): r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))
+            if a.task == "bouger": return -(r_[:, :2] - gt).norm(dim=-1)                       # imaginer l'objet DÉPLACÉ
+            if a.task == "direction": return -((r_[:, :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
             sl = slice(0, 2) if a.task == "objet" else slice(2, 4)    # position lue : objet (pousser) ou MAIN (atteindre, toucher)
-            with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, sl] - gt).norm(dim=-1)
+            return (r_[:, sl] - gt).norm(dim=-1)
         return cost
     def real_cost(env, cand):
         out = []
@@ -283,7 +297,8 @@ def main():
                     el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
             env.step(np.asarray(act, np.float32))
-        return d0, env.dist(), float(env.touched if a.task == "toucher" else env.dist() < succ)
+        ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
+        return d0, env.dist(), float(ok)
     succ = 0.04 if a.task.startswith("main") else 0.06
     if a.diag > 0:
         tp = time.time(); R = [run(e, "diag") for e in range(a.diag)]
@@ -293,9 +308,10 @@ def main():
             x = np.array([r[fam] for r in R], dtype=np.float64)
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
     titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
-             "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22"}[a.task]
+             "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22",
+             "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
-    print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
+    print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
     for pol in ("hasard", "oracle", "MPC bébé"):
         tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
