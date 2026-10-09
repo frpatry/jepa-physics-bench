@@ -44,12 +44,18 @@ class Push0:
         for _ in range(500):                                            # cible à 0.12–0.22 de l'objet, dans le champ et à portée
             a_ = rng.uniform(0, 2 * math.pi); s.g = (s.P + rng.uniform(dmin, dmax) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
             if np.all((s.g > s.rc + 0.02) & (s.g < 1 - s.rc - 0.02)) and np.linalg.norm(s.g - SHOULDER) < s.Lr - 0.05: break
-        if task == "main":                                              # pièce vide : l'objet est rangé loin (invisible, inerte)
-            s.P = np.array([5.0, 5.0], np.float32)
-            for _ in range(500):
+        s.touched = False
+        if task.startswith("main"):                                     # pièce vide : l'objet est rangé loin (invisible, inerte)
+            s.P = np.array([5.0, 5.0], np.float32); lo, hi = (0.35, 0.6) if task == "main_loin" else (0.15, 0.35)
+            for _ in range(2000):
                 s.Hp = s.place(rng.uniform(0.15, 0.85, 2)); a_ = rng.uniform(0, 2 * math.pi)
-                s.g = (s.Hp + rng.uniform(0.15, 0.35) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
+                s.g = (s.Hp + rng.uniform(lo, hi) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
                 if np.all((s.g > 0.12) & (s.g < 0.88)) and np.linalg.norm(s.g - SHOULDER) < s.Lr - 0.03: break
+        if task == "toucher":                                           # TOUCHER un objet immobile : la main part à 0.25–0.45 de lui
+            for _ in range(2000):
+                s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
+                if 0.25 < dd < 0.45: break
+            s.g = s.P.copy()
         s.t = 0; s.X = np.zeros((T, H, H, 3), np.float32); s.POS = np.zeros((T, 2), np.float32); s.HAND = np.zeros((T, 2), np.float32)
         s.CMD = np.zeros((T, 2), np.float32); s.TOUCH = np.zeros((T, 8), np.float32); s.PROP = np.zeros((T, 4), np.float32)
         s.vact = np.zeros((T, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
@@ -57,7 +63,9 @@ class Push0:
     def place(s, h):
         h = np.clip(h, s.Rh, 1 - s.Rh); d = h - SHOULDER; nd = float(np.linalg.norm(d))
         return (SHOULDER + d * s.Lr / nd if nd > s.Lr else h).astype(np.float32)
-    def dist(s): return float(np.linalg.norm((s.Hp if s.task == "main" else s.P) - s.g))
+    def dist(s):
+        if s.task == "toucher": return max(0.0, float(np.linalg.norm(s.Hp - s.P)) - (s.rc + s.Rh))   # écart avant le contact
+        return float(np.linalg.norm((s.Hp if s.task.startswith("main") else s.P) - s.g))
     def record(s, t, render=True):
         s.POS[t], s.HAND[t] = s.P, s.Hp
         if render:
@@ -67,7 +75,7 @@ class Push0:
     def step(s, cmd, render=True):
         t = s.t = s.t + 1; rc, m = s.rc, s.m; s.CMD[t] = np.clip(cmd, -VMAX, VMAX)
         H0 = s.Hp.copy(); s.Hp = s.place(s.Hp + s.CMD[t])
-        if s.task == "main":                                            # pièce vide : seule la main bouge
+        if s.task.startswith("main"):                                   # pièce vide : seule la main bouge
             s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t]]) + s.rng.normal(0, 0.005, 4); s.record(t, render); return
         P0 = s.P.copy(); s.P = s.P + s.V; s.ang += s.om
         for dd in range(2):                                             # murs
@@ -84,7 +92,7 @@ class Push0:
                 J = -2 * s_ * m / (1 + m); s.V = s.V + J / m * nv; s.om += s.rng.normal(0, 0.1); s.ev.append((t - 0.5, 0, J, float((s.P[0] + s.Hp[0]) / 2)))
             ov = lim - dist; w_ = m / (1 + m)
             s.Hp = s.place(s.Hp - nv * ov * w_); s.P = np.clip(s.P + nv * ov * (1 - w_), rc, 1 - rc).astype(np.float32)
-            s.TOUCH[t, 2 * side] += J; s.TOUCH[t, 2 * side + 1] = max(s.TOUCH[t, 2 * side + 1], w_)
+            s.TOUCH[t, 2 * side] += J; s.TOUCH[t, 2 * side + 1] = max(s.TOUCH[t, 2 * side + 1], w_); s.touched = True
         v_ = float(np.linalg.norm(s.V)); s.V = (s.V * np.clip(1 - s.fric / (v_ + 1e-9), 0, 1)).astype(np.float32)
         s.om *= 0.97 if s.fric < 0.003 else 0.9
         s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t]]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
@@ -99,7 +107,10 @@ class Push0:
         return to_torch(to_np([w]))
 
 def oracle(env):
-    if env.task == "main":                                              # aller droit au point (vitesse ∝ distance restante)
+    if env.task == "toucher":                                           # aller droit vers l'objet jusqu'au contact
+        d = env.P - env.Hp; n_ = float(np.linalg.norm(d)); spd = min(VMAX, env.dist() + 0.02)
+        return np.clip(d / max(n_, 1e-6) * spd, -VMAX, VMAX).astype(np.float32)
+    if env.task.startswith("main"):                                     # aller droit au point (vitesse ∝ distance restante)
         d = env.g - env.Hp; n_ = float(np.linalg.norm(d)); return np.clip(d * min(1.0, VMAX / max(n_, 1e-6)), -VMAX, VMAX).astype(np.float32)
     """connaît l'état ET la physique (masse, frottement) : contourne l'objet, se place derrière, donne UNE poussée dosée pour
     que l'objet s'arrête sur la cible (glissade v²/2f), puis attend qu'il s'arrête avant de corriger."""
@@ -118,7 +129,7 @@ def main():
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
-    p.add_argument("--task", type=str, default="objet", choices=["objet", "main"], help="main = amener SA MAIN sur un point, pièce vide")
+    p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -229,9 +240,14 @@ def main():
         ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]; ti = torch.from_numpy(np.where((fr == t + Hh) & (md == 0))[0]).to(dev)[None]
         with torch.no_grad(): ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
         gt = torch.from_numpy(env.g).to(dev)
+        if a.task == "toucher":                                          # où est l'objet MAINTENANT (perception, pas imagination)
+            vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
+            with torch.no_grad():
+                zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
+                gt = read(zt)[0, :2]
         def cost(cand):                         # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
-            sl = slice(2, 4) if a.task == "main" else slice(0, 2)     # position lue : MAIN ou objet
+            sl = slice(0, 2) if a.task == "objet" else slice(2, 4)    # position lue : objet (pousser) ou MAIN (atteindre, toucher)
             with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, sl] - gt).norm(dim=-1)
         return cost
     def real_cost(env, cand):
@@ -267,7 +283,8 @@ def main():
                     el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
             env.step(np.asarray(act, np.float32))
-        return d0, env.dist()
+        return d0, env.dist(), float(env.touched if a.task == "toucher" else env.dist() < succ)
+    succ = 0.04 if a.task.startswith("main") else 0.06
     if a.diag > 0:
         tp = time.time(); R = [run(e, "diag") for e in range(a.diag)]
         print(f"3 DIAG (c) {a.diag} situations, 48 gestes par famille, horizon {a.plan_h} : l'imagination classe-t-elle comme la réalité ? ({time.time() - tp:.0f}s)")
@@ -275,12 +292,13 @@ def main():
         for fam in ("CEM", "bébé", "tous"):
             x = np.array([r[fam] for r in R], dtype=np.float64)
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
-    succ = 0.04 if a.task == "main" else 0.06
-    print(f"4 PLANIFICATION : " + ("amener SA MAIN sur un point (pièce vide, 0.15–0.35)" if a.task == "main" else "pousser l'objet sur une cible à 0.12–0.22") + f" ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
-    print(f"   {'politique':>10s} | {'distance finale':>15s} | {'réussite (< ' + str(succ) + ')':>17s} | {'progrès moyen':>13s}")
+    titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
+             "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22"}[a.task]
+    print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
+    print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
     for pol in ("hasard", "oracle", "MPC bébé"):
         tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
-        print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 1] < succ):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
+        print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
 if __name__ == "__main__":
