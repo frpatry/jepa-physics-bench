@@ -70,7 +70,7 @@ def fric_sound(pos, mat, m, T, level):
     return sig
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -81,6 +81,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     p_auto / kick : « JE REGARDE DES CHOSES BOUGER » (étape passive, idée validée avec l'user) — part d'objets qui bougent seuls dès
     le départ (remplace le réglage de l'étape) et proba, par image et par objet, d'une poussée EXTÉRIEURE (une main d'adulte
     invisible déplace le jouet) : le mouvement commun qui permet de DÉCOUPER les objets (Kellman & Spelke), sans que le bébé agisse.
+    p_parent : part des séquences où la MAIN D'UN PARENT (idée user) entre dans le champ, va derrière un objet et le POUSSE, puis
+    repart : démonstration du principe de contact. Le bébé la voit et entend le choc, mais ne la SENT pas (ni toucher, ni bras) et
+    elle ne suit pas ses commandes -> ce n'est pas sa main. Teinte peau, un peu plus grande. PAR (n,T,2) = position (examens).
     calm (0..1) : MONDE LISIBLE / COMPLEXITÉ PROGRESSIVE (idées user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba
     0.8·calm, 3–6 images) ; il fait aussi des pauses sans contact (0.35·calm des changements de geste) ; les objets sont AU REPOS par
     défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm)."""
@@ -92,6 +95,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     POS = np.full((n, T, K, 2), np.nan, np.float32); ANG = np.full((n, T, K), np.nan, np.float32)
     SHAPE = -np.ones((n, K), np.int64); NOBJ = np.zeros(n, np.int64); IMP = np.zeros((n, T), bool); TSRC = np.zeros((n, T), np.int8)
     MOB = np.full((n, T, 2), np.nan, np.float32); LINK = np.zeros((n, T), bool); MTYPE = -np.ones(n, np.int64); VIS = np.zeros((n, T, K), bool)
+    PAR = np.full((n, T, 2), np.nan, np.float32); PCONT = np.zeros((n, T), bool)
     win = np.hanning(SPF // a_sub).astype(np.float32); W = band_matrix(SPF // a_sub); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
         Rh = rng.uniform(*cf["hand"]); RH[i] = Rh; Lr = rng.uniform(*cf["reach"]) if cf["reach"] else None
@@ -116,7 +120,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 ok = all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k))
                 if ok and (stage != "0d" or np.linalg.norm(P[k] - SHOULDER) < Lr - rc[k] - 0.03): break
         p_mov = 1 - cf["rest"] if calm <= 0 else (1 - calm) * (1 - cf["rest"]) + calm * 0.03   # monde LISIBLE : objets AU REPOS par défaut
-        p_mov = p_mov if p_auto is None else p_auto
+        par = N > 0 and p_parent > 0 and rng.random() < p_parent              # un parent viendra montrer comment on pousse
+        p_mov = (p_mov if p_auto is None else p_auto) * (0.0 if par else 1.0)  # avec le parent : objets au repos, SEULE sa main les fera bouger
         moving = rng.random(N) < p_mov
         th = rng.uniform(0, 2 * math.pi, N); sp = rng.uniform(smin, smax, N) * moving
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
@@ -133,6 +138,11 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             M0 = np.array([rng.uniform(0.25, 0.75), rng.uniform(0.15, 0.3)], np.float32); off = np.zeros(2, np.float32); mv = np.zeros(2, np.float32)
             mkind = int(rng.integers(0, 3)); mcol = PAL[rng.integers(len(PAL))]; mf0 = rng.uniform(850, 1150)
         vact = np.zeros((T, 2), np.float32); mspd = np.zeros(T, np.float32); ev = []
+        if par:                                                      # MAIN DU PARENT : arrive d'en face (haut), pousse un objet, repart
+            Rp = 0.09; pcol = (np.array([0.95, 0.75, 0.6]) * rng.uniform(0.85, 1.0)).astype(np.float32)
+            Pp = np.array([rng.uniform(0.2, 0.8), -0.2], np.float32); Ps = Pp.copy(); pk = int(rng.integers(N))
+            a_ = rng.uniform(0, 2 * math.pi); pu = np.array([math.cos(a_), math.sin(a_)], np.float32)     # direction de la poussée
+            pwait, ppush, pspd = int(rng.integers(0, 4)), int(rng.integers(2, 5)), rng.uniform(0.03, 0.07); pmode = "attend"
         left, mode, spd, tgt, dirv = 0, "immobile", vmax, None, None
         pg = 0.35 if stage == "0c" else 0.15                         # 0c : plus de gigotage (les coups de pied du mobile)
         for t in range(T):
@@ -170,6 +180,23 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                             J = 2 * m[k] * abs(V[k, dd]); V[k, dd] = -V[k, dd]; om[k] += rng.normal(0, 0.05)
                             P[k, dd] = 2 * lo_w - P[k, dd] if P[k, dd] < lo_w else 2 * hi_w - P[k, dd]
                             if J > 1e-4: ev.append((t - 1 + fr_, k, J * att_out(P[k]), P[k, 0]))   # choc hors champ : plus faible
+                if par:                                              # le parent agit (pas de toucher ni de bras pour le bébé)
+                    if pmode == "attend": pwait -= 1; pmode = "approche" if pwait <= 0 else pmode; Vp = np.zeros(2, np.float32)
+                    if pmode == "approche":
+                        bpt = P[pk] - pu * (rc[pk] + Rp + 0.02); d_ = bpt - Pp; nd_ = float(np.linalg.norm(d_))
+                        Vp = (d_ * min(1.0, 0.08 / max(nd_, 1e-6))).astype(np.float32)
+                        if nd_ < 0.03: pmode = "pousse"
+                    elif pmode == "pousse": Vp = (pu * pspd).astype(np.float32); ppush -= 1; pmode = "repart" if ppush <= 0 else pmode
+                    elif pmode == "repart": d_ = Ps - Pp; Vp = (d_ * min(1.0, 0.08 / max(float(np.linalg.norm(d_)), 1e-6))).astype(np.float32)
+                    Pp = Pp + Vp
+                    for k in range(N):                               # main du parent -> objet (elle est menée : pas de recul)
+                        dv = P[k] - Pp; dist = float(np.linalg.norm(dv)); lim = rc[k] + Rp
+                        if 1e-6 < dist < lim:
+                            nv = dv / dist; s_ = float((V[k] - Vp) @ nv); PCONT[i, t] = True
+                            if s_ < 0:
+                                J = -2 * s_ * m[k] * 3 / (3 + m[k]); V[k] += J / m[k] * nv; om[k] += rng.normal(0, 0.1)
+                                ev.append((t - 0.5, k, J, float((P[k, 0] + Pp[0]) / 2)))
+                            P[k] = np.clip(Pp + nv * lim, rc[k] - mg, 1 - rc[k] + mg)
                 vh = Hp - H0
                 for k in range(N):                                   # main <-> objet : choc + PEAU + le lourd repousse la main
                     dv = P[k] - Hp; dist = float(np.linalg.norm(dv)); lim = rc[k] + Rh
@@ -215,6 +242,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             if cf["mobile"]:
                 MOB[i, t] = M0 + off; al = shape_alpha(mkind, mob_size, 3.0 * off[0], *MOB[i, t], xx, yy, H)[..., None]
                 img = img * (1 - al) + mcol * al
+            if par:                                                  # la main du parent (derrière la sienne, plus proche des yeux)
+                PAR[i, t] = Pp; ph = np.clip((Rp * 0.85 - np.maximum(abs(xx - Pp[0]), abs(yy - Pp[1]))) * H + 0.5, 0, 1)[..., None]
+                img = img * (1 - ph) + pcol * ph
             hx = np.clip((Rh * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
             X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp; INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))
             POS[i, t, :N] = P; ANG[i, t, :N] = ang; VIS[i, t, :N] = np.all((P > -s[:, None]) & (P < 1 + s[:, None]), axis=-1)
@@ -223,7 +253,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         if cf["mobile"]: extra = extra + cont_sound(2 * hum * mspd / 0.03, MOB[i, :, 0], T, rng, "tinte", mf0)
         A[i] = render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, 1, IMP[i], extra)
     return dict(X=X, A=A, TOUCH=TOUCH, PROP=PROP, CMD=CMD, HAND=HAND, RH=RH, INVIEW=INVIEW, POS=POS, ANG=ANG, SHAPE=SHAPE,
-                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS)
+                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT)
 
 def baby_view(X, stage):
     """ce que le bébé VOIT à cette étape (numpy, pour les figures) : flou gaussien UNIFORME + gris + contraste réduit."""

@@ -315,6 +315,7 @@ def main():
     p.add_argument("--calm", type=int, default=0, help="1 = COMPLEXITÉ PROGRESSIVE (calme 1 -> 0) ; 2 = monde LISIBLE à progression LENTE (1 -> 0.7 en 0d, 0.7 -> 0.3 en 0e)")
     p.add_argument("--outside", type=int, default=0, help="1 = la TABLE DÉBORDE du champ dans une part croissante des séquences (0d 10 % -> 30 %, 0e 30 % -> 70 %) : objets qui sortent, entendus hors champ")
     p.add_argument("--T", type=int, default=16, help="images par séquence (16 ≈ 1 s ; 32 = 2 s : il faut repartir de zéro)")
+    p.add_argument("--parent", type=float, default=0.0, help="part des séquences (avec objets) où la MAIN D'UN PARENT vient pousser un objet (démonstration du contact)")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -328,7 +329,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size)
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent)
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
