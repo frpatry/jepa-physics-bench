@@ -57,7 +57,7 @@ class Push0:
                 s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
                 if s.rc + s.Rh + 0.03 < dd < 0.3: break
             a_ = rng.integers(0, 4) * math.pi / 2; s.u = np.array([math.cos(a_), math.sin(a_)], np.float32)   # gauche/droite/haut/bas
-            s.g = (s.P + 0.2 * s.u).astype(np.float32)
+            s.g = (s.P + 0.5 * s.u).astype(np.float32)                       # (repère de l'oracle : pousser franchement dans la direction)
         if task == "toucher":                                           # TOUCHER un objet immobile : la main part à 0.25–0.45 de lui
             for _ in range(2000):
                 s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
