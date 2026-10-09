@@ -84,6 +84,40 @@ class PairDyn(nn.Module):
         e_sens = s.sens(torch.cat([sl, pos, st], -1))
         return F.layer_norm(sl + s.upd(torch.cat([e_self, e_pair, e_body, e_sens], -1)), (ds,))   # boîtes BORNÉES (essai 1 : divergence)
 
+def build_grid(res, dev="cpu"):
+    r = torch.linspace(0., 1., res, device=dev); y, x = torch.meshgrid(r, r, indexing="ij")
+    return torch.stack([x, y, 1 - x, 1 - y], -1)                                 # (res, res, 4)
+
+class PixBoxes(nn.Module):
+    """ESSAI 3 — perception RÉTINOTOPIQUE fine (leçons de slots.py, 1 boîte/objet découverte seule) : petit réseau local sur
+    l'image (grille 16×16), boîtes qui se disputent ces points, décodeur FAIBLE (convolutions 1×1, goulot de 16 dims) qui
+    repeint l'image 32×32 boîte par boîte ; perte de MÉLANGE par pixel (chaque pixel doit être expliqué par UNE boîte).
+    Essai 2 (carrés 4×4 + MSE de la moyenne) : les boîtes restaient identiques (α uniforme)."""
+    def __init__(s, K=5, ds=64, D=64, sd=16, Hh=32):
+        super().__init__(); s.K, s.ds, s.sd, s.Hh = K, ds, sd, Hh
+        s.cnn = nn.Sequential(nn.Conv2d(3, D, 5, 1, 2), nn.ReLU(), nn.Conv2d(D, D, 5, 2, 2), nn.ReLU(), nn.Conv2d(D, D, 3, 1, 1), nn.ReLU())
+        s.pe = nn.Linear(4, D); s.mlp = nn.Sequential(nn.LayerNorm(D), nn.Linear(D, D), nn.ReLU(), nn.Linear(D, D))
+        s.sa = SlotAttn(D, ds, K); s.down = nn.Linear(ds, sd); s.ped = nn.Linear(4, sd)
+        s.dec_ = nn.Sequential(nn.Conv2d(sd, 32, 1), nn.ReLU(), nn.Conv2d(32, 32, 1), nn.ReLU(), nn.Conv2d(32, 3 + 3 + 1, 1))
+        s.dyn = PairDyn(ds)
+        s.register_buffer("g16", build_grid(Hh // 2)); s.register_buffer("g32", build_grid(Hh))
+        s.register_buffer("gxy", s.g32[..., :2].reshape(-1, 2))
+    def feats(s, X):                                                             # X (B,T,H,H,3) -> (B,T,256,D)
+        B, T = X.shape[:2]; f = s.cnn(X.flatten(0, 1).permute(0, 3, 1, 2)).permute(0, 2, 3, 1)
+        return s.mlp(f + s.pe(s.g16)).reshape(B, T, -1, f.size(-1))
+    def dec(s, sl):                                                              # sl (B,K,ds) -> rgb (B,K,H,H,3), mouvement, α (B,K,H*H)
+        B = sl.size(0); x = s.down(sl).reshape(B * s.K, s.sd, 1, 1).expand(-1, -1, s.Hh, s.Hh).permute(0, 2, 3, 1)
+        o = s.dec_((x + s.ped(s.g32)).permute(0, 3, 1, 2)).reshape(B, s.K, 7, s.Hh, s.Hh).permute(0, 1, 3, 4, 2)
+        al = torch.softmax(o[..., 6], dim=1)
+        return o[..., :3], o[..., 3:6], al.reshape(B, s.K, -1)
+    def pos(s, al, gxy=None): return (al @ s.gxy) / al.sum(-1, keepdim=True).clamp_min(1e-6)
+    def slot_pos(s, sl, gxy=None): return s.pos(s.dec(sl)[2])
+
+def mixture_nll(img, rgbs, al, sig=0.1):
+    """-log Σ_k α_k N(x | rgb_k, σ²) par pixel (MONet/IODINE) : interdit le mélange — l'optimum = UNE boîte par pixel."""
+    B, K = al.shape[:2]; d2 = ((img.unsqueeze(1) - rgbs) ** 2).sum(-1).reshape(B, K, -1)
+    return -torch.logsumexp((al + 1e-8).log() - d2 / (2 * sig * sig), 1).mean() * sig * sig
+
 class Boxes(nn.Module):
     """feat = dimension de ce que lisent les boîtes : petits carrés de l'image RÉTINOTOPIQUES (pixels du carré + sa position)
     — essai 1 : sur le résumé GLOBAL de l'œil, rien n'émerge (chaque carré y décrit toute la scène) puis divergence."""
@@ -99,7 +133,8 @@ def senses(tok, cmd, nv, T):
 
 def track(bx, Z, cmd, prop, touch, audio, gxy, drop=0.0):
     """suivi « prédire puis corriger » sur T images -> boîtes (B,T,K,ds), attention (B,T,npf,K), prédictions (B,T-1,K,ds)."""
-    B, T = Z.shape[:2]; X = bx.inp(torch.cat([Z, gxy.expand(B, T, -1, -1)], -1))      # carrés rétinotopiques + leur position
+    B, T = Z.shape[:2]
+    X = bx.feats(Z) if isinstance(bx, PixBoxes) else bx.inp(torch.cat([Z, gxy.expand(B, T, -1, -1)], -1))   # entrée rétinotopique
     sl, att = bx.sa(X[:, 0], None, iters=3); sl = F.layer_norm(sl, (sl.size(-1),)); S, A, Pr = [sl], [att], []
     for t in range(1, T):
         pos = bx.slot_pos(sl, gxy)
@@ -121,7 +156,7 @@ def eye(enc, b, st, P, dev, nv, npf, d, T):
     """-> Z (B,T,npf,P*P*3) : les petits carrés de l'image tels que le bébé les voit (RÉTINOTOPIQUES, comme le cortex visuel
     précoce ; essai 1 sur le résumé global de l'œil : rien n'émerge) ; sens et commande = tokens de la phase 0."""
     tok, cmd = to_tok0(b, st, VIEW["0e"], P, dev)
-    return tok[:, :nv, :P * P * 3].reshape(len(tok), T, npf, P * P * 3), tok, cmd
+    return b["X"].to(dev).float() / 255.0, tok, cmd                                  # l'image vue (B,T,H,H,3)
 
 @torch.no_grad()
 def exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, tag):
@@ -131,7 +166,7 @@ def exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, tag):
     for i in range(0, len(b["X"]), 50):
         bb = {k: x[i:i + 50] for k, x in b.items()}; Z, tok, cmd = eye(enc, bb, st, P, dev, nv, npf, d, T)
         S, A, _ = track(bx, Z, *senses(tok, cmd, nv, T), gxy)
-        pos = bx.pos(A.transpose(2, 3).flatten(0, 1), gxy).view(len(Z), T, -1, 2).cpu().numpy()
+        pos = bx.slot_pos(S.flatten(0, 1)).view(len(Z), T, -1, 2).cpu().numpy()          # centre de ce que chaque boîte explique
         for j in range(len(Z)):
             g = i + j
             for t in (3, 8, 15):
@@ -185,7 +220,7 @@ def main():
     baby = baby_from_cfg(cfg, dev); T = P0.T; enc = copy.deepcopy(baby.enc); enc.load_state_dict(ck["tgt"]); enc.eval()
     for q in enc.parameters(): q.requires_grad_(False)
     P = cfg["P"]; nP = H // P; npf = nP * nP; nv = T * npf; d = cfg["d"]; gxy = grid_xy(nP, dev); wkw = dict(cfg.get("wkw", {}))
-    bx = Boxes(P * P * 3, npf, a.K, a.ds).to(dev); opt = torch.optim.AdamW(bx.parameters(), a.lr, weight_decay=0.01)
+    bx = PixBoxes(a.K, a.ds).to(dev); opt = torch.optim.AdamW(bx.parameters(), a.lr, weight_decay=0.01)
     wA = gen_world0(a.n_probe, "0e", T, H, seed=5101); wC = gen_world0(3 * a.n_probe, "0e", T, H, seed=5102); keep = np.where(wC["NOBJ"] == 1)[0]
     probes = dict(A={**to_np([wA]), **{k: wA[k] for k in ("HAND", "POS", "NOBJ", "VIS")}},
                   C={**to_np([{k: wC[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]), **{k: wC[k][keep] for k in ("HAND", "POS", "TSRC")}})
@@ -204,18 +239,20 @@ def main():
         for g in opt.param_groups: g["lr"] = a.lr * min(1.0, it / 1000)
         Z, tok, cmd = eye(enc, S_.next(), st, P, dev, nv, npf, d, T); sen = senses(tok, cmd, nv, T)
         S, A, Pr = track(bx, Z, *sen, gxy, drop=0.3)
-        app, mot, _ = bx.dec(S.flatten(0, 1)); app, mot = app.view(Z.shape), mot.view(Z.shape)
-        l_app = F.mse_loss(app, Z); l_mot = F.mse_loss(mot[:, :-1], Z[:, 1:] - Z[:, :-1])
+        rgb, mo, al = bx.dec(S.flatten(0, 1)); B_ = len(Z)
+        l_app = mixture_nll(Z.flatten(0, 1), rgb, al)                                    # APPARENCE : chaque pixel -> UNE boîte
+        mot = (al.reshape(*al.shape[:2], 32, 32, 1) * mo).sum(1).view(Z.shape)
+        l_mot = F.mse_loss(mot[:, :-1], Z[:, 1:] - Z[:, :-1]) * 10                       # MOUVEMENT : ce qui change ensemble
         t0 = int(np.random.randint(3, T - 2)); Hh = min(a.H, T - 1 - t0)
         Si, _ = imagine(bx, S[:, t0], A[:, t0], cmd, t0, Hh, gxy)
         l_dyn = F.mse_loss(Si, S[:, t0 + 1:t0 + 1 + Hh].detach())                         # JEPA : rejoindre les boîtes que l'œil trouvera
-        ai, _, _ = bx.dec(Si.flatten(0, 1)); l_img = F.mse_loss(ai.view(len(Z), Hh, npf, -1), Z[:, t0 + 1:t0 + 1 + Hh])   # ancrage dans la scène
+        ri, _, ali = bx.dec(Si.flatten(0, 1)); l_img = mixture_nll(Z[:, t0 + 1:t0 + 1 + Hh].flatten(0, 1), ri, ali)   # ancrage dans la scène
         loss = w_app * l_app + w_mot * l_mot + a.w_dyn * l_dyn + a.w_img * l_img
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(bx.parameters(), 1.0); opt.step()
-        cur = np.array([l_app.item(), l_mot.item(), l_dyn.item(), l_img.item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
+        cur = np.array([l_app.item(), l_mot.item(), l_dyn.item(), l_img.item(), al.max(1).values.mean().item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             print(f"  pas {it:6d} | monde {S_.stage} calme {S_.wkw['calm']:.2f} | poids mouvement {w_mot:.2f} apparence {w_app:.2f} | apparence {ma[0]:.4f} "
-                  f"mouvement {ma[1]:.4f} imagination(boîtes) {ma[2]:.4f} imagination(scène) {ma[3]:.4f} | {time.time() - t0_:.0f}s", flush=True)
+                  f"mouvement {ma[1]:.4f} imagination(boîtes) {ma[2]:.4f} imagination(scène) {ma[3]:.4f} | SPÉCIALISATION α max {ma[4]:.2f} (1/K = {1 / a.K:.2f}) | {time.time() - t0_:.0f}s", flush=True)
         if it % a.exam_every == 0 or it == a.steps:
             state["exams"].append((f"pas {it}", exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, f"pas {it}")))
             torch.save(dict(bx=bx.state_dict(), state=state, cfg=vars(a)), a.ckpt.replace(".pt", f"_{it // 1000}k.pt"))
