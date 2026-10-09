@@ -215,7 +215,8 @@ def main():
     p.add_argument("--eye", required=True, help="instantané de phase 0 (œil figé)"); p.add_argument("--ckpt", default="/content/slots0.pt")
     p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32); p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--K", type=int, default=5, help="5 = 3 objets + main + marge pour le fond (recherche : 4 ou 5)"); p.add_argument("--ds", type=int, default=64); p.add_argument("--H", type=int, default=8)
-    p.add_argument("--warm", type=int, default=5000, help="ÉCHAUFFEMENT : d'abord apprendre à découper (image par image, sans imagination), comme la perception avant la dynamique")
+    p.add_argument("--watch", type=int, default=8000, help="étape « JE REGARDE DES CHOSES BOUGER » : objets déplacés par d'autres (mouvement commun pour découper), avant le monde calme")
+    p.add_argument("--warm", type=int, default=3000, help="ÉCHAUFFEMENT : d'abord apprendre à découper (image par image, sans imagination), comme la perception avant la dynamique")
     p.add_argument("--mot_scale", type=float, default=3.0); p.add_argument("--w_dyn", type=float, default=1.0); p.add_argument("--w_img", type=float, default=1.0)
     p.add_argument("--workers", type=int, default=6); p.add_argument("--n_probe", type=int, default=300); p.add_argument("--exam_every", type=int, default=5000)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0_ = time.time()
@@ -236,9 +237,14 @@ def main():
     S_ = Stream(state["it"], a.bs, a.workers, 0.3, wkw=wkw); ma = None
     while state["it"] < a.steps:
         it = state["it"] = state["it"] + 1; f = it / a.steps
-        S_.stage = "0d" if f < 0.5 else "0e"; fs = (f / 0.5) if f < 0.5 else (f - 0.5) / 0.5      # monde lisible : calme 1 -> 0.7 -> 0.3
-        S_.wkw["calm"] = 1 - 0.3 * fs if f < 0.5 else 0.7 - 0.4 * fs; S_.wkw["p_out"] = 0.1 + 0.2 * fs if f < 0.5 else 0.3 + 0.3 * fs
-        w_mot, w_app = 1.0 - 0.8 * f, 0.2 + 0.8 * f                                        # MOUVEMENT d'abord, APPARENCE ensuite
+        if it <= a.watch:                                                              # 1) JE REGARDE DES CHOSES BOUGER (passif)
+            S_.stage = "0e"; S_.wkw.update(p_auto=1.0, kick=0.1, calm=0.0, p_out=0.2); w_mot = 1.0
+        else:                                                                          # 2) monde LISIBLE : mes gestes, leurs conséquences
+            S_.wkw.update(p_auto=None, kick=0.0); g = (it - a.watch) / max(1, a.steps - a.watch)
+            S_.stage = "0d" if g < 0.5 else "0e"; fs = (g / 0.5) if g < 0.5 else (g - 0.5) / 0.5      # calme 1 -> 0.7 -> 0.3
+            S_.wkw["calm"] = 1 - 0.3 * fs if g < 0.5 else 0.7 - 0.4 * fs; S_.wkw["p_out"] = 0.1 + 0.2 * fs if g < 0.5 else 0.3 + 0.3 * fs
+            w_mot = 0.6 - 0.4 * g
+        w_app = 0.2 + 0.8 * f                                                          # MOUVEMENT d'abord, APPARENCE ensuite
         for g in opt.param_groups: g["lr"] = a.lr * min(1.0, it / 1000)
         Z, tok, cmd = eye(enc, S_.next(), st, P, dev, nv, npf, d, T); sen = senses(tok, cmd, nv, T)
         warm = it <= a.warm; S, A, Pr = track(bx, Z, *sen, gxy, drop=0.3, indep=warm)
@@ -255,7 +261,7 @@ def main():
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(bx.parameters(), 1.0); opt.step()
         cur = np.array([l_app.item(), l_mot.item(), l_dyn.item(), l_img.item(), al.max(1).values.mean().item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
-            print(f"  pas {it:6d} | monde {S_.stage} calme {S_.wkw['calm']:.2f} | poids mouvement {w_mot:.2f} apparence {w_app:.2f} | apparence {ma[0]:.4f} "
+            print(f"  pas {it:6d} | monde {'REGARDE' if it <= a.watch else S_.stage} calme {S_.wkw['calm']:.2f} | poids mouvement {w_mot:.2f} apparence {w_app:.2f} | apparence {ma[0]:.4f} "
                   f"mouvement {ma[1]:.4f} imagination(boîtes) {ma[2]:.4f} imagination(scène) {ma[3]:.4f} | SPÉCIALISATION α max {ma[4]:.2f} (1/K = {1 / a.K:.2f}) | {time.time() - t0_:.0f}s", flush=True)
         if it % a.exam_every == 0 or it == a.steps:
             state["exams"].append((f"pas {it}", exam(bx, enc, st, P, dev, nv, npf, d, T, probes, gxy, f"pas {it}")))

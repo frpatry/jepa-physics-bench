@@ -70,7 +70,7 @@ def fric_sound(pos, mat, m, T, level):
     return sig
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -78,6 +78,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     force_mtype / force_tcut : paires APPARIÉES pour les tests de surprise (même graine -> même séquence jusqu'à la coupure).
     p_out : part des séquences où la TABLE DÉBORDE du champ de vision (murs à `table` au-delà du bord, idée user) : un objet poussé
     peut SORTIR du champ (on l'entend encore glisser et cogner le mur extérieur, atténué) puis parfois revenir. VIS (n,T,3) = visible.
+    p_auto / kick : « JE REGARDE DES CHOSES BOUGER » (étape passive, idée validée avec l'user) — part d'objets qui bougent seuls dès
+    le départ (remplace le réglage de l'étape) et proba, par image et par objet, d'une poussée EXTÉRIEURE (une main d'adulte
+    invisible déplace le jouet) : le mouvement commun qui permet de DÉCOUPER les objets (Kellman & Spelke), sans que le bébé agisse.
     calm (0..1) : MONDE LISIBLE / COMPLEXITÉ PROGRESSIVE (idées user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba
     0.8·calm, 3–6 images) ; il fait aussi des pauses sans contact (0.35·calm des changements de geste) ; les objets sont AU REPOS par
     défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm)."""
@@ -113,6 +116,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 ok = all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k))
                 if ok and (stage != "0d" or np.linalg.norm(P[k] - SHOULDER) < Lr - rc[k] - 0.03): break
         p_mov = 1 - cf["rest"] if calm <= 0 else (1 - calm) * (1 - cf["rest"]) + calm * 0.03   # monde LISIBLE : objets AU REPOS par défaut
+        p_mov = p_mov if p_auto is None else p_auto
         moving = rng.random(N) < p_mov
         th = rng.uniform(0, 2 * math.pi, N); sp = rng.uniform(smin, smax, N) * moving
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
@@ -152,6 +156,11 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 CMD[i, t] = np.clip(a, -vmax, vmax)
                 H0 = Hp.copy(); Hp = place(Hp + CMD[i, t])
                 P0 = P.copy(); P = P + V; ang = ang + om
+                if kick > 0:                                         # POUSSÉES EXTÉRIEURES (quelqu'un d'autre fait bouger le jouet)
+                    for k in range(N):
+                        if rng.random() < kick:
+                            a_ = rng.uniform(0, 2 * math.pi); dvk = rng.uniform(0.02, 0.07) * np.array([math.cos(a_), math.sin(a_)], np.float32)
+                            V[k] = V[k] + dvk; om[k] += rng.normal(0, 0.1); ev.append((t - 0.5, k, float(np.linalg.norm(dvk)) * m[k], float(P[k, 0])))
                 for k in range(N):                                   # murs (au bord du champ, ou plus loin si la table déborde)
                     lo_w, hi_w = rc[k] - mg, 1 - rc[k] + mg
                     for dd in range(2):
