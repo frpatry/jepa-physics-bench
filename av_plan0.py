@@ -27,7 +27,8 @@ VMAX = 0.1
 
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
-    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004):
+    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet"):
+        s.task = task                                                   # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
         s.Rh, s.Lr = 0.07, 0.9; s.kind = int(rng.integers(0, 4))
         s.sz = rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
@@ -43,6 +44,12 @@ class Push0:
         for _ in range(500):                                            # cible à 0.12–0.22 de l'objet, dans le champ et à portée
             a_ = rng.uniform(0, 2 * math.pi); s.g = (s.P + rng.uniform(dmin, dmax) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
             if np.all((s.g > s.rc + 0.02) & (s.g < 1 - s.rc - 0.02)) and np.linalg.norm(s.g - SHOULDER) < s.Lr - 0.05: break
+        if task == "main":                                              # pièce vide : l'objet est rangé loin (invisible, inerte)
+            s.P = np.array([5.0, 5.0], np.float32)
+            for _ in range(500):
+                s.Hp = s.place(rng.uniform(0.15, 0.85, 2)); a_ = rng.uniform(0, 2 * math.pi)
+                s.g = (s.Hp + rng.uniform(0.15, 0.35) * np.array([math.cos(a_), math.sin(a_)])).astype(np.float32)
+                if np.all((s.g > 0.12) & (s.g < 0.88)) and np.linalg.norm(s.g - SHOULDER) < s.Lr - 0.03: break
         s.t = 0; s.X = np.zeros((T, H, H, 3), np.float32); s.POS = np.zeros((T, 2), np.float32); s.HAND = np.zeros((T, 2), np.float32)
         s.CMD = np.zeros((T, 2), np.float32); s.TOUCH = np.zeros((T, 8), np.float32); s.PROP = np.zeros((T, 4), np.float32)
         s.vact = np.zeros((T, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
@@ -50,7 +57,7 @@ class Push0:
     def place(s, h):
         h = np.clip(h, s.Rh, 1 - s.Rh); d = h - SHOULDER; nd = float(np.linalg.norm(d))
         return (SHOULDER + d * s.Lr / nd if nd > s.Lr else h).astype(np.float32)
-    def dist(s): return float(np.linalg.norm(s.P - s.g))
+    def dist(s): return float(np.linalg.norm((s.Hp if s.task == "main" else s.P) - s.g))
     def record(s, t, render=True):
         s.POS[t], s.HAND[t] = s.P, s.Hp
         if render:
@@ -59,7 +66,10 @@ class Push0:
             s.X[t] = img * (1 - hx) + hx
     def step(s, cmd, render=True):
         t = s.t = s.t + 1; rc, m = s.rc, s.m; s.CMD[t] = np.clip(cmd, -VMAX, VMAX)
-        H0 = s.Hp.copy(); s.Hp = s.place(s.Hp + s.CMD[t]); P0 = s.P.copy(); s.P = s.P + s.V; s.ang += s.om
+        H0 = s.Hp.copy(); s.Hp = s.place(s.Hp + s.CMD[t])
+        if s.task == "main":                                            # pièce vide : seule la main bouge
+            s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t]]) + s.rng.normal(0, 0.005, 4); s.record(t, render); return
+        P0 = s.P.copy(); s.P = s.P + s.V; s.ang += s.om
         for dd in range(2):                                             # murs
             if s.P[dd] < rc or s.P[dd] > 1 - rc:
                 wall = rc if s.P[dd] < rc else 1 - rc; fr_ = float(np.clip((wall - P0[dd]) / (s.V[dd] + 1e-9), 0, 0.999))
@@ -89,6 +99,8 @@ class Push0:
         return to_torch(to_np([w]))
 
 def oracle(env):
+    if env.task == "main":                                              # aller droit au point (vitesse ∝ distance restante)
+        d = env.g - env.Hp; n_ = float(np.linalg.norm(d)); return np.clip(d * min(1.0, VMAX / max(n_, 1e-6)), -VMAX, VMAX).astype(np.float32)
     """connaît l'état ET la physique (masse, frottement) : contourne l'objet, se place derrière, donne UNE poussée dosée pour
     que l'objet s'arrête sur la cible (glissade v²/2f), puis attend qu'il s'arrête avant de corriger."""
     P, g, Hp = env.P, env.g, env.Hp; dg = g - P; dist = float(np.linalg.norm(dg)); u = dg / (dist + 1e-6); perp = np.array([-u[1], u[0]])
@@ -106,6 +118,7 @@ def main():
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
+    p.add_argument("--task", type=str, default="objet", choices=["objet", "main"], help="main = amener SA MAIN sur un point, pièce vide")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -218,7 +231,8 @@ def main():
         gt = torch.from_numpy(env.g).to(dev)
         def cost(cand):                         # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
-            with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, :2] - gt).norm(dim=-1)
+            sl = slice(2, 4) if a.task == "main" else slice(0, 2)     # position lue : MAIN ou objet
+            with torch.no_grad(): return (read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, sl] - gt).norm(dim=-1)
         return cost
     def real_cost(env, cand):
         out = []
@@ -228,7 +242,7 @@ def main():
             out.append(e2.dist())
         return np.array(out)
     def run(ep, policy):
-        env = Push0(ep); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
             Hh = min(a.plan_h, T - 1 - env.t)
@@ -261,11 +275,12 @@ def main():
         for fam in ("CEM", "bébé", "tous"):
             x = np.array([r[fam] for r in R], dtype=np.float64)
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
-    print(f"4 PLANIFICATION : pousser l'objet sur une cible à 0.12–0.22 ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
-    print(f"   {'politique':>10s} | {'distance finale':>15s} | {'réussite (< 0.06)':>17s} | {'progrès moyen':>13s}")
+    succ = 0.04 if a.task == "main" else 0.06
+    print(f"4 PLANIFICATION : " + ("amener SA MAIN sur un point (pièce vide, 0.15–0.35)" if a.task == "main" else "pousser l'objet sur une cible à 0.12–0.22") + f" ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
+    print(f"   {'politique':>10s} | {'distance finale':>15s} | {'réussite (< ' + str(succ) + ')':>17s} | {'progrès moyen':>13s}")
     for pol in ("hasard", "oracle", "MPC bébé"):
         tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
-        print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 1] < 0.06):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
+        print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 1] < succ):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
 if __name__ == "__main__":
