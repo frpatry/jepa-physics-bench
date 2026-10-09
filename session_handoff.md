@@ -1,6 +1,10 @@
 # Session Handoff — JEPA / World Model / Object-Centric
 
-Reprise propre du projet. Lire ceci en premier.
+> **Note (octobre 2026) : document PÉRIMÉ**, conservé pour l'histoire (état de juillet 2026,
+> époque des slots). L'état actuel du projet est décrit dans [README.md](README.md) et
+> [docs/ETAT_DU_PROJET.md](docs/ETAT_DU_PROJET.md).
+
+Reprise propre du projet (juillet 2026).
 
 ---
 

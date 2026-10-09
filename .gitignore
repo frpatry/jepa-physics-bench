@@ -4,3 +4,13 @@ __pycache__/
 .DS_Store
 *.json
 !*_colab.ipynb
+.gstack/
+
+# sorties générées par les runs (journaux, poids, caches)
+*.log
+*.pt
+*.pth
+*.ckpt
+*.npy
+*.npz
+.ipynb_checkpoints/
