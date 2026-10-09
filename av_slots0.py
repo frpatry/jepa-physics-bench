@@ -131,17 +131,19 @@ def senses(tok, cmd, nv, T):
     """commande (B,T,2) ; sens du bras (B,T,4) ; toucher (B,T,8) ; ouïe (B,T,128) — tokens normalisés de la phase 0."""
     return cmd, tok[:, nv + 2 * T:, :4], tok[:, nv + T:nv + 2 * T, :8], tok[:, nv:nv + T, :128]
 
-def track(bx, Z, cmd, prop, touch, audio, gxy, drop=0.0):
+def track(bx, Z, cmd, prop, touch, audio, gxy, drop=0.0, indep=False):
     """suivi « prédire puis corriger » sur T images -> boîtes (B,T,K,ds), attention (B,T,npf,K), prédictions (B,T-1,K,ds)."""
     B, T = Z.shape[:2]
     X = bx.feats(Z) if isinstance(bx, PixBoxes) else bx.inp(torch.cat([Z, gxy.expand(B, T, -1, -1)], -1))   # entrée rétinotopique
     sl, att = bx.sa(X[:, 0], None, iters=3); sl = F.layer_norm(sl, (sl.size(-1),)); S, A, Pr = [sl], [att], []
     for t in range(1, T):
+        if indep:                                                                 # ÉCHAUFFEMENT : chaque image découpée seule (pas de suivi)
+            sl, att = bx.sa(X[:, t], None, iters=3); sl = F.layer_norm(sl, (sl.size(-1),)); S.append(sl); A.append(att); continue
         pos = bx.slot_pos(sl, gxy)
         pf = (torch.rand(B, 1, device=Z.device) >= drop).float(); sf = (torch.rand(B, 1, device=Z.device) >= drop).float()
         pred = bx.dyn(sl, pos, cmd[:, t], prop[:, t - 1], pf, touch[:, t - 1], audio[:, t - 1], sf); Pr.append(pred)
         sl, att = bx.sa(X[:, t], pred, iters=2); sl = F.layer_norm(sl, (sl.size(-1),)); S.append(sl); A.append(att)
-    return torch.stack(S, 1), torch.stack(A, 1), torch.stack(Pr, 1)
+    return torch.stack(S, 1), torch.stack(A, 1), (torch.stack(Pr, 1) if Pr else None)
 
 def imagine(bx, sl0, att0, cmd, t0, H_, gxy):
     """IMAGINATION en boucle ouverte depuis l'instant t0 : seulement les gestes (aucun sens futur) -> boîtes (B,H,K,ds), positions."""
@@ -213,7 +215,8 @@ def main():
     p.add_argument("--eye", required=True, help="instantané de phase 0 (œil figé)"); p.add_argument("--ckpt", default="/content/slots0.pt")
     p.add_argument("--steps", type=int, default=20000); p.add_argument("--bs", type=int, default=32); p.add_argument("--lr", type=float, default=2e-4)
     p.add_argument("--K", type=int, default=5, help="5 = 3 objets + main + marge pour le fond (recherche : 4 ou 5)"); p.add_argument("--ds", type=int, default=64); p.add_argument("--H", type=int, default=8)
-    p.add_argument("--w_dyn", type=float, default=1.0); p.add_argument("--w_img", type=float, default=1.0)
+    p.add_argument("--warm", type=int, default=5000, help="ÉCHAUFFEMENT : d'abord apprendre à découper (image par image, sans imagination), comme la perception avant la dynamique")
+    p.add_argument("--mot_scale", type=float, default=3.0); p.add_argument("--w_dyn", type=float, default=1.0); p.add_argument("--w_img", type=float, default=1.0)
     p.add_argument("--workers", type=int, default=6); p.add_argument("--n_probe", type=int, default=300); p.add_argument("--exam_every", type=int, default=5000)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0_ = time.time()
     ck = torch.load(a.eye, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
@@ -238,15 +241,16 @@ def main():
         w_mot, w_app = 1.0 - 0.8 * f, 0.2 + 0.8 * f                                        # MOUVEMENT d'abord, APPARENCE ensuite
         for g in opt.param_groups: g["lr"] = a.lr * min(1.0, it / 1000)
         Z, tok, cmd = eye(enc, S_.next(), st, P, dev, nv, npf, d, T); sen = senses(tok, cmd, nv, T)
-        S, A, Pr = track(bx, Z, *sen, gxy, drop=0.3)
+        warm = it <= a.warm; S, A, Pr = track(bx, Z, *sen, gxy, drop=0.3, indep=warm)
         rgb, mo, al = bx.dec(S.flatten(0, 1)); B_ = len(Z)
         l_app = mixture_nll(Z.flatten(0, 1), rgb, al)                                    # APPARENCE : chaque pixel -> UNE boîte
         mot = (al.reshape(*al.shape[:2], 32, 32, 1) * mo).sum(1).view(Z.shape)
-        l_mot = F.mse_loss(mot[:, :-1], Z[:, 1:] - Z[:, :-1]) * 10                       # MOUVEMENT : ce qui change ensemble
-        t0 = int(np.random.randint(3, T - 2)); Hh = min(a.H, T - 1 - t0)
-        Si, _ = imagine(bx, S[:, t0], A[:, t0], cmd, t0, Hh, gxy)
-        l_dyn = F.mse_loss(Si, S[:, t0 + 1:t0 + 1 + Hh].detach())                         # JEPA : rejoindre les boîtes que l'œil trouvera
-        ri, _, ali = bx.dec(Si.flatten(0, 1)); l_img = mixture_nll(Z[:, t0 + 1:t0 + 1 + Hh].flatten(0, 1), ri, ali)   # ancrage dans la scène
+        l_mot = F.mse_loss(mot[:, :-1], Z[:, 1:] - Z[:, :-1]) * a.mot_scale              # MOUVEMENT : ce qui change ensemble
+        t0 = int(np.random.randint(3, T - 2)); Hh = min(a.H, T - 1 - t0); l_dyn = l_img = torch.zeros((), device=dev)
+        if not warm:
+            Si, _ = imagine(bx, S[:, t0], A[:, t0], cmd, t0, Hh, gxy)
+            l_dyn = F.mse_loss(Si, S[:, t0 + 1:t0 + 1 + Hh].detach())                     # JEPA : rejoindre les boîtes que l'œil trouvera
+            ri, _, ali = bx.dec(Si.flatten(0, 1)); l_img = mixture_nll(Z[:, t0 + 1:t0 + 1 + Hh].flatten(0, 1), ri, ali)   # ancrage dans la scène
         loss = w_app * l_app + w_mot * l_mot + a.w_dyn * l_dyn + a.w_img * l_img
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(bx.parameters(), 1.0); opt.step()
         cur = np.array([l_app.item(), l_mot.item(), l_dyn.item(), l_img.item(), al.max(1).values.mean().item()]); ma = cur if ma is None else 0.99 * ma + 0.01 * cur
