@@ -147,7 +147,7 @@ def main():
     p.add_argument("--plan_hs", type=str, default="", help="balayage d'horizons pour le MPC, ex. 1,2,6 (même lecteur, un seul chargement)")
     p.add_argument("--subgoal", type=int, default=0, help="1 = SOUS-BUTS (objet : se placer derrière puis pousser ; bouger : aller à l'objet puis pousser)")
     p.add_argument("--subgoals", type=str, default="", help="balayage, ex. 0,1")
-    p.add_argument("--behind", type=float, default=0.15, help="sous-but « derrière » : distance au centre de l'objet perçu"); p.add_argument("--sg_tol", type=float, default=0.04)
+    p.add_argument("--behind", type=float, default=0.15, help="sous-but « derrière » : distance au centre de l'objet perçu"); p.add_argument("--sg_tol", type=float, default=0.06)
     p.add_argument("--reach", type=float, default=0.2, help="bouger : sous-but « aller à l'objet » tant que main–objet perçus > reach")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
@@ -271,7 +271,8 @@ def main():
             if a.task == "bouger": phase, sub = (1, ob) if float((hd - ob).norm()) > a.reach else (2, None)
             else:
                 dg = gt - ob; u = dg / (dg.norm() + 1e-6); perp = torch.stack([-u[1], u[0]]); behind = ob - u * a.behind; rel = hd - ob
-                if float((hd - behind).norm()) > a.sg_tol:
+                dbh = float((hd - behind).norm()); env.ph2 = getattr(env, "ph2", False) and dbh < 2.5 * a.sg_tol or dbh <= a.sg_tol   # hystérésis : la perception de l'objet tremble
+                if not env.ph2:
                     phase = 1                                            # se placer DERRIÈRE (en contournant si la main est du mauvais côté)
                     if float(rel @ u) > -0.5 * a.behind: s_ = perp if float(rel @ perp) > 0 else -perp; sub = ob + s_ * (a.behind + 0.04) - u * 0.05
                     else: sub = behind
@@ -383,20 +384,24 @@ def main():
             if a.dump_n > 0:
                 import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, h=h_, subgoal=sg, episodes=[dict(ep=e, steps=r_) for e, r_ in enumerate(recs)])))
             if a.film > 0:
-                out = f"{a.film_dir}/film_{a.task}_h{h_}{'_ss' if sg else ''}.png"; film_fig(films, out, f"{titre} — {nm} ({a.episodes} épisodes : {np.mean(res[:, 2]):.0%})", has_obj)
-                print(f"      film -> {out}", flush=True)
+                import pickle; out = f"{a.film_dir}/film_{a.task}_h{h_}{'_ss' if sg else ''}"
+                pickle.dump(dict(films=films, has_obj=has_obj, res=res[:a.film]), open(out + ".pkl", "wb"))
+                for i, fl in enumerate(films):
+                    film_fig([fl], f"{out}_ep{i}.png", f"{titre} — {nm} — épisode {i} : {'RÉUSSI' if res[i, 2] else 'raté'} (distance finale {res[i, 1]:.2f})", has_obj,
+                             {"objet": "objet→cible", "bouger": "déplacement objet", "direction": "déplacement objet"}.get(a.task, "main→but"))
+                print(f"      films -> {out}_ep*.png", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
-def film_fig(films, path, title, has_obj):
+def film_fig(films, path, title, has_obj, qlab="fin du plan"):
     """une case par geste planifié : image vue AVANT le geste ; pointillés = le plan IMAGINÉ (rouge objet, jaune main),
     traits pleins = le MÊME plan exécuté pour de vrai (orange objet, cyan main) ; flèche blanche = le geste joué ;
     croix verte = but, x magenta = sous-but. Titre : quantité visée imaginée vs réelle à la fin du plan."""
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
-    ne = len(films); nc = max(len(f) for f in films)
-    fig, ax = plt.subplots(ne, nc, figsize=(1.75 * nc, 2.0 * ne + 0.6), squeeze=False)
+    wrap = 6; nc = max(len(f) for f in films); rows_per = -(-nc // wrap); ne = len(films) * rows_per
+    fig, ax = plt.subplots(ne, wrap, figsize=(2.6 * wrap, 2.85 * ne + 0.7), squeeze=False)
     for i, fl in enumerate(films):
-        for j in range(nc):
-            A_ = ax[i, j]; A_.set_xticks([]); A_.set_yticks([])
+        for j in range(rows_per * wrap):
+            A_ = ax[i * rows_per + j // wrap, j % wrap]; A_.set_xticks([]); A_.set_yticks([])
             if j >= len(fl): A_.axis("off"); continue
             s = fl[j]; A_.imshow(s["X"], extent=(0, 1, 1, 0), interpolation="nearest"); im, re = s["im"], s["re"]
             if has_obj:
@@ -408,10 +413,9 @@ def film_fig(films, path, title, has_obj):
             A_.plot(*s["g"], "+", c="lime", ms=9, mew=2)
             if s["sub"] is not None: A_.plot(*s["sub"], "x", c="magenta", ms=7, mew=2)
             ph = {0: "", 1: " · main→ss-but", 2: " · pousse"}[s["phase"]]
-            A_.set_title(f"t={s['t']}{ph}\nimag {s['qi']:.2f} | réel {s['qr']:.2f}", fontsize=6); A_.set_xlim(0, 1); A_.set_ylim(1, 0)
-        ax[i, 0].set_ylabel(f"épisode {i}", fontsize=7)
+            A_.set_title(f"t={s['t']}{ph}\n{qlab} : imaginé {s['qi']:.2f} | réel {s['qr']:.2f}", fontsize=8); A_.set_xlim(0, 1); A_.set_ylim(1, 0)
     fig.suptitle(title + "\npointillés = plan IMAGINÉ (rouge objet, jaune main) · plein = même plan RÉEL (orange objet, cyan main) · flèche = geste joué · + but · x sous-but", fontsize=8)
-    plt.tight_layout(); plt.savefig(path, dpi=85); plt.close(fig)
+    plt.tight_layout(); plt.savefig(path, dpi=100); plt.close(fig)
 
 if __name__ == "__main__":
     main()
