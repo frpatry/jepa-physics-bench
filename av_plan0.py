@@ -140,6 +140,7 @@ def main():
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
+    p.add_argument("--dump_n", type=int, default=0, help="enregistre les N premiers épisodes MPC (gestes + positions IMAGINÉES) pour les animations")
     p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
@@ -256,9 +257,10 @@ def main():
             with torch.no_grad():
                 zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
                 gt = read(zt)[0, :2]
-        def cost(cand):                         # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
+        def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad(): r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))
+            if raw: return r_                                            # positions imaginées (objet x,y, main x,y) à t+Hh
             if a.task == "bouger": return -(r_[:, :2] - gt).norm(dim=-1)                       # imaginer l'objet DÉPLACÉ
             if a.task == "direction": return -((r_[:, :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
             sl = slice(0, 2) if a.task == "objet" else slice(2, 4)    # position lue : objet (pousser) ou MAIN (atteindre, toucher)
@@ -271,7 +273,7 @@ def main():
             for ac in cc: e2.step(ac, render=False)
             out.append(e2.dist())
         return np.array(out)
-    def run(ep, policy):
+    def run(ep, policy, rec=None):
         env = Push0(ep, task=a.task); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
@@ -296,6 +298,9 @@ def main():
                     seg = (mu_ + sd_ * torch.randn(a.pop, K, 2, device=dev)).clamp(-VMAX, VMAX); cand = seg.repeat_interleave(rep, 1)[:, :Hh]
                     el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
+                if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
+                    plan = mu_.repeat_interleave(rep, 0)[:Hh]; gh = cost(plan[None], raw=True)[0].cpu().numpy()
+                    rec.append(dict(t=int(env.t), act=[float(x) for x in act], ghost=[float(x) for x in gh], Hh=int(Hh)))
             env.step(np.asarray(act, np.float32))
         ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         return d0, env.dist(), float(ok)
@@ -312,9 +317,14 @@ def main():
              "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
+    dump = []
     for pol in ("hasard", "oracle", "MPC bébé"):
-        tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
+        recs = [[] for _ in range(a.dump_n)] if pol == "MPC bébé" else None
+        tp = time.time(); res = np.array([run(e, pol, recs[e] if recs is not None and e < a.dump_n else None) for e in range(a.episodes)])
+        if recs is not None: dump = [dict(ep=e, steps=r_) for e, r_ in enumerate(recs)]
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
+    if a.dump_n > 0:
+        import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, episodes=dump)))
     print(f"total {time.time() - t0:.0f}s")
 
 if __name__ == "__main__":
