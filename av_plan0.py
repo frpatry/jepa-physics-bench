@@ -147,8 +147,10 @@ def main():
     p.add_argument("--plan_hs", type=str, default="", help="balayage d'horizons pour le MPC, ex. 1,2,6 (même lecteur, un seul chargement)")
     p.add_argument("--subgoal", type=int, default=0, help="1 = SOUS-BUTS (objet : se placer derrière puis pousser ; bouger : aller à l'objet puis pousser)")
     p.add_argument("--subgoals", type=str, default="", help="balayage, ex. 0,1")
-    p.add_argument("--behind", type=float, default=0.15, help="sous-but « derrière » : distance au centre de l'objet perçu"); p.add_argument("--sg_tol", type=float, default=0.06)
+    p.add_argument("--behind", type=float, default=0.21, help="sous-but « derrière » : distance au centre de l'objet perçu (> rayon objet + main ≈ 0.2, sinon inatteignable)"); p.add_argument("--sg_tol", type=float, default=0.06)
     p.add_argument("--reach", type=float, default=0.2, help="bouger : sous-but « aller à l'objet » tant que main–objet perçus > reach")
+    p.add_argument("--cost_all", type=int, default=0, help="1 = coût moyen sur TOUS les pas du plan (sinon seulement la fin : le planificateur peut « remettre à plus tard »)")
+    p.add_argument("--cost_alls", type=str, default="", help="balayage, ex. 0,1")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -279,13 +281,16 @@ def main():
                 else: phase = 2
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
-            with torch.no_grad(): r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))
-            if raw: return r_                                            # positions imaginées (objet x,y, main x,y) à t+Hh
-            if phase == 1: return (r_[:, 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
-            if a.task == "bouger": return -(r_[:, :2] - gt).norm(dim=-1)                       # imaginer l'objet DÉPLACÉ
-            if a.task == "direction": return -((r_[:, :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
-            sl = slice(0, 2) if a.task == "objet" else slice(2, 4)    # position lue : objet (pousser) ou MAIN (atteindre, toucher)
-            return (r_[:, sl] - gt).norm(dim=-1)
+            with torch.no_grad():
+                if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
+                    r_ = read(m.pred(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
+                else: r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
+            if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
+            if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
+            elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
+            elif a.task == "direction": c_ = -((r_[..., :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
+            else: c_ = (r_[..., slice(0, 2) if a.task == "objet" else slice(2, 4)] - gt).norm(dim=-1)   # objet (pousser) ou MAIN (atteindre, toucher)
+            return c_.mean(1)
         def traj(plan):                         # plan (Hh, 2) -> positions IMAGINÉES (Hh, 4) à t+1 .. t+Hh (une requête par horizon)
             cmd = cmd0.expand(Hh, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = plan[None] / 0.05
             with torch.no_grad(): return read(m.pred(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
@@ -367,9 +372,10 @@ def main():
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
     hs = [int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]
     sgs = [int(x) for x in a.subgoals.split(",")] if a.subgoals else [a.subgoal]
-    for h_ in hs:
-        for sg in sgs:
-            a.plan_h, a.subgoal = h_, sg; nm = f"MPC h={h_}" + (" +ss-buts" if sg else "")
+    cas = [int(x) for x in a.cost_alls.split(",")] if a.cost_alls else [a.cost_all]
+    for h_, sg, ca in [(h_, sg, ca) for h_ in hs for sg in sgs for ca in cas]:
+        if True:
+            a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = f"MPC h={h_}" + (" +ss-buts" if sg else "") + (" +coût-tous-pas" if ca else "")
             recs = [[] for _ in range(a.dump_n)]; films = [[] for _ in range(a.film)]; S = []
             tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
@@ -382,9 +388,9 @@ def main():
                       + f"{f_(r[:, 2])} / {f_(r[:, 4])}", flush=True)
             if a.subgoal: print(f"      gestes en phase « main au sous-but » {np.mean(S[S[:, 0] == 1, 6] == 1):.0%}, « pousser » {np.mean(S[S[:, 0] == 1, 6] == 2):.0%}")
             if a.dump_n > 0:
-                import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, h=h_, subgoal=sg, episodes=[dict(ep=e, steps=r_) for e, r_ in enumerate(recs)])))
+                import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, h=h_, subgoal=sg, cost_all=ca, episodes=[dict(ep=e, steps=r_) for e, r_ in enumerate(recs)])))
             if a.film > 0:
-                import pickle; out = f"{a.film_dir}/film_{a.task}_h{h_}{'_ss' if sg else ''}"
+                import pickle; out = f"{a.film_dir}/film_{a.task}_h{h_}{'_ss' if sg else ''}{'_ca' if ca else ''}"
                 pickle.dump(dict(films=films, has_obj=has_obj, res=res[:a.film]), open(out + ".pkl", "wb"))
                 for i, fl in enumerate(films):
                     film_fig([fl], f"{out}_ep{i}.png", f"{titre} — {nm} — épisode {i} : {'RÉUSSI' if res[i, 2] else 'raté'} (distance finale {res[i, 1]:.2f})", has_obj,
