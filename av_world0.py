@@ -70,7 +70,7 @@ def fric_sound(pos, mat, m, T, level):
     return sig
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -86,7 +86,10 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     elle ne suit pas ses commandes -> ce n'est pas sa main. Teinte peau, un peu plus grande. PAR (n,T,2) = position (examens).
     calm (0..1) : MONDE LISIBLE / COMPLEXITÉ PROGRESSIVE (idées user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba
     0.8·calm, 3–6 images) ; il fait aussi des pauses sans contact (0.35·calm des changements de geste) ; les objets sont AU REPOS par
-    défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm)."""
+    défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm).
+    blocks (0..1) : part des séquences en MONDE DE BLOCS (option B) — les objets ne bougent QUE pendant qu'on les pousse (vitesse
+    amortie ×0.25 par image : ils s'arrêtent dès que la main les lâche), au repos au départ, masse presque constante (0.8–1.25) :
+    le principe de contact (2.5 mois) avant l'élan et les glissades (plus tard)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -127,6 +130,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
         ang = rng.uniform(0, 2 * math.pi, N); om = rng.normal(0, 0.15, N) * moving
         fric = (0.008 if calm > 0 and rng.random() < calm else rng.choice([0.0015, 0.004])) if N else 0.0   # calm : l'objet s'arrête dans la séquence
+        blk = N > 0 and blocks > 0 and rng.random() < blocks              # BLOCS : au repos, masse ~constante, s'arrêtent dès qu'on les lâche
+        if blk: m = np.exp(np.log(m) * np.log(1.25) / np.log(3)); V[:] = 0; om[:] = 0
         mg = table if (p_out > 0 and N and rng.random() < p_out) else 0.0                  # marge de la table au-delà du champ
         for _ in range(200):
             out = lo < 0 and rng.random() < 0.3                     # 0b : la main commence parfois HORS du champ
@@ -225,6 +230,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if fric > 0:
                     v_ = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (v_ + 1e-9), 0, 1)
                     om *= 0.97 if fric < 0.003 else 0.9
+                if blk: V *= 0.25; om *= 0.5                         # bloc : il ne bouge que POUSSÉ
                 vact[t] = Hp - H0
                 if calm > 0 and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
                     mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire

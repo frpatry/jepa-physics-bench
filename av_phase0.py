@@ -316,6 +316,8 @@ def main():
     p.add_argument("--outside", type=int, default=0, help="1 = la TABLE DÉBORDE du champ dans une part croissante des séquences (0d 10 % -> 30 %, 0e 30 % -> 70 %) : objets qui sortent, entendus hors champ")
     p.add_argument("--T", type=int, default=16, help="images par séquence (16 ≈ 1 s ; 32 = 2 s : il faut repartir de zéro)")
     p.add_argument("--parent", type=float, default=0.0, help="part des séquences (avec objets) où la MAIN D'UN PARENT vient pousser un objet (démonstration du contact)")
+    p.add_argument("--blocks", type=int, default=0, help="1 = MONDE DE BLOCS (option B) : objets qui ne bougent que poussés en 0d (100 %), puis glissades progressives en 0e (100 % -> 30 % de blocs)")
+    p.add_argument("--surprise_w", type=float, default=0.0, help="ATTENTION À LA SURPRISE : chaque cible pèse selon son erreur (relative à la moyenne du lot)^γ, γ = cette valeur ; le bébé regarde plus longtemps ce qui le surprend")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -342,7 +344,7 @@ def main():
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -360,6 +362,7 @@ def main():
         if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + (0.3 if a.calm == 2 else 0.4) * fe}.get(stage, 0.0)
         if a.calm == 1: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - fe)}.get(stage, 1.0)
         if a.calm == 2: S.wkw["calm"] = {"0d": 1 - 0.3 * f, "0e": 0.7 - 0.4 * fe}.get(stage, 1.0)   # LENT : jamais chaotique (1 -> 0.7 -> 0.3)
+        if a.blocks: S.wkw["blocks"] = {"0d": 1.0, "0e": 1.0 - 0.7 * fe}.get(stage, 1.0)          # BLOCS d'abord, glissades ensuite
         lr_f = min(1.0, it / 3000) * (0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
@@ -379,6 +382,8 @@ def main():
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
                 w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
+                if a.surprise_w > 0:                                # ATTENTION À LA SURPRISE (ce qui est mal prédit compte plus ; moyenne 1)
+                    e_ = dif.mean(-1).detach(); w_ = w_ * (e_ / e_.mean().clamp_min(1e-8)).pow(a.surprise_w).clamp(max=5.0)
                 jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
             jl = jl / len(pairs); il = torch.zeros((), device=dev)
             if a.inv_w > 0:                                          # CONTINGENCE : vision SEULE (le bras serait un raccourci)
@@ -408,7 +413,7 @@ def main():
         cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
-            print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
+            print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
                   f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:

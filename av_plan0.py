@@ -27,13 +27,14 @@ VMAX = 0.1
 
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
-    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet"):
-        s.task = task                                                   # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
+    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False):
+        s.task, s.blocks = task, blocks                                                   # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
         s.Rh, s.Lr = 0.07, 0.9; s.kind = int(rng.integers(0, 4))
         s.sz = rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
         s.col = np.clip(PAL[rng.integers(len(PAL))] * rng.uniform(0.7, 1.0) + rng.normal(0, 0.08, 3), 0.1, 0.95).astype(np.float32)
         s.m = float(np.exp(rng.uniform(np.log(1 / 3), np.log(3)))); s.mat = int(rng.integers(0, 3)); s.fric = fric   # frottement « s'arrête vite » (vécu en babillant) : sinon l'objet glisse comme sur la glace
+        if blocks: s.m = float(np.exp(np.log(s.m) * np.log(1.25) / np.log(3)))   # BLOC : masse ~constante (mêmes tirages aléatoires)
         for _ in range(500):                                            # objet À PORTÉE, avec de la place autour pour pousser
             s.P = rng.uniform(s.rc + 0.05, 1 - s.rc - 0.05, 2).astype(np.float32)
             if np.linalg.norm(s.P - SHOULDER) < s.Lr - s.rc - 0.12: break
@@ -104,6 +105,7 @@ class Push0:
             s.TOUCH[t, 2 * side] += J; s.TOUCH[t, 2 * side + 1] = max(s.TOUCH[t, 2 * side + 1], w_); s.touched = True
         v_ = float(np.linalg.norm(s.V)); s.V = (s.V * np.clip(1 - s.fric / (v_ + 1e-9), 0, 1)).astype(np.float32)
         s.om *= 0.97 if s.fric < 0.003 else 0.9
+        if s.blocks: s.V = (s.V * 0.25).astype(np.float32); s.om *= 0.5        # BLOC : il ne bouge que poussé
         s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t]]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
     def batch(s):
         """vécu jusqu'à t -> lot (1, T, ...) ; le futur est rempli « immobile » (hors contexte de toute façon)."""
@@ -128,6 +130,8 @@ def oracle(env):
     P, g, Hp = env.P, env.g, env.Hp; dg = g - P; dist = float(np.linalg.norm(dg)); u = dg / (dist + 1e-6); perp = np.array([-u[1], u[0]])
     if np.linalg.norm(env.V) > 0.003 or dist < 0.02: return np.zeros(2, np.float32)
     behind = P - u * (env.rc + env.Rh + 0.01); rel = Hp - P
+    if np.linalg.norm(Hp - behind) < 0.02 and env.blocks:               # BLOC : pousser en continu, ralentir près de la cible
+        return np.clip(u * min(0.08, max(dist - 0.005, 0.008)), -VMAX, VMAX).astype(np.float32)
     if np.linalg.norm(Hp - behind) < 0.02:                              # en place : vitesse de main pour la bonne glissade
         vh = math.sqrt(2 * env.fric * max(dist - 0.005, 0)) * (1 + env.m) / 2; return np.clip(u * max(vh, 0.012), -VMAX, VMAX).astype(np.float32)
     if rel @ u > -(env.rc + env.Rh) * 0.5: side = perp if rel @ perp > 0 else -perp; tgt = P + side * (env.rc + env.Rh + 0.06) - u * 0.05
@@ -151,6 +155,7 @@ def main():
     p.add_argument("--reach", type=float, default=0.2, help="bouger : sous-but « aller à l'objet » tant que main–objet perçus > reach")
     p.add_argument("--cost_all", type=int, default=0, help="1 = coût moyen sur TOUS les pas du plan (sinon seulement la fin : le planificateur peut « remettre à plus tard »)")
     p.add_argument("--cost_alls", type=str, default="", help="balayage, ex. 0,1")
+    p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -170,7 +175,7 @@ def main():
             out.append(F.layer_norm(tgt(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d).half().cpu())
         return torch.cat(out)
     # ---------- 1 LECTEUR (instrument) : objet + main, monde 0e à UN objet
-    w = gen_world0(a.n_read, "0e", T, H, seed=777, **cfg.get("wkw", {})); keep = np.where(w["NOBJ"] == 1)[0]
+    w = gen_world0(a.n_read, "0e", T, H, seed=777, **{**cfg.get("wkw", {}), **({"blocks": 1.0} if a.blocks else {})}); keep = np.where(w["NOBJ"] == 1)[0]
     wb = to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]); b = to_torch(wb); n = len(keep)
     Y = torch.from_numpy(np.concatenate([w["POS"][keep, :, 0], w["HAND"][keep]], -1)).float()       # (n, T, 4)
     Z = vis_lat(b); ntr = int(0.8 * n); Ztr, Ytr = Z[:ntr].flatten(0, 1), Y[:ntr].flatten(0, 1)
@@ -185,6 +190,11 @@ def main():
         pt = torch.cat([read(Z[ntr:].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, (n - ntr) * T, 512)])
     e = (pt - Y[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32
     print(f"1 LECTEUR sur vrais latents ({n} séq. à 1 objet) : objet {e[:, 0].mean():.2f} px, main {e[:, 1].mean():.2f} px  ({time.time() - t0:.0f}s)", flush=True)
+    dho = (Y[ntr:, :, :2] - Y[ntr:, :, 2:]).flatten(0, 1).norm(dim=-1); eo = e[:, 0]               # B0 : la PERCEPTION de l'objet selon la distance à la main
+    bins = [(0, 0.2, "au contact (< 0.2)"), (0.2, 0.35, "proche (0.2–0.35)"), (0.35, 9, "loin (> 0.35)")]
+    print("   B0 objet perçu selon la distance main–objet : " + " | ".join(f"{nm} {eo[(dho >= lo) & (dho < hi)].mean():.2f} px (n={int(((dho >= lo) & (dho < hi)).sum())})" for lo, hi, nm in bins), flush=True)
+    pd_ = pt.view(-1, 4); bias = ((pd_[:, :2] - Y[ntr:].flatten(0, 1)[:, :2]) * F.normalize(Y[ntr:].flatten(0, 1)[:, 2:] - Y[ntr:].flatten(0, 1)[:, :2], dim=-1)).sum(-1) * 32
+    print("   B0 erreur de l'objet perçu PROJETÉE vers la main (+ = tiré vers la main) : " + " | ".join(f"{nm} {bias[(dho >= lo) & (dho < hi)].mean():+.2f} px" for lo, hi, nm in bins), flush=True)
     # ---------- 2 IMAGINATION DÉCODÉE : contexte 0..7, futur 8..15
     te = slice(ntr, n); bt = {k: x[te] for k, x in b.items()}; Yt = Y[te]; cm, tm = fr < h, (fr >= h) & (fr < h + nf) & (md == 0)
     ci0, ti0 = torch.from_numpy(np.where(cm)[0]).to(dev), torch.from_numpy(np.where(tm)[0]).to(dev)
@@ -309,7 +319,7 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
             Hh = min(a.plan_h, T - 1 - env.t)
