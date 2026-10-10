@@ -144,6 +144,13 @@ def main():
     p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
+    p.add_argument("--plan_hs", type=str, default="", help="balayage d'horizons pour le MPC, ex. 1,2,6 (même lecteur, un seul chargement)")
+    p.add_argument("--subgoal", type=int, default=0, help="1 = SOUS-BUTS (objet : se placer derrière puis pousser ; bouger : aller à l'objet puis pousser)")
+    p.add_argument("--subgoals", type=str, default="", help="balayage, ex. 0,1")
+    p.add_argument("--behind", type=float, default=0.15, help="sous-but « derrière » : distance au centre de l'objet perçu"); p.add_argument("--sg_tol", type=float, default=0.04)
+    p.add_argument("--reach", type=float, default=0.2, help="bouger : sous-but « aller à l'objet » tant que main–objet perçus > reach")
+    p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
+    p.add_argument("--film_dir", type=str, default="/content")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     global T; T = int(cfg.get("T", 16)); import av_phase0; av_phase0.T = T                 # longueur des séquences de l'instantané
@@ -249,22 +256,39 @@ def main():
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         t = env.t; b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
-        ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]; ti = torch.from_numpy(np.where((fr == t + Hh) & (md == 0))[0]).to(dev)[None]
-        with torch.no_grad(): ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
+        ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]
+        tis = torch.stack([torch.from_numpy(np.where((fr == t + hh) & (md == 0))[0]) for hh in range(1, Hh + 1)]).to(dev); ti = tis[-1:]
+        vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
+        with torch.no_grad():
+            ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
+            zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
+            now = read(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
         gt = torch.from_numpy(env.g).to(dev)
-        if a.task in ("toucher", "bouger", "direction"):                 # où est l'objet MAINTENANT (perception, pas imagination)
-            vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
-            with torch.no_grad():
-                zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
-                gt = read(zt)[0, :2]
+        if a.task in ("toucher", "bouger", "direction"): gt = now[:2]   # où est l'objet MAINTENANT
+        phase, sub = 0, None                                             # SOUS-BUTS (le bébé décompose : d'abord la main, ensuite l'objet)
+        if a.subgoal and a.task in ("objet", "bouger"):
+            ob, hd = now[:2], now[2:]
+            if a.task == "bouger": phase, sub = (1, ob) if float((hd - ob).norm()) > a.reach else (2, None)
+            else:
+                dg = gt - ob; u = dg / (dg.norm() + 1e-6); perp = torch.stack([-u[1], u[0]]); behind = ob - u * a.behind; rel = hd - ob
+                if float((hd - behind).norm()) > a.sg_tol:
+                    phase = 1                                            # se placer DERRIÈRE (en contournant si la main est du mauvais côté)
+                    if float(rel @ u) > -0.5 * a.behind: s_ = perp if float(rel @ perp) > 0 else -perp; sub = ob + s_ * (a.behind + 0.04) - u * 0.05
+                    else: sub = behind
+                else: phase = 2
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad(): r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))
             if raw: return r_                                            # positions imaginées (objet x,y, main x,y) à t+Hh
+            if phase == 1: return (r_[:, 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             if a.task == "bouger": return -(r_[:, :2] - gt).norm(dim=-1)                       # imaginer l'objet DÉPLACÉ
             if a.task == "direction": return -((r_[:, :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
             sl = slice(0, 2) if a.task == "objet" else slice(2, 4)    # position lue : objet (pousser) ou MAIN (atteindre, toucher)
             return (r_[:, sl] - gt).norm(dim=-1)
+        def traj(plan):                         # plan (Hh, 2) -> positions IMAGINÉES (Hh, 4) à t+1 .. t+Hh (une requête par horizon)
+            cmd = cmd0.expand(Hh, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = plan[None] / 0.05
+            with torch.no_grad(): return read(m.pred(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
+        cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
     def real_cost(env, cand):
         out = []
@@ -273,7 +297,12 @@ def main():
             for ac in cc: e2.step(ac, render=False)
             out.append(e2.dist())
         return np.array(out)
-    def run(ep, policy, rec=None):
+    has_obj = not a.task.startswith("main")
+    def qty(p4, ref):                           # la quantité visée par la tâche (pour le film) : distance au but / déplacement
+        if a.task == "objet": return float(np.linalg.norm(p4[:2] - ref))
+        if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
+        return float(np.linalg.norm(p4[2:] - ref))
+    def run(ep, policy, rec=None, stats=None, film=None):
         env = Push0(ep, task=a.task); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
@@ -301,6 +330,21 @@ def main():
                 if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
                     plan = mu_.repeat_interleave(rep, 0)[:Hh]; gh = cost(plan[None], raw=True)[0].cpu().numpy()
                     rec.append(dict(t=int(env.t), act=[float(x) for x in act], ghost=[float(x) for x in gh], Hh=int(Hh)))
+                if stats is not None or film is not None:                # le plan ENTIER : imaginé pas à pas vs exécuté pour de vrai (copie du monde)
+                    plan = mu_.repeat_interleave(rep, 0)[:Hh]; im = cost.traj(plan).cpu().numpy(); now = cost.now.cpu().numpy()
+                    e2 = copy.deepcopy(env); re = []
+                    for ac in plan.cpu().numpy(): e2.step(ac, render=False); re.append(np.concatenate([e2.P, e2.Hp]))
+                    re = np.array(re, np.float32)
+                    if stats is not None:
+                        for hh in range(Hh):
+                            mv = float(np.linalg.norm(re[hh, :2] - env.P)) > 0.01
+                            stats.append((hh + 1, np.linalg.norm(im[hh, :2] - re[hh, :2]), np.linalg.norm(im[hh, 2:] - re[hh, 2:]),
+                                          np.linalg.norm(now[:2] - re[hh, :2]), np.linalg.norm(now[2:] - re[hh, 2:]), mv, cost.phase))
+                    if film is not None:
+                        ref = cost.gt.cpu().numpy()
+                        film.append(dict(t=int(env.t), X=env.X[env.t].copy(), P=env.P.copy(), Hp=env.Hp.copy(), now=now, im=im, re=re, act=np.asarray(act),
+                                         phase=cost.phase, sub=None if cost.sub is None else cost.sub.cpu().numpy(), g=ref,
+                                         qi=qty(im[-1], ref), qr=qty(re[-1], env.P if a.task in ("bouger", "direction") else ref)))
             env.step(np.asarray(act, np.float32))
         ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         return d0, env.dist(), float(ok)
@@ -317,15 +361,57 @@ def main():
              "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
-    dump = []
-    for pol in ("hasard", "oracle", "MPC bébé"):
-        recs = [[] for _ in range(a.dump_n)] if pol == "MPC bébé" else None
-        tp = time.time(); res = np.array([run(e, pol, recs[e] if recs is not None and e < a.dump_n else None) for e in range(a.episodes)])
-        if recs is not None: dump = [dict(ep=e, steps=r_) for e, r_ in enumerate(recs)]
+    for pol in ("hasard", "oracle"):
+        tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
-    if a.dump_n > 0:
-        import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, episodes=dump)))
+    hs = [int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]
+    sgs = [int(x) for x in a.subgoals.split(",")] if a.subgoals else [a.subgoal]
+    for h_ in hs:
+        for sg in sgs:
+            a.plan_h, a.subgoal = h_, sg; nm = f"MPC h={h_}" + (" +ss-buts" if sg else "")
+            recs = [[] for _ in range(a.dump_n)]; films = [[] for _ in range(a.film)]; S = []
+            tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
+            print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f}  ({time.time() - tp:.0f}s)", flush=True)
+            S = np.array(S, dtype=np.float64)                             # (h, err objet, err main, copie objet, copie main, l'objet bouge, phase)
+            print(f"      DÉRIVE de l'imagination (plan entier exécuté pour de vrai, px) : h | objet qui BOUGE imaginé / copie (n) "
+                  f"| objet IMMOBILE imaginé / copie | main imaginée / copie")
+            for hh in sorted(set(S[:, 0].astype(int))):
+                r = S[S[:, 0] == hh]; mv = r[:, 5] > 0; f_ = lambda x: f"{x.mean() * 32:5.1f}" if len(x) else "  —  "
+                print(f"      {hh} | " + (f"{f_(r[mv, 1])} / {f_(r[mv, 3])} ({int(mv.sum()):4d}) | {f_(r[~mv, 1])} / {f_(r[~mv, 3])} | " if has_obj else "")
+                      + f"{f_(r[:, 2])} / {f_(r[:, 4])}", flush=True)
+            if a.subgoal: print(f"      gestes en phase « main au sous-but » {np.mean(S[S[:, 0] == 1, 6] == 1):.0%}, « pousser » {np.mean(S[S[:, 0] == 1, 6] == 2):.0%}")
+            if a.dump_n > 0:
+                import json; print("DUMP_JSON " + json.dumps(dict(task=a.task, plan_c=a.plan_c, h=h_, subgoal=sg, episodes=[dict(ep=e, steps=r_) for e, r_ in enumerate(recs)])))
+            if a.film > 0:
+                out = f"{a.film_dir}/film_{a.task}_h{h_}{'_ss' if sg else ''}.png"; film_fig(films, out, f"{titre} — {nm} ({a.episodes} épisodes : {np.mean(res[:, 2]):.0%})", has_obj)
+                print(f"      film -> {out}", flush=True)
     print(f"total {time.time() - t0:.0f}s")
+
+def film_fig(films, path, title, has_obj):
+    """une case par geste planifié : image vue AVANT le geste ; pointillés = le plan IMAGINÉ (rouge objet, jaune main),
+    traits pleins = le MÊME plan exécuté pour de vrai (orange objet, cyan main) ; flèche blanche = le geste joué ;
+    croix verte = but, x magenta = sous-but. Titre : quantité visée imaginée vs réelle à la fin du plan."""
+    import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
+    ne = len(films); nc = max(len(f) for f in films)
+    fig, ax = plt.subplots(ne, nc, figsize=(1.75 * nc, 2.0 * ne + 0.6), squeeze=False)
+    for i, fl in enumerate(films):
+        for j in range(nc):
+            A_ = ax[i, j]; A_.set_xticks([]); A_.set_yticks([])
+            if j >= len(fl): A_.axis("off"); continue
+            s = fl[j]; A_.imshow(s["X"], extent=(0, 1, 1, 0), interpolation="nearest"); im, re = s["im"], s["re"]
+            if has_obj:
+                A_.plot(np.r_[s["P"][0], re[:, 0]], np.r_[s["P"][1], re[:, 1]], "-", c="orange", lw=1.3)
+                A_.plot(np.r_[s["now"][0], im[:, 0]], np.r_[s["now"][1], im[:, 1]], ":", c="red", lw=1.6, marker=".", ms=3)
+            A_.plot(np.r_[s["Hp"][0], re[:, 2]], np.r_[s["Hp"][1], re[:, 3]], "-", c="cyan", lw=1.1)
+            A_.plot(np.r_[s["now"][2], im[:, 2]], np.r_[s["now"][3], im[:, 3]], ":", c="yellow", lw=1.6, marker=".", ms=3)
+            A_.arrow(s["Hp"][0], s["Hp"][1], 1.5 * s["act"][0], 1.5 * s["act"][1], color="w", width=0.008, head_width=0.04, length_includes_head=True)
+            A_.plot(*s["g"], "+", c="lime", ms=9, mew=2)
+            if s["sub"] is not None: A_.plot(*s["sub"], "x", c="magenta", ms=7, mew=2)
+            ph = {0: "", 1: " · main→ss-but", 2: " · pousse"}[s["phase"]]
+            A_.set_title(f"t={s['t']}{ph}\nimag {s['qi']:.2f} | réel {s['qr']:.2f}", fontsize=6); A_.set_xlim(0, 1); A_.set_ylim(1, 0)
+        ax[i, 0].set_ylabel(f"épisode {i}", fontsize=7)
+    fig.suptitle(title + "\npointillés = plan IMAGINÉ (rouge objet, jaune main) · plein = même plan RÉEL (orange objet, cyan main) · flèche = geste joué · + but · x sous-but", fontsize=8)
+    plt.tight_layout(); plt.savefig(path, dpi=85); plt.close(fig)
 
 if __name__ == "__main__":
     main()
