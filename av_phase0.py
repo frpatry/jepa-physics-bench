@@ -363,6 +363,8 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = MONDE DE BLOCS (option B) : objets qui ne bougent que poussés en 0d (100 %), puis glissades progressives en 0e (100 % -> 30 % de blocs)")
     p.add_argument("--surprise_w", type=float, default=0.0, help="ATTENTION À LA SURPRISE : chaque cible pèse selon son erreur (relative à la moyenne du lot)^γ, γ = cette valeur ; le bébé regarde plus longtemps ce qui le surprend")
     p.add_argument("--split", type=int, default=0, help="1 = CORPS / MONDE séparés (conception_corps_monde.md) : la commande ne va qu'au corps ; le monde reçoit l'état du corps (4 nombres du bras), jamais la commande")
+    p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
+    p.add_argument("--start_it", type=int, default=0, help="avec un prédicteur NEUF : repartir à ce pas (ex. 22000 = début de 0d) même si l'œil vient d'un instantané plus avancé")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -387,9 +389,11 @@ def main():
     torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
-    opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
+    if a.freeze_eye:
+        for p_ in m.enc.parameters(): p_.requires_grad_(False)
+    opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -398,6 +402,7 @@ def main():
         else: m.load_state_dict(ck["m"])
         tgt.load_state_dict(ck["tgt"]); state = ck["state"]
         if "opt" in ck and not fresh: opt.load_state_dict(ck["opt"])       # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
+        if fresh and a.start_it: state["it"] = a.start_it                # œil d'un bébé plus âgé, prédicteur neuf : on rejoue 0d–0e
         if "norm" in ck: st = ck["norm"]                                  # garder la normalisation des sens avec laquelle il a appris
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
@@ -453,14 +458,15 @@ def main():
                 e_t, e_l = err_(cmd), err_(cmd_l)
                 al = F.relu(e_t - e_l + a.act_margin * e_t.detach()).mean(); gap = ((e_l - e_t) / e_t.clamp_min(1e-6)).mean().detach()
         sr = torch.zeros((), device=dev)
-        if a.sig_w > 0:
+        if a.sig_w > 0 and not a.freeze_eye:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
         loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
-        with torch.no_grad():
-            for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
+        if not a.freeze_eye:
+            with torch.no_grad():
+                for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
         cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
