@@ -97,6 +97,44 @@ class PredAC(nn.Module):
             out = s.base(ctx, ctx_idx, tgt_idx) + out
         return out
 
+class SplitPred(nn.Module):
+    """CORPS / MONDE séparés (conception_corps_monde.md ; Wolpert 1998, Spelke 1990) — même interface que PredAC.
+    CORPS (« cervelet ») : sens du bras connus + COMMANDES -> latents du bras de chaque frame (modèle direct) ; il ne voit pas l'image.
+    ÉTAT DU CORPS : les 4 nombres du bras (position, vitesse) lus dans le latent du bras — RÉELS pour les frames connues,
+    PRÉDITS par le corps pour les autres (ou fournis : body_real, le bras réellement senti, à l'entraînement).
+    MONDE : vue + ouïe + toucher du contexte + état du corps -> vue, ouïe, toucher cachés ; il ne reçoit JAMAIS la commande
+    ni le latent du bras : la main vue se dessine depuis l'état du corps, un objet ne peut bouger que par CONTACT."""
+    def __init__(s, d, nv, npf, T, nl, nh, bl=2):
+        super().__init__(); s.nv, s.npf, s.T = nv, npf, T
+        mk = lambda n: nn.TransformerEncoder(nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0), n)
+        s.b_missing = nn.Parameter(torch.zeros(d)); s.b_cmd = nn.Sequential(nn.Linear(2, d), nn.GELU(), nn.Linear(d, d)); s.b_t = nn.Embedding(T, d)
+        s.b_tr = mk(bl); s.b_ln = nn.LayerNorm(d); s.b_head = nn.Linear(d, d)
+        s.read = nn.Linear(d, 4)                                               # latent du bras -> les 4 nombres du bras
+        s.mask_token = nn.Parameter(torch.zeros(d)); s.pos = nn.Embedding(nv + 3 * T, d); s.w_t = nn.Embedding(T, d)
+        s.w_body = nn.Sequential(nn.Linear(4, d), nn.GELU(), nn.Linear(d, d))
+        s.w_tr = mk(nl); s.w_ln = nn.LayerNorm(d); s.w_head = nn.Linear(d, d)
+    def md_fr(s, idx):
+        nv, T = s.nv, s.T; md = (idx >= nv).long() + (idx >= nv + T).long() + (idx >= nv + 2 * T).long()
+        return md, torch.where(idx < nv, idx // s.npf, (idx - nv) % T)
+    def body(s, ctx, ctx_idx, cmd):
+        """-> latents du bras prédits (B,T,d), état du corps (B,T,4) (lu : réel si la frame est connue, sinon prédit), connues (B,T)."""
+        B, _, d = ctx.shape; T = s.T; md, fr = s.md_fr(ctx_idx)
+        slot = s.b_missing.expand(B, T, d).clone(); known = torch.zeros(B, T, dtype=torch.bool, device=ctx.device)
+        bi, ji = torch.where(md == 3); slot[bi, fr[bi, ji]] = ctx[bi, ji].to(slot.dtype); known[bi, fr[bi, ji]] = True
+        zb = s.b_head(s.b_ln(s.b_tr(slot + s.b_cmd(cmd[:, :T]) + s.b_t.weight[:T])))
+        lat = torch.where(known.unsqueeze(-1), F.layer_norm(slot.float(), (d,)), F.layer_norm(zb.float(), (d,)))
+        return zb, s.read(lat), known
+    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None, body_real=None):
+        assert ctx_idx is not None, "prédicteur corps/monde : passer ctx_idx"
+        zb, st, _ = s.body(ctx, ctx_idx, cmd)
+        if body_real is not None: st = body_real                              # le bras réellement SENTI (entraînement)
+        B, nt = ctx.size(0), tgt_idx.size(1); md_c, _ = s.md_fr(ctx_idx); md_t, fr_t = s.md_fr(tgt_idx)
+        x = torch.cat([ctx, s.w_body(st.detach().to(ctx.dtype)) + s.w_t.weight[:s.T], s.mask_token + s.pos(tgt_idx)], 1)
+        pad = torch.cat([md_c == 3, torch.zeros(B, s.T + nt, dtype=torch.bool, device=ctx.device)], 1)   # le monde ne lit pas le latent du bras
+        w = s.w_head(s.w_ln(s.w_tr(x, src_key_padding_mask=pad)[:, -nt:]))
+        b = torch.gather(zb, 1, fr_t.clamp(0, s.T - 1).unsqueeze(-1).expand(-1, -1, zb.size(-1)))
+        return torch.where((md_t == 3).unsqueeze(-1), b.to(w.dtype), w)
+
 class InvHead(nn.Module):
     """CONTINGENCE : deviner son geste en VOYANT l'avant et l'après (patches de 2 frames consécutives -> commande)."""
     def __init__(s, d, npf, h=128):
@@ -116,9 +154,11 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False):
         super().__init__()
-        s.enc = Enc4(din, d, nv, T, nl, nh, sep); s.pred = PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
+        s.enc = Enc4(din, d, nv, T, nl, nh, sep)
+        s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
+        assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
         if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
         s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
         if std_tgt: s.register_buffer("tstd", torch.ones(4, d))       # écart-type courant des latents CIBLES par sens et par dimension
@@ -128,7 +168,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -318,6 +358,7 @@ def main():
     p.add_argument("--parent", type=float, default=0.0, help="part des séquences (avec objets) où la MAIN D'UN PARENT vient pousser un objet (démonstration du contact)")
     p.add_argument("--blocks", type=int, default=0, help="1 = MONDE DE BLOCS (option B) : objets qui ne bougent que poussés en 0d (100 %), puis glissades progressives en 0e (100 % -> 30 % de blocs)")
     p.add_argument("--surprise_w", type=float, default=0.0, help="ATTENTION À LA SURPRISE : chaque cible pèse selon son erreur (relative à la moyenne du lot)^γ, γ = cette valeur ; le bébé regarde plus longtemps ce qui le surprend")
+    p.add_argument("--split", type=int, default=0, help="1 = CORPS / MONDE séparés (conception_corps_monde.md) : la commande ne va qu'au corps ; le monde reçoit l'état du corps (4 nombres du bras), jamais la commande")
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -339,17 +380,20 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
-        m.load_state_dict(ck["m"]); tgt.load_state_dict(ck["tgt"]); state = ck["state"]
-        if "opt" in ck: opt.load_state_dict(ck["opt"])                    # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
+        fresh = a.split and not any(k.startswith("pred.b_") for k in ck["m"])   # œil d'un bébé à prédicteur unique -> corps/monde NEUFS
+        if fresh: m.load_state_dict({k: w for k, w in ck["m"].items() if not k.startswith("pred.")}, strict=False); print("œil repris, prédicteur CORPS / MONDE neuf", flush=True)
+        else: m.load_state_dict(ck["m"])
+        tgt.load_state_dict(ck["tgt"]); state = ck["state"]
+        if "opt" in ck and not fresh: opt.load_state_dict(ck["opt"])       # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
         if "norm" in ck: st = ck["norm"]                                  # garder la normalisation des sens avec laquelle il a appris
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
@@ -373,11 +417,14 @@ def main():
                 z = F.layer_norm(tgt(tok, full).float(), (a.d,))
                 if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
                     for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
-            jl = 0.0; summ = []
+            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev)
+            if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
+                braw = tok[:, nv + 2 * T:, :4].float(); bk = dict(body_real=braw)
+                rl = F.mse_loss(m.pred.read(z[:, md_t == 3].detach().float()), braw)
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
-                dif = m.pred(zc, tidx, cmd, cidx).float() - _gather(z, tidx)
+                dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
@@ -404,17 +451,17 @@ def main():
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al
+        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         with torch.no_grad():
             for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
-                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
+                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + f" | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)

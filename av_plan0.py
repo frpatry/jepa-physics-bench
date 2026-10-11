@@ -198,14 +198,19 @@ def main():
     # ---------- 2 IMAGINATION DÉCODÉE : contexte 0..7, futur 8..15
     te = slice(ntr, n); bt = {k: x[te] for k, x in b.items()}; Yt = Y[te]; cm, tm = fr < h, (fr >= h) & (fr < h + nf) & (md == 0)
     ci0, ti0 = torch.from_numpy(np.where(cm)[0]).to(dev), torch.from_numpy(np.where(tm)[0]).to(dev)
-    def imagined(lie):
+    def imagined(lie, body=None):
+        """body (corps/monde seulement) : "vrai" = état du corps prédit avec SES gestes imposé au monde (même si on ment sur la commande) ;
+        "faux" = état du corps d'une AUTRE séquence imposé au monde."""
         out = []
         with torch.no_grad():
             for i in range(0, len(bt["X"]), 50):
                 tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bt.items()}, st, v, P_, dev); B = len(tok)
-                if lie: cmd = cmd.roll(1, 0)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                zp = m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float()
+                ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci); kw = {}
+                if body is not None:
+                    sb = m.pred.body(ctx, ci, cmd)[1]; kw = dict(body_real=sb if body == "vrai" else sb.roll(1, 0))
+                if lie: cmd = cmd.roll(1, 0)
+                zp = m.pred(ctx, ti, cmd, ci, **kw).float()
                 out.append(read(zp.view(B * nf, npf, d)).view(B, nf, 4).cpu())
         return torch.cat(out)
     with torch.no_grad():
@@ -219,6 +224,12 @@ def main():
         sl = moved if k == 0 else slice(None)
         print(f"   {nm:>15s} | lecture du vrai futur {err(true_r, sl, k):5.2f} | COPIE {err(copy_r, sl, k):5.2f} | imaginé avec SES gestes {err(im_t, sl, k):5.2f} "
               f"| avec les gestes d'un AUTRE {err(im_l, sl, k):5.2f}", flush=True)
+    if cfg.get("split", 0):                     # 2d LE MONDE EST-IL EXTÉRIEUR AU CORPS ? (corps/monde séparés)
+        dpx = lambda u, w, k: float(((u - w)[..., 2 * k:2 * k + 2].norm(dim=-1) * 32).mean())
+        i_lie_v, i_fake = imagined(True, "vrai"), imagined(False, "faux")
+        print(f"2d MONDE EXTÉRIEUR : mentir sur la COMMANDE déplace la main imaginée de {dpx(im_l, im_t, 1):.2f} px, l'objet de {dpx(im_l, im_t, 0):.2f} px ; "
+              f"en GARDANT le vrai état du corps : main {dpx(i_lie_v, im_t, 1):.2f} px, objet {dpx(i_lie_v, im_t, 0):.2f} px (attendu ≈ 0) | "
+              f"FAUX état du corps : main {dpx(i_fake, im_t, 1):.2f} px, objet {dpx(i_fake, im_t, 0):.2f} px", flush=True)
     if a.obj_diag:                              # 2b QUE FAIT L'IMAGINATION DE L'OBJET ? (positions lues, px ; départ = frame 7 lue)
         cos = lambda u, w: float((F.cosine_similarity(u, w, dim=-1)).mean())
         st0 = copy_r[:, 0]; Tdisp, Idisp = (Yt[:, h + nf - 1] - Yt[:, h - 1]) * 32, (im_t[:, -1] - st0) * 32
