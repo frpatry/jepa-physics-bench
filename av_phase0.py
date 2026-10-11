@@ -128,8 +128,12 @@ class SplitPred(nn.Module):
         assert ctx_idx is not None, "prédicteur corps/monde : passer ctx_idx"
         zb, st, _ = s.body(ctx, ctx_idx, cmd)
         if body_real is not None: st = body_real                              # le bras réellement SENTI (entraînement)
-        B, nt = ctx.size(0), tgt_idx.size(1); md_c, _ = s.md_fr(ctx_idx); md_t, fr_t = s.md_fr(tgt_idx)
-        x = torch.cat([ctx, s.w_body(st.detach().to(ctx.dtype)) + s.w_t.weight[:s.T], s.mask_token + s.pos(tgt_idx)], 1)
+        B, nt = ctx.size(0), tgt_idx.size(1); md_c, fr_c = s.md_fr(ctx_idx); md_t, fr_t = s.md_fr(tgt_idx)
+        be = s.w_body(st.detach().to(ctx.dtype)); D = be.size(-1)        # (B,T,d) — l'état du corps de CHAQUE frame…
+        at = lambda fr: torch.gather(be, 1, fr.clamp(0, s.T - 1).unsqueeze(-1).expand(-1, -1, D))
+        # … ajouté à chaque case de cette frame (contexte et requêtes ; comme l'action collée à chaque patch dans DINO-WM) :
+        # 16 jetons seuls étaient noyés parmi ~1000 -> le monde l'ignorait (rC0, examen 2d : faux corps -> main bouge de 0.02 px)
+        x = torch.cat([ctx + at(fr_c).to(ctx.dtype), be + s.w_t.weight[:s.T], s.mask_token + s.pos(tgt_idx) + at(fr_t)], 1)
         pad = torch.cat([md_c == 3, torch.zeros(B, s.T + nt, dtype=torch.bool, device=ctx.device)], 1)   # le monde ne lit pas le latent du bras
         w = s.w_head(s.w_ln(s.w_tr(x, src_key_padding_mask=pad)[:, -nt:]))
         b = torch.gather(zb, 1, fr_t.clamp(0, s.T - 1).unsqueeze(-1).expand(-1, -1, zb.size(-1)))
