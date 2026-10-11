@@ -365,6 +365,9 @@ def main():
     p.add_argument("--split", type=int, default=0, help="1 = CORPS / MONDE séparés (conception_corps_monde.md) : la commande ne va qu'au corps ; le monde reçoit l'état du corps (4 nombres du bras), jamais la commande")
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
     p.add_argument("--start_it", type=int, default=0, help="avec un prédicteur NEUF : repartir à ce pas (ex. 22000 = début de 0d) même si l'œil vient d'un instantané plus avancé")
+    p.add_argument("--world_end", type=int, default=0, help="PROLONGATION : le monde suit son calendrier jusqu'à ce pas puis reste FIGÉ (réglages de fin de 0e) ; 0 = jusqu'à --total")
+    p.add_argument("--lr_restart", type=int, default=0, help="PROLONGATION : à partir de ce pas, nouveau cycle du taux (montée sur 1000 pas puis cosinus jusqu'à --total), pic = --lr_peak × lr")
+    p.add_argument("--lr_peak", type=float, default=0.3)
     p.add_argument("--stop_at", type=int, default=0, help="arrêter (avec sauvegarde) à ce pas — essais courts qu'on peut ensuite PROLONGER")
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
@@ -411,12 +414,15 @@ def main():
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
-        fe = min(1.0, (it - starts[4]) / max(1, a.total - starts[4]))          # avancement dans 0e
+        fe = min(1.0, (it - starts[4]) / max(1, (a.world_end or a.total) - starts[4]))   # avancement dans 0e (figé après --world_end)
         if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + (0.3 if a.calm == 2 else 0.4) * fe}.get(stage, 0.0)
         if a.calm == 1: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - fe)}.get(stage, 1.0)
         if a.calm == 2: S.wkw["calm"] = {"0d": 1 - 0.3 * f, "0e": 0.7 - 0.4 * fe}.get(stage, 1.0)   # LENT : jamais chaotique (1 -> 0.7 -> 0.3)
         if a.blocks: S.wkw["blocks"] = {"0d": 1.0, "0e": 1.0 - 0.7 * fe}.get(stage, 1.0)          # BLOCS d'abord, glissades ensuite
         lr_f = min(1.0, it / 3000) * (0.05 + 0.95 * (1 + math.cos(math.pi * it / a.total)) / 2)
+        if a.lr_restart and it > a.lr_restart:                       # nouveau cycle (prolongation au-delà de la fin prévue)
+            u = (it - a.lr_restart) / max(1, a.total - a.lr_restart)
+            lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
         pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks); full = torch.arange(N, device=dev).expand(B, -1)
