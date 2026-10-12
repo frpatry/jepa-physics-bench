@@ -89,12 +89,13 @@ class PredAC(nn.Module):
         q = torch.gather(pos, 2, last.clamp_min(0)); q = torch.where(last >= 0, q, -1)[b_, s.cell_of[tgt_idx], s.frame_of[tgt_idx]]
         z = F.layer_norm(torch.gather(ctx.detach(), 1, q.clamp_min(0).unsqueeze(-1).expand(-1, -1, d)).float(), (d,))   # base SANS gradient (run 2a : effondrement)
         return z * (q >= 0).unsqueeze(-1)
-    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None):
+    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None, ret_ctx=False):
         c = s.ec(cmd) + s.tpos.weight[:cmd.size(1)]; tg = s.mask_token + s.pos(tgt_idx)
         x = s.tr(torch.cat([ctx, c, tg], 1)); out = s.head(s.ln(x[:, -tgt_idx.size(1):]))
         if s.resid:
             assert ctx_idx is not None, "prédicteur résiduel : passer ctx_idx"
             out = s.base(ctx, ctx_idx, tgt_idx) + out
+        if ret_ctx: return out, s.head(s.ln(x[:, :ctx.size(1)]))     # sorties aux cases VISIBLES (même tête ; perte de contexte)
         return out
 
 class SplitPred(nn.Module):
@@ -363,6 +364,10 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = MONDE DE BLOCS (option B) : objets qui ne bougent que poussés en 0d (100 %), puis glissades progressives en 0e (100 % -> 30 % de blocs)")
     p.add_argument("--surprise_w", type=float, default=0.0, help="ATTENTION À LA SURPRISE : chaque cible pèse selon son erreur (relative à la moyenne du lot)^γ, γ = cette valeur ; le bébé regarde plus longtemps ce qui le surprend")
     p.add_argument("--split", type=int, default=0, help="1 = CORPS / MONDE séparés (conception_corps_monde.md) : la commande ne va qu'au corps ; le monde reçoit l'état du corps (4 nombres du bras), jamais la commande")
+    p.add_argument("--ctx_w", type=float, default=0.0, help="INTERVENTION 1 (inspirée de V-JEPA 2.1) : on corrige AUSSI ce que le prédicteur dit des cases VISIBLES "
+                   "(chacune doit décrire SON endroit comme l'œil-cible qui voit tout) ; poids final de cette perte (0 = désactivée)")
+    p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
+    p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
     p.add_argument("--start_it", type=int, default=0, help="avec un prédicteur NEUF : repartir à ce pas (ex. 22000 = début de 0d) même si l'œil vient d'un instantané plus avancé")
     p.add_argument("--world_end", type=int, default=0, help="PROLONGATION : le monde suit son calendrier jusqu'à ce pas puis reste FIGÉ (réglages de fin de 0e) ; 0 = jusqu'à --total")
@@ -374,6 +379,7 @@ def main():
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
     p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
+    assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
     global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; npf = nP * nP; nv = T * npf; din = (a.P * a.P * 3, 4 * NB, 8, 4)
@@ -396,7 +402,7 @@ def main():
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -432,14 +438,18 @@ def main():
                 z = F.layer_norm(tgt(tok, full).float(), (a.d,))
                 if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
                     for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
-            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev)
+            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev)
+            cw = a.ctx_w * min(1.0, max(0.0, (it - a.ctx_from) / max(1, a.ctx_ramp)))     # poids courant de la perte de contexte
             if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
                 braw = tok[:, nv + 2 * T:, :4].float(); bk = dict(body_real=braw)
                 rl = F.mse_loss(m.pred.read(z[:, md_t == 3].detach().float()), braw)
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
-                dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                if cw > 0:                                              # INTERVENTION 1 : les cases visibles décrivent leur endroit
+                    out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
+                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
+                else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
@@ -466,18 +476,18 @@ def main():
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0 and not a.freeze_eye:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl
+        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         if not a.freeze_eye:
             with torch.no_grad():
                 for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item(), cl.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
-                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + f" | {time.time() - t0:.0f}s", flush=True)
+                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + (f" | CONTEXTE {ma[6]:.4f} (poids {cw:.2f})" if a.ctx_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
