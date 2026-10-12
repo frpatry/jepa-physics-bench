@@ -366,6 +366,8 @@ def main():
     p.add_argument("--split", type=int, default=0, help="1 = CORPS / MONDE séparés (conception_corps_monde.md) : la commande ne va qu'au corps ; le monde reçoit l'état du corps (4 nombres du bras), jamais la commande")
     p.add_argument("--ctx_w", type=float, default=0.0, help="INTERVENTION 1 (inspirée de V-JEPA 2.1) : on corrige AUSSI ce que le prédicteur dit des cases VISIBLES "
                    "(chacune doit décrire SON endroit comme l'œil-cible qui voit tout) ; poids final de cette perte (0 = désactivée)")
+    p.add_argument("--motion_w", type=float, default=0.0, help="ATTENTION À CE QUI BOUGE : chaque case de vue cible pèse selon son CHANGEMENT (latent cible vs même case "
+                   "à l'image précédente, relatif à la moyenne du lot)^γ, γ = cette valeur, plafonné à 5 ; le fond immobile compte moins, la main et l'objet poussé plus")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
     p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
@@ -402,7 +404,7 @@ def main():
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -438,6 +440,11 @@ def main():
                 z = F.layer_norm(tgt(tok, full).float(), (a.d,))
                 if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
                     for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
+            wmot = None
+            if a.motion_w > 0:                                          # poids par case : changement du latent cible d'une image à l'autre
+                zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1); ch_ = torch.cat([ch_[:, :1], ch_], 1)
+                wv_ = (ch_ / ch_.mean((1, 2), keepdim=True).clamp_min(1e-8)).pow(a.motion_w).clamp(max=5.0).reshape(B, nv)
+                wmot = torch.cat([wv_, torch.ones(B, N - nv, device=dev)], 1)
             jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev)
             cw = a.ctx_w * min(1.0, max(0.0, (it - a.ctx_from) / max(1, a.ctx_ramp)))     # poids courant de la perte de contexte
             if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
@@ -454,6 +461,7 @@ def main():
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
                 w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
+                if wmot is not None: w_ = w_ * torch.gather(wmot, 1, tidx)               # ce qui BOUGE compte plus
                 if a.surprise_w > 0:                                # ATTENTION À LA SURPRISE (ce qui est mal prédit compte plus ; moyenne 1)
                     e_ = dif.mean(-1).detach(); w_ = w_ * (e_ / e_.mean().clamp_min(1e-8)).pow(a.surprise_w).clamp(max=5.0)
                 jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
