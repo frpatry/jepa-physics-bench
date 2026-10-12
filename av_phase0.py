@@ -368,6 +368,8 @@ def main():
                    "(chacune doit décrire SON endroit comme l'œil-cible qui voit tout) ; poids final de cette perte (0 = désactivée)")
     p.add_argument("--motion_w", type=float, default=0.0, help="ATTENTION À CE QUI BOUGE : chaque case de vue cible pèse selon son CHANGEMENT (latent cible vs même case "
                    "à l'image précédente, relatif à la moyenne du lot)^γ, γ = cette valeur, plafonné à 5 ; le fond immobile compte moins, la main et l'objet poussé plus")
+    p.add_argument("--ctx_on", type=str, default="pred", choices=["pred", "enc"], help="où corriger les cases visibles : pred = sorties du PRÉDICTEUR (V-JEPA 2.1 ; "
+                   "l'imagination apprend aussi à les redonner) ; enc = directement l'ŒIL (sa sortie sur les cases visibles vs l'œil-cible qui voit tout), le prédicteur n'est pas touché")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
     p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
@@ -404,7 +406,7 @@ def main():
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -453,7 +455,10 @@ def main():
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
                 zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
-                if cw > 0:                                              # INTERVENTION 1 : les cases visibles décrivent leur endroit
+                if cw > 0 and a.ctx_on == "enc":                        # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
+                    dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
+                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                elif cw > 0:                                            # INTERVENTION 1 : les cases visibles décrivent leur endroit
                     out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
                     cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
                 else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
