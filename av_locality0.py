@@ -5,7 +5,7 @@ carrés cachés, les carrés visibles sont libres de devenir globaux, et la main
 
 Sur des séquences à UN objet du monde 0e, pour chaque image on prend trois carrés de vue (latents cibles normalisés) :
   SUR L'OBJET (le carré qui contient son centre) | SUR LA MAIN | LOIN (à ≥ --far carrés de l'objet ET de la main).
-Sondes linéaires (ridge, instruments), séparées par séquence (80 % / 20 %) :
+Sondes NON linéaires (MLP, instruments), séparées par séquence (80 % / 20 %) :
   1 position de l'OBJET lue dans un carré LOIN       -> local si ≈ hasard (prédire la moyenne)
   2 position de la MAIN lue dans un carré LOIN       -> la main est-elle partout ?
   3 COULEUR de l'objet (R²) : carré sur l'objet vs carré loin -> l'apparence est-elle à son endroit ?
@@ -32,13 +32,33 @@ def ridge(Xtr, Ytr, Xte, lams=(1e-2, 1e-1, 1.0, 10.0, 100.0)):
     return Xte @ fit(Xtr, Ytr, best) + ym
 
 
+def mlp_probe(Xtr, Ytr, Xte, steps=1500, seed=0):
+    """sonde NON linéaire (MLP 2 couches de 256) : la position n'est pas forcément lisible linéairement dans un carré."""
+    mu, sd = Xtr.mean(0), Xtr.std(0) + 1e-6; ym, ys = Ytr.mean(0), Ytr.std(0) + 1e-6
+    Xtr, Xte, Yn = (Xtr - mu) / sd, (Xte - mu) / sd, (Ytr - ym) / ys
+    torch.manual_seed(seed); net = torch.nn.Sequential(torch.nn.Linear(Xtr.size(1), 256), torch.nn.GELU(), torch.nn.Linear(256, 256), torch.nn.GELU(),
+                                                       torch.nn.Linear(256, Ytr.size(1))).to(Xtr.device)
+    opt = torch.optim.AdamW(net.parameters(), 1e-3, weight_decay=0.05); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
+    for _ in range(steps):
+        bi = torch.randint(0, len(Xtr), (512,), device=Xtr.device); l = F.mse_loss(net(Xtr[bi]), Yn[bi])
+        opt.zero_grad(); l.backward(); opt.step(); sch.step()
+    with torch.no_grad(): return net(Xte) * ys + ym
+
+
+def commune(Z):
+    """part de la variance (entre images) d'un carré qui est COMMUNE à tous les carrés de l'image : Z (N, npf, d).
+    ≈ 1/npf pour des carrés indépendants, → 1 si chaque carré porte le même résumé de la scène."""
+    zc = Z - Z.mean(0, keepdim=True)
+    return float(zc.mean(1).pow(2).mean() / zc.pow(2).mean())
+
+
 def r2(p, y): return float(1 - ((p - y) ** 2).sum() / ((y - y.mean(0)) ** 2).sum())
 
 
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpts", required=True, help="instantanés séparés par des virgules (noms relatifs à --dir) ; « init » = œil aléatoire")
-    p.add_argument("--dir", default="/content/drive/MyDrive/jepa_runs"); p.add_argument("--n", type=int, default=2000)
+    p.add_argument("--dir", default="/content/drive/MyDrive/jepa_runs"); p.add_argument("--n", type=int, default=5000)
     p.add_argument("--far", type=int, default=3, help="distance minimale (en carrés, max des écarts x/y) du carré LOIN à l'objet et à la main")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -73,12 +93,12 @@ def main():
     def report(tag, F_):                       # F_ : dict lieu -> (N, dim) features des images retenues (+ « moyenne »)
         tr, te = torch.from_numpy(split).to(dev), torch.from_numpy(~split).to(dev)
         def pos_err(Fx, Y):
-            pr = ridge(Fx[tr], Y[tr], Fx[te]); return float((pr - Y[te]).norm(dim=-1).mean() * 32)
+            pr = mlp_probe(Fx[tr], Y[tr], Fx[te]); return float((pr - Y[te]).norm(dim=-1).mean() * 32)
         ch_o, ch_h = float((Yo[te] - Yo[tr].mean(0)).norm(dim=-1).mean() * 32), float((Yh[te] - Yh[tr].mean(0)).norm(dim=-1).mean() * 32)
-        c_on = r2(ridge(F_["objet"][tr], Yc[tr], F_["objet"][te]), Yc[te]); c_far = r2(ridge(F_["loin"][tr], Yc[tr], F_["loin"][te]), Yc[te])
+        c_on = r2(mlp_probe(F_["objet"][tr], Yc[tr], F_["objet"][te]), Yc[te]); c_far = r2(mlp_probe(F_["loin"][tr], Yc[tr], F_["loin"][te]), Yc[te])
         print(f"  {tag:>28s} | 1 objet lu LOIN {pos_err(F_['loin'], Yo):5.2f} px (hasard {ch_o:.2f}) | 2 main lue LOIN {pos_err(F_['loin'], Yh):5.2f} px "
               f"(hasard {ch_h:.2f}) | 3 couleur R² sur l'objet {c_on:+.2f} / loin {c_far:+.2f} | 4 objet lu SUR LA MAIN {pos_err(F_['main'], Yo):5.2f} px "
-              f"| 5 objet lu SUR L'OBJET {pos_err(F_['objet'], Yo):5.2f} px, dans la MOYENNE {pos_err(F_['moyenne'], Yo):5.2f} px", flush=True)
+              f"| 5 objet lu SUR L'OBJET {pos_err(F_['objet'], Yo):5.2f} px, dans la MOYENNE {pos_err(F_['moyenne'], Yo):5.2f} px | 6 part COMMUNE {F_['commune']:.0%}", flush=True)
 
     # ---------- référence : pixels bruts du carré (vue 0e : nette, en couleur)
     tok, _ = to_tok0({k: x[:1] for k, x in b.items()}, cfg0 and cks[ref]["norm"], v, P, dev)
@@ -87,7 +107,8 @@ def main():
         tk, _ = to_tok0({k: x[i0:i0 + 100] for k, x in b.items()}, cks[ref]["norm"], v, P, dev); pix.append(tk[:, :nv].float().view(-1, T, npf, tk.size(-1)).cpu())
     pix = torch.cat(pix)[..., :P * P * 3]
     sel = lambda Z, k: Z[ii, tt, torch.from_numpy(idx[k])].float().to(dev)
-    report("PIXELS bruts du carré", {**{k: sel(pix, k) for k in idx}, "moyenne": pix[ii, tt].mean(1).float().to(dev)})
+    sub = torch.from_numpy(np.random.default_rng(1).choice(len(ii), min(4000, len(ii)), replace=False))
+    report("PIXELS bruts du carré", {**{k: sel(pix, k) for k in idx}, "moyenne": pix[ii, tt].mean(1).float().to(dev), "commune": commune(pix[ii, tt][sub].float())})
     # ---------- chaque œil
     for c in names:
         if c == "init":
@@ -101,7 +122,7 @@ def main():
                 tk, _ = to_tok0({k: x[i0:i0 + 50] for k, x in b.items()}, st, v, P, dev); ix = torch.arange(nv, device=dev).expand(len(tk), -1)
                 Z.append(F.layer_norm(enc(tk[:, :nv], ix).float(), (d,)).view(len(tk), T, npf, d).half().cpu())
         Z = torch.cat(Z)
-        report(lab, {**{k: sel(Z, k) for k in idx}, "moyenne": Z[ii, tt].float().mean(1).to(dev)})
+        report(lab, {**{k: sel(Z, k) for k in idx}, "moyenne": Z[ii, tt].float().mean(1).to(dev), "commune": commune(Z[ii, tt][sub].float())})
         del Z, m, enc; torch.cuda.empty_cache() if dev == "cuda" else None
     print(f"total {time.time() - t0:.0f}s")
 
