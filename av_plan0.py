@@ -25,6 +25,23 @@ from av_phase0 import Baby0, baby_from_cfg, to_tok0, to_np, to_torch, layout, VI
 
 VMAX = 0.1
 
+class LocalReader(torch.nn.Module):
+    """LECTEUR LOCAL (instrument adapté à un œil local) : chaque case lit dans SON latent « la chose est-elle chez moi ? » (score) et
+    « où exactement dans ma case ? » (décalage) ; la position = moyenne des centres de cases + décalages, pondérée par les scores
+    (softmax). Rien n'est mélangé entre cases. Même interface que _PosReader : sorties NORMALISÉES ((pos − mu) / sd)."""
+    def __init__(s, d, npf, nout=4, h=128, mu=None, sd=None):
+        super().__init__(); nP = int(round(npf ** 0.5)); s.nP, s.k = nP, nout // 2
+        s.f = torch.nn.Sequential(torch.nn.Linear(d, h), torch.nn.GELU(), torch.nn.Linear(h, h), torch.nn.GELU())
+        s.score, s.off = torch.nn.Linear(h, s.k), torch.nn.Linear(h, 2 * s.k)
+        r, c = torch.meshgrid(torch.arange(nP), torch.arange(nP), indexing="ij")
+        s.register_buffer("ctr", torch.stack([(c.flatten() + 0.5) / nP, (r.flatten() + 0.5) / nP], -1).float())   # (npf, 2) x, y
+        s.register_buffer("mu", torch.zeros(nout) if mu is None else mu.float().clone()); s.register_buffer("sd", torch.ones(nout) if sd is None else sd.float().clone())
+    def forward(s, x):
+        f = s.f(x.float()); w = s.score(f).softmax(1)                                   # (B, npf, k) : où est chaque chose
+        off = torch.tanh(s.off(f)).view(*f.shape[:2], s.k, 2) * (0.5 / s.nP)            # décalage dans la case
+        pos = (w.unsqueeze(-1) * (s.ctr[None, :, None] + off)).sum(1).reshape(len(x), -1)   # (B, 2k)
+        return (pos - s.mu) / s.sd
+
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
     def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False):
@@ -158,6 +175,8 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
+    p.add_argument("--reader", type=str, default="attn", choices=["attn", "local"], help="INSTRUMENT de lecture des positions : attn = lecteur attentionnel "
+                   "(conçu pour des cases globales) ; local = chaque case dit « la chose est chez moi + décalage » (adapté à un œil local)")
     p.add_argument("--instr", type=int, default=0, help="MESURE DE L'INSTRUMENT (tâche main) : N épisodes ; pour des gestes de familles différentes (babillage, "
                    "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
@@ -182,7 +201,9 @@ def main():
     wb = to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]); b = to_torch(wb); n = len(keep)
     Y = torch.from_numpy(np.concatenate([w["POS"][keep, :, 0], w["HAND"][keep]], -1)).float()       # (n, T, 4)
     Z = vis_lat(b); ntr = int(0.8 * n); Ztr, Ytr = Z[:ntr].flatten(0, 1), Y[:ntr].flatten(0, 1)
-    mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6; torch.manual_seed(0); ro = _PosReader(d, npf, nout=4).to(dev)
+    mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6; torch.manual_seed(0)
+    mk_reader = lambda nout, mu_, sd_: (LocalReader(d, npf, nout, mu=mu_, sd=sd_) if a.reader == "local" else _PosReader(d, npf, nout=nout)).to(dev)
+    ro = mk_reader(4, mu, sd)
     opt = torch.optim.AdamW(ro.parameters(), 3e-4, weight_decay=0.05); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.read_steps)
     for _ in range(a.read_steps):
         bi = torch.randint(0, len(Ztr), (256,)); l = F.mse_loss(ro(Ztr[bi].to(dev).float()), ((Ytr[bi] - mu) / sd).to(dev))
@@ -260,7 +281,7 @@ def main():
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
         Ytr_i, Yte_i = Y[:ntr, h:h + nf].flatten(0, 1), Yt[:, h:h + nf].flatten(0, 1)
-        torch.manual_seed(0); r2_ = _PosReader(d, npf, nout=4).to(dev); o2 = torch.optim.AdamW(r2_.parameters(), 3e-4, weight_decay=0.05)
+        torch.manual_seed(0); r2_ = mk_reader(4, mu, sd); o2 = torch.optim.AdamW(r2_.parameters(), 3e-4, weight_decay=0.05)
         s2 = torch.optim.lr_scheduler.CosineAnnealingLR(o2, a.read_steps)
         for _ in range(a.read_steps):
             bi = torch.randint(0, len(Ztr_i), (256,)); l = F.mse_loss(r2_(Ztr_i[bi].to(dev).float()), ((Ytr_i[bi] - mu.cpu()) / sd.cpu()).to(dev))
@@ -425,7 +446,7 @@ def main():
             Zi = torch.cat([r["zi"] for r in R_]).float(); Zr = torch.cat([r["zr"] for r in R_]).float(); eps_ = np.concatenate([[r["ep"]] * len(r["tru"]) for r in R_])
             tr_, te_ = eps_ < a.instr // 2, eps_ >= a.instr // 2               # lecteur NEUF : moitié des épisodes pour apprendre, l'autre pour tester
             Y = torch.from_numpy(tru).float(); mu2, sd2 = Y[tr_].mean(0), Y[tr_].std(0) + 1e-6; torch.manual_seed(0)
-            r2 = _PosReader(d, npf, nout=2).to(dev); o2 = torch.optim.AdamW(r2.parameters(), 3e-4, weight_decay=0.05); Ztr, Ytr = Zi[tr_], ((Y[tr_] - mu2) / sd2)
+            r2 = mk_reader(2, mu2, sd2); o2 = torch.optim.AdamW(r2.parameters(), 3e-4, weight_decay=0.05); Ztr, Ytr = Zi[tr_], ((Y[tr_] - mu2) / sd2)
             for _ in range(1500):
                 bi = torch.randint(0, len(Ztr), (128,)); l = F.mse_loss(r2(Ztr[bi].to(dev)), Ytr[bi].to(dev)); o2.zero_grad(); l.backward(); o2.step()
             with torch.no_grad(): pn = (r2(Zi[te_].to(dev)).cpu() * sd2 + mu2).numpy()
