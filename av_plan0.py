@@ -177,8 +177,10 @@ def main():
     p.add_argument("--film_dir", type=str, default="/content")
     p.add_argument("--reader", type=str, default="attn", choices=["attn", "local"], help="INSTRUMENT de lecture des positions : attn = lecteur attentionnel "
                    "(conçu pour des cases globales) ; local = chaque case dit « la chose est chez moi + décalage » (adapté à un œil local)")
-    p.add_argument("--read_level", type=str, default="top", choices=["top", "low"], help="PYRAMIDE : à quel étage on LIT les positions — top = sortie du haut "
-                   "(comme avant) ; low = étage fin (lecteur entraîné sur l'étage bas de l'œil-cible, imagination = prédiction de l'étage bas)")
+    p.add_argument("--read_level", type=str, default="top", choices=["top", "low", "both"], help="PYRAMIDE : à quel étage on LIT les positions — top = sortie du haut "
+                   "(comme avant) ; low = étage fin ; both = les DEUX étages ensemble (général + précis, chaque case = [haut | fin])")
+    p.add_argument("--read_on", type=str, default="real", choices=["real", "imag"], help="sur quoi le lecteur de l'IMAGINATION est entraîné : real = vrais latents "
+                   "(comme avant) ; imag = latents IMAGINÉS (babillage, vraies positions) — l'imagination peut « écrire » autrement que l'œil ; la perception du présent garde le lecteur du réel")
     p.add_argument("--instr", type=int, default=0, help="MESURE DE L'INSTRUMENT (tâche main) : N épisodes ; pour des gestes de familles différentes (babillage, "
                    "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
@@ -190,16 +192,24 @@ def main():
     m = baby_from_cfg(cfg, dev)
     m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     print(f"bébé de phase 0, pas {ck['state']['it']} | {time.time() - t0:.0f}s", flush=True)
-    if a.read_level == "low": assert int(cfg.get("levels", 0)), "--read_level low : bébé à pyramide (--levels) seulement"
-    teach = (lambda x, ix: tgt(x, ix, levels=True)[1]) if a.read_level == "low" else tgt          # latents de l'œil-cible à l'étage lu
-    imagine = (lambda *ar, **kw: m.pred(*ar, ret_low=True, **kw)[1]) if a.read_level == "low" else m.pred   # imagination à l'étage lu
+    if a.read_level != "top": assert int(cfg.get("levels", 0)), "--read_level low/both : bébé à pyramide (--levels) seulement"
+    LN = lambda u: F.layer_norm(u.float(), (d,))
+    def teachN(x, ix):                                                   # latents NORMALISÉS de l'œil-cible à l'étage lu (dR par case)
+        if a.read_level == "top": return LN(tgt(x, ix))
+        top_, low_ = tgt(x, ix, levels=True)
+        return LN(low_) if a.read_level == "low" else torch.cat([LN(top_), LN(low_)], -1)
+    def imagine(*ar, **kw):                                              # imagination à l'étage lu
+        if a.read_level == "top": return m.pred(*ar, **kw)
+        top_, low_ = m.pred(*ar, ret_low=True, **kw)
+        return low_ if a.read_level == "low" else torch.cat([top_.float(), low_.float()], -1)
+    dR = 2 * d if a.read_level == "both" else d
 
     @torch.no_grad()
     def vis_lat(b, bs=50):                      # latents CIBLES normalisés (= ce que le prédicteur imite) : (n, T, npf, d)
         out = []
         for i in range(0, len(b["X"]), bs):
             tok, _ = to_tok0({k: x[i:i + bs] for k, x in b.items()}, st, v, P_, dev); ix = torch.arange(nv, device=dev).expand(len(tok), -1)
-            out.append(F.layer_norm(teach(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d).half().cpu())
+            out.append(teachN(tok[:, :nv], ix).view(len(tok), T, npf, dR).half().cpu())
         return torch.cat(out)
     # ---------- 1 LECTEUR (instrument) : objet + main, monde 0e à UN objet
     w = gen_world0(a.n_read, "0e", T, H, seed=777, **{**cfg.get("wkw", {}), **({"blocks": 1.0} if a.blocks else {})}); keep = np.where(w["NOBJ"] == 1)[0]
@@ -207,7 +217,7 @@ def main():
     Y = torch.from_numpy(np.concatenate([w["POS"][keep, :, 0], w["HAND"][keep]], -1)).float()       # (n, T, 4)
     Z = vis_lat(b); ntr = int(0.8 * n); Ztr, Ytr = Z[:ntr].flatten(0, 1), Y[:ntr].flatten(0, 1)
     mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6; torch.manual_seed(0)
-    mk_reader = lambda nout, mu_, sd_: (LocalReader(d, npf, nout, mu=mu_, sd=sd_) if a.reader == "local" else _PosReader(d, npf, nout=nout)).to(dev)
+    mk_reader = lambda nout, mu_, sd_: (LocalReader(dR, npf, nout, mu=mu_, sd=sd_) if a.reader == "local" else _PosReader(dR, npf, nout=nout)).to(dev)
     ro = mk_reader(4, mu, sd)
     opt = torch.optim.AdamW(ro.parameters(), 3e-4, weight_decay=0.05); sch = torch.optim.lr_scheduler.CosineAnnealingLR(opt, a.read_steps)
     for _ in range(a.read_steps):
@@ -215,6 +225,7 @@ def main():
         opt.zero_grad(); l.backward(); opt.step(); sch.step()
     ro.eval(); mu, sd = mu.to(dev), sd.to(dev)
     read = lambda z: ro(z.float()) * sd + mu
+    read_now = read                                                      # PERCEPTION du présent : toujours le lecteur du réel
     with torch.no_grad():
         pt = torch.cat([read(Z[ntr:].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, (n - ntr) * T, 512)])
     e = (pt - Y[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32
@@ -240,7 +251,7 @@ def main():
                     sb = m.pred.body(ctx, ci, cmd)[1]; kw = dict(body_real=sb if body == "vrai" else sb.roll(1, 0))
                 if lie: cmd = cmd.roll(1, 0)
                 zp = imagine(ctx, ti, cmd, ci, **kw).float()
-                out.append(read(zp.view(B * nf, npf, d)).view(B, nf, 4).cpu())
+                out.append(read(zp.view(B * nf, npf, dR)).view(B, nf, 4).cpu())
         return torch.cat(out)
     with torch.no_grad():
         Zt = Z[te]; true_r = torch.cat([read(Zt[:, h:h + nf].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, len(Zt) * nf, 512)]).view(-1, nf, 4)
@@ -282,7 +293,7 @@ def main():
             with torch.no_grad():
                 for i in range(0, len(bb["X"]), 50):
                     tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                    out.append(imagine(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
+                    out.append(imagine(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, dR).half().cpu())
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
         Ytr_i, Yte_i = Y[:ntr, h:h + nf].flatten(0, 1), Yt[:, h:h + nf].flatten(0, 1)
@@ -305,6 +316,24 @@ def main():
         ax.flat[0].legend(fontsize=7, loc="lower left"); fig.suptitle("frames 7 -> 15 : l'objet poussé, réel (blanc) vs imaginé (rouge) ; la main, réelle (cyan) vs imaginée (jaune) ; image = frame 15")
         plt.tight_layout(); plt.savefig(a.obj_diag_fig, dpi=80); print(f"   figure -> {a.obj_diag_fig}  ({time.time() - t0:.0f}s)", flush=True)
         return
+    if a.read_on == "imag":                                              # LECTEUR DE L'IMAGINATION : appris sur des latents IMAGINÉS (babillage)
+        tq = time.time(); Zi_ = []
+        with torch.no_grad():
+            for i in range(0, n, 50):
+                tok, cmd = to_tok0({k: x[i:i + 50] for k, x in b.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
+                Zi_.append(imagine(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, dR).half().cpu())
+        Zi_ = torch.cat(Zi_); Yi_ = Y[:, h:h + nf]; Zitr, Yitr = Zi_[:ntr].flatten(0, 1), Yi_[:ntr].flatten(0, 1)
+        torch.manual_seed(0); ri_ = mk_reader(4, mu, sd); oi = torch.optim.AdamW(ri_.parameters(), 3e-4, weight_decay=0.05); si = torch.optim.lr_scheduler.CosineAnnealingLR(oi, a.read_steps)
+        for _ in range(a.read_steps):
+            bi = torch.randint(0, len(Zitr), (256,)); l = F.mse_loss(ri_(Zitr[bi].to(dev).float()), ((Yitr[bi] - mu.cpu()) / sd.cpu()).to(dev)); oi.zero_grad(); l.backward(); oi.step(); si.step()
+        ri_.eval()
+        with torch.no_grad():
+            pi_ = torch.cat([(ri_(Zi_[ntr:].flatten(0, 1)[i:i + 512].to(dev).float()) * sd + mu).cpu() for i in range(0, (n - ntr) * nf, 512)])
+            pr_ = torch.cat([read(Zi_[ntr:].flatten(0, 1)[i:i + 512].to(dev).float()).cpu() for i in range(0, (n - ntr) * nf, 512)])
+        ei = (pi_ - Yi_[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32; er = (pr_ - Yi_[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32
+        print(f"LECTEUR DE L'IMAGINATION (étage {a.read_level}, {ntr} séq. d'entraînement, futur {h}..{h + nf - 1}) : main {ei[:, 1].mean():.2f} px, objet {ei[:, 0].mean():.2f} px "
+              f"| lecteur du RÉEL sur la même imagination : main {er[:, 1].mean():.2f} px, objet {er[:, 0].mean():.2f} px ({time.time() - tq:.0f}s)", flush=True)
+        read = lambda z: ri_(z.float()) * sd + mu                        # l'imagination est lue par SON lecteur ; la perception garde read_now
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         t = env.t; b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
@@ -313,8 +342,8 @@ def main():
         vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
         with torch.no_grad():
             ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
-            zt = F.layer_norm(teach(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
-            now = read(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
+            zt = teachN(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi)[:, -npf:]
+            now = read_now(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
         gt = torch.from_numpy(env.g).to(dev)
         if a.task in ("toucher", "bouger", "direction"): gt = now[:2]   # où est l'objet MAINTENANT
         phase, sub = 0, None                                             # SOUS-BUTS (le bébé décompose : d'abord la main, ensuite l'objet)
@@ -440,8 +469,8 @@ def main():
                         e2 = copy.deepcopy(env)
                         for ac in plan.cpu().numpy(): e2.step(ac)
                         tk2, _ = to_tok0(e2.batch(), st, v, P_, dev); ix = torch.arange(nvv, device=dev)[None]
-                        zr = F.layer_norm(teach(tk2[:, :nvv], ix).float(), (d,)).view(T, npf, d)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
-                        ri, rr = read(zi)[:, 2:4].cpu().numpy(), read(zr)[:, 2:4].cpu().numpy()
+                        zr = teachN(tk2[:, :nvv], ix).view(T, npf, dR)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
+                        ri, rr = read(zi)[:, 2:4].cpu().numpy(), read_now(zr)[:, 2:4].cpu().numpy()
                     tru = e2.HAND[t0 + 1:t0 + 1 + Hh_]
                     rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr))
         print(f"MESURE DE L'INSTRUMENT ({a.instr} épisodes « main », {K} gestes par famille, horizon {Hh}) | {time.time() - tp:.0f}s", flush=True)
