@@ -472,7 +472,7 @@ def main():
                         zr = teachN(tk2[:, :nvv], ix).view(T, npf, dR)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
                         ri, rr = read(zi)[:, 2:4].cpu().numpy(), read_now(zr)[:, 2:4].cpu().numpy()
                     tru = e2.HAND[t0 + 1:t0 + 1 + Hh_]
-                    rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr))
+                    rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr, h0=env.HAND[t0].copy()))
         print(f"MESURE DE L'INSTRUMENT ({a.instr} épisodes « main », {K} gestes par famille, horizon {Hh}) | {time.time() - tp:.0f}s", flush=True)
         print(f"   {'famille':>10s} | {'lecteur sur VRAIES images':>25s} | {'lecteur sur IMAGINATION':>23s} | {'lecteur NEUF sur imagination':>28s} | {'écart latent imag./vrai':>23s} | {'imaginé vs vrai (lecteur)':>25s}")
         for f in fams:
@@ -487,6 +487,12 @@ def main():
             px = lambda u, w: float(np.linalg.norm(u - w, axis=-1).mean() * 32)
             dl = float(((Zi - Zr).norm(dim=-1) / Zr.norm(dim=-1).clamp_min(1e-6)).mean())
             print(f"   {f:>10s} | {px(rr, tru):22.2f} px | {px(ri, tru):20.2f} px | {px(pn, tru[te_]):25.2f} px | {dl:20.2f}    | {px(ri, rr):22.2f} px", flush=True)
+            cal = []                                                     # CALIBRATION : le déplacement imaginé de la main va-t-il dans le bon sens, de la bonne longueur ?
+            for k in (0, len(R_[0]["tru"]) - 1):
+                Dr = np.stack([r["tru"][k] - r["h0"] for r in R_]); Di = np.stack([r["ri"][k] - r["h0"] for r in R_]); ok_ = np.linalg.norm(Dr, axis=1) > 0.5 / 32
+                cos_ = (Dr * Di).sum(1)[ok_] / (np.linalg.norm(Dr, axis=1)[ok_] * np.linalg.norm(Di, axis=1)[ok_] + 1e-9)
+                cal.append(f"h={k + 1} : direction cos {cos_.mean():+.2f}, longueur imaginée/réelle {np.median(np.linalg.norm(Di, axis=1)[ok_] / np.linalg.norm(Dr, axis=1)[ok_]):.2f}")
+            print(f"   {'':>10s}   calibration du déplacement de la main : " + " | ".join(cal), flush=True)
         return
     if a.diag > 0:
         tp = time.time(); R = [run(e, "diag") for e in range(a.diag)]
