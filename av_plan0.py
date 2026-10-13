@@ -177,6 +177,8 @@ def main():
     p.add_argument("--film_dir", type=str, default="/content")
     p.add_argument("--reader", type=str, default="attn", choices=["attn", "local"], help="INSTRUMENT de lecture des positions : attn = lecteur attentionnel "
                    "(conçu pour des cases globales) ; local = chaque case dit « la chose est chez moi + décalage » (adapté à un œil local)")
+    p.add_argument("--read_level", type=str, default="top", choices=["top", "low"], help="PYRAMIDE : à quel étage on LIT les positions — top = sortie du haut "
+                   "(comme avant) ; low = étage fin (lecteur entraîné sur l'étage bas de l'œil-cible, imagination = prédiction de l'étage bas)")
     p.add_argument("--instr", type=int, default=0, help="MESURE DE L'INSTRUMENT (tâche main) : N épisodes ; pour des gestes de familles différentes (babillage, "
                    "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
@@ -188,13 +190,16 @@ def main():
     m = baby_from_cfg(cfg, dev)
     m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     print(f"bébé de phase 0, pas {ck['state']['it']} | {time.time() - t0:.0f}s", flush=True)
+    if a.read_level == "low": assert int(cfg.get("levels", 0)), "--read_level low : bébé à pyramide (--levels) seulement"
+    teach = (lambda x, ix: tgt(x, ix, levels=True)[1]) if a.read_level == "low" else tgt          # latents de l'œil-cible à l'étage lu
+    imagine = (lambda *ar, **kw: m.pred(*ar, ret_low=True, **kw)[1]) if a.read_level == "low" else m.pred   # imagination à l'étage lu
 
     @torch.no_grad()
     def vis_lat(b, bs=50):                      # latents CIBLES normalisés (= ce que le prédicteur imite) : (n, T, npf, d)
         out = []
         for i in range(0, len(b["X"]), bs):
             tok, _ = to_tok0({k: x[i:i + bs] for k, x in b.items()}, st, v, P_, dev); ix = torch.arange(nv, device=dev).expand(len(tok), -1)
-            out.append(F.layer_norm(tgt(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d).half().cpu())
+            out.append(F.layer_norm(teach(tok[:, :nv], ix).float(), (d,)).view(len(tok), T, npf, d).half().cpu())
         return torch.cat(out)
     # ---------- 1 LECTEUR (instrument) : objet + main, monde 0e à UN objet
     w = gen_world0(a.n_read, "0e", T, H, seed=777, **{**cfg.get("wkw", {}), **({"blocks": 1.0} if a.blocks else {})}); keep = np.where(w["NOBJ"] == 1)[0]
@@ -234,7 +239,7 @@ def main():
                 if body is not None:
                     sb = m.pred.body(ctx, ci, cmd)[1]; kw = dict(body_real=sb if body == "vrai" else sb.roll(1, 0))
                 if lie: cmd = cmd.roll(1, 0)
-                zp = m.pred(ctx, ti, cmd, ci, **kw).float()
+                zp = imagine(ctx, ti, cmd, ci, **kw).float()
                 out.append(read(zp.view(B * nf, npf, d)).view(B, nf, 4).cpu())
         return torch.cat(out)
     with torch.no_grad():
@@ -277,7 +282,7 @@ def main():
             with torch.no_grad():
                 for i in range(0, len(bb["X"]), 50):
                     tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                    out.append(m.pred(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
+                    out.append(imagine(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
         Ytr_i, Yte_i = Y[:ntr, h:h + nf].flatten(0, 1), Yt[:, h:h + nf].flatten(0, 1)
@@ -308,7 +313,7 @@ def main():
         vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
         with torch.no_grad():
             ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
-            zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
+            zt = F.layer_norm(teach(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
             now = read(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
         gt = torch.from_numpy(env.g).to(dev)
         if a.task in ("toucher", "bouger", "direction"): gt = now[:2]   # où est l'objet MAINTENANT
@@ -328,8 +333,8 @@ def main():
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad():
                 if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
-                    r_ = read(m.pred(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
-                else: r_ = read(m.pred(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
+                    r_ = read(imagine(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
+                else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
@@ -338,7 +343,7 @@ def main():
             return c_.mean(1)
         def traj(plan):                         # plan (Hh, 2) -> positions IMAGINÉES (Hh, 4) à t+1 .. t+Hh (une requête par horizon)
             cmd = cmd0.expand(Hh, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = plan[None] / 0.05
-            with torch.no_grad(): return read(m.pred(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
+            with torch.no_grad(): return read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
     def real_cost(env, cand):
@@ -431,11 +436,11 @@ def main():
                         tis = torch.stack([torch.from_numpy(np.where((fr == t0 + hh) & (md == 0))[0]) for hh in range(1, Hh_ + 1)]).to(dev)
                         ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
                         cmd = cmd0.expand(Hh_, -1, -1).clone(); cmd[:, t0 + 1:] = 0; cmd[:, t0 + 1:t0 + 1 + Hh_] = plan[None] / 0.05
-                        zi = m.pred(ctx.expand(Hh_, -1, -1), tis, cmd, ci.expand(Hh_, -1)).float()          # (Hh, npf, d) IMAGINÉ
+                        zi = imagine(ctx.expand(Hh_, -1, -1), tis, cmd, ci.expand(Hh_, -1)).float()          # (Hh, npf, d) IMAGINÉ
                         e2 = copy.deepcopy(env)
                         for ac in plan.cpu().numpy(): e2.step(ac)
                         tk2, _ = to_tok0(e2.batch(), st, v, P_, dev); ix = torch.arange(nvv, device=dev)[None]
-                        zr = F.layer_norm(tgt(tk2[:, :nvv], ix).float(), (d,)).view(T, npf, d)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
+                        zr = F.layer_norm(teach(tk2[:, :nvv], ix).float(), (d,)).view(T, npf, d)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
                         ri, rr = read(zi)[:, 2:4].cpu().numpy(), read(zr)[:, 2:4].cpu().numpy()
                     tru = e2.HAND[t0 + 1:t0 + 1 + Hh_]
                     rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr))
