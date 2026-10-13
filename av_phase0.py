@@ -389,7 +389,7 @@ def main():
                    "(chacune doit décrire SON endroit comme l'œil-cible qui voit tout) ; poids final de cette perte (0 = désactivée)")
     p.add_argument("--motion_w", type=float, default=0.0, help="ATTENTION À CE QUI BOUGE : chaque case de vue cible pèse selon son CHANGEMENT (latent cible vs même case "
                    "à l'image précédente, relatif à la moyenne du lot)^γ, γ = cette valeur, plafonné à 5 ; le fond immobile compte moins, la main et l'objet poussé plus")
-    p.add_argument("--ctx_on", type=str, default="pred", choices=["pred", "enc"], help="où corriger les cases visibles : pred = sorties du PRÉDICTEUR (V-JEPA 2.1 ; "
+    p.add_argument("--ctx_on", type=str, default="pred", choices=["pred", "enc", "enc_low"], help="où corriger les cases visibles (enc_low : seulement l'ÉTAGE FIN de la pyramide, le haut reste GLOBAL) : pred = sorties du PRÉDICTEUR (V-JEPA 2.1 ; "
                    "l'imagination apprend aussi à les redonner) ; enc = directement l'ŒIL (sa sortie sur les cases visibles vs l'œil-cible qui voit tout), le prédicteur n'est pas touché")
     p.add_argument("--levels", type=int, default=0, help="PYRAMIDE À 2 ÉTAGES (inspirée de la supervision en profondeur de V-JEPA 2.1) : l'imagination reçoit aussi "
                    "l'étage N de l'œil (fin, local) fusionné avec le haut, et doit prédire la cible aux DEUX étages ; 0 = désactivée, ex. 2")
@@ -408,7 +408,8 @@ def main():
     p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
-    assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc, sans split/resid/act_w"
+    assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc/enc_low, sans split/resid/act_w"
+    assert not (a.ctx_on == "enc_low" and not a.levels), "--ctx_on enc_low : avec --levels seulement"
     global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; npf = nP * nP; nv = T * npf; din = (a.P * a.P * 3, 4 * NB, 8, 4)
@@ -486,8 +487,9 @@ def main():
                     ctx_in = m.fuse(torch.cat([F.layer_norm(zc, (a.d,)), F.layer_norm(zl_c, (a.d,))], -1))
                 else: zc = m.enc(_gather(tok, cidx), cidx); ctx_in = zc
                 summ.append(zc.float().mean(1))
-                if cw > 0 and a.ctx_on == "enc":                        # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
-                    dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
+                if cw > 0 and a.ctx_on in ("enc", "enc_low"):          # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
+                    if a.ctx_on == "enc_low": dc = F.layer_norm(zl_c.float(), (a.d,)) - _gather(z_low, cidx)   # ZOOM : seul l'étage FIN devient local
+                    else: dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
                     cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs)
                     if a.levels:
                         o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
