@@ -158,6 +158,9 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
+    p.add_argument("--instr", type=int, default=0, help="MESURE DE L'INSTRUMENT (tâche main) : N épisodes ; pour des gestes de familles différentes (babillage, "
+                   "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
+                   "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     global T; T = int(cfg.get("T", 16)); import av_phase0; av_phase0.T = T                 # longueur des séquences de l'instantané
@@ -379,6 +382,57 @@ def main():
         ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         return d0, env.dist(), float(ok)
     succ = 0.04 if a.task.startswith("main") else 0.06
+    if a.instr > 0:                                                      # ---------- MESURE DE L'INSTRUMENT (lecteur) vs IMAGINATION
+        tp = time.time(); Hh = a.plan_h; K = 16; fams = ("babillage", "CEM", "extrêmes", "plans"); rows = {f: [] for f in fams}
+        nvv = T * npf
+        for ep in range(a.instr):
+            env = Push0(1000 + ep, task="main"); rng = np.random.default_rng(40_000 + ep)
+            for _ in range(a.plan_c + int(rng.integers(0, 4))): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
+            Hh_ = min(Hh, T - 1 - env.t); cost = imag_cost(env, Hh_); t0 = env.t
+            an = torch.rand(K, 1, device=dev) * 2 * math.pi; spd = 0.03 + 0.07 * torch.rand(K, 1, device=dev)
+            cands = {"babillage": (spd * torch.cat([an.cos(), an.sin()], -1)).unsqueeze(1).expand(K, Hh_, 2).contiguous(),
+                     "CEM": (torch.randn(K, 2, 2, device=dev) * 0.06).clamp(-VMAX, VMAX).repeat_interleave(-(-Hh_ // 2), 1)[:, :Hh_],
+                     "extrêmes": (VMAX * torch.sign(torch.randn(K, 2, 2, device=dev))).repeat_interleave(-(-Hh_ // 2), 1)[:, :Hh_]}
+            pl = []
+            for _ in range(K // 4):                                     # les plans que le PLANIFICATEUR choisit vraiment (CEM complet)
+                Kc = a.plan_seg if a.plan_seg > 0 else Hh_; rep = -(-Hh_ // Kc)
+                mu_, sd_ = torch.zeros(Kc, 2, device=dev), torch.full((Kc, 2), 0.06, device=dev)
+                for _ in range(a.iters):
+                    seg = (mu_ + sd_ * torch.randn(a.pop, Kc, 2, device=dev)).clamp(-VMAX, VMAX); cand = seg.repeat_interleave(rep, 1)[:, :Hh_]
+                    el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
+                pl.append(mu_.repeat_interleave(rep, 0)[:Hh_])
+            cands["plans"] = torch.stack(pl)
+            for f in fams:
+                for plan in cands[f]:
+                    with torch.no_grad():
+                        b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
+                        ci = torch.from_numpy(np.where(fr <= t0)[0]).to(dev)[None]
+                        tis = torch.stack([torch.from_numpy(np.where((fr == t0 + hh) & (md == 0))[0]) for hh in range(1, Hh_ + 1)]).to(dev)
+                        ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
+                        cmd = cmd0.expand(Hh_, -1, -1).clone(); cmd[:, t0 + 1:] = 0; cmd[:, t0 + 1:t0 + 1 + Hh_] = plan[None] / 0.05
+                        zi = m.pred(ctx.expand(Hh_, -1, -1), tis, cmd, ci.expand(Hh_, -1)).float()          # (Hh, npf, d) IMAGINÉ
+                        e2 = copy.deepcopy(env)
+                        for ac in plan.cpu().numpy(): e2.step(ac)
+                        tk2, _ = to_tok0(e2.batch(), st, v, P_, dev); ix = torch.arange(nvv, device=dev)[None]
+                        zr = F.layer_norm(tgt(tk2[:, :nvv], ix).float(), (d,)).view(T, npf, d)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
+                        ri, rr = read(zi)[:, 2:4].cpu().numpy(), read(zr)[:, 2:4].cpu().numpy()
+                    tru = e2.HAND[t0 + 1:t0 + 1 + Hh_]
+                    rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr))
+        print(f"MESURE DE L'INSTRUMENT ({a.instr} épisodes « main », {K} gestes par famille, horizon {Hh}) | {time.time() - tp:.0f}s", flush=True)
+        print(f"   {'famille':>10s} | {'lecteur sur VRAIES images':>25s} | {'lecteur sur IMAGINATION':>23s} | {'lecteur NEUF sur imagination':>28s} | {'écart latent imag./vrai':>23s} | {'imaginé vs vrai (lecteur)':>25s}")
+        for f in fams:
+            R_ = rows[f]; tru = np.concatenate([r["tru"] for r in R_]); ri = np.concatenate([r["ri"] for r in R_]); rr = np.concatenate([r["rr"] for r in R_])
+            Zi = torch.cat([r["zi"] for r in R_]).float(); Zr = torch.cat([r["zr"] for r in R_]).float(); eps_ = np.concatenate([[r["ep"]] * len(r["tru"]) for r in R_])
+            tr_, te_ = eps_ < a.instr // 2, eps_ >= a.instr // 2               # lecteur NEUF : moitié des épisodes pour apprendre, l'autre pour tester
+            Y = torch.from_numpy(tru).float(); mu2, sd2 = Y[tr_].mean(0), Y[tr_].std(0) + 1e-6; torch.manual_seed(0)
+            r2 = _PosReader(d, npf, nout=2).to(dev); o2 = torch.optim.AdamW(r2.parameters(), 3e-4, weight_decay=0.05); Ztr, Ytr = Zi[tr_], ((Y[tr_] - mu2) / sd2)
+            for _ in range(1500):
+                bi = torch.randint(0, len(Ztr), (128,)); l = F.mse_loss(r2(Ztr[bi].to(dev)), Ytr[bi].to(dev)); o2.zero_grad(); l.backward(); o2.step()
+            with torch.no_grad(): pn = (r2(Zi[te_].to(dev)).cpu() * sd2 + mu2).numpy()
+            px = lambda u, w: float(np.linalg.norm(u - w, axis=-1).mean() * 32)
+            dl = float(((Zi - Zr).norm(dim=-1) / Zr.norm(dim=-1).clamp_min(1e-6)).mean())
+            print(f"   {f:>10s} | {px(rr, tru):22.2f} px | {px(ri, tru):20.2f} px | {px(pn, tru[te_]):25.2f} px | {dl:20.2f}    | {px(ri, rr):22.2f} px", flush=True)
+        return
     if a.diag > 0:
         tp = time.time(); R = [run(e, "diag") for e in range(a.diag)]
         print(f"3 DIAG (c) {a.diag} situations, 48 gestes par famille, horizon {a.plan_h} : l'imagination classe-t-elle comme la réalité ? ({time.time() - tp:.0f}s)")
