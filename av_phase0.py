@@ -43,28 +43,40 @@ KEYS = ("X", "A", "TOUCH", "PROP", "CMD")
 class Enc4(nn.Module):
     """encodeur des 4 SENS (la commande n'y entre JAMAIS). Indices : vue [0,nv), ouïe [nv,nv+T), toucher, bras.
     sep : attention à l'intérieur d'un sens seulement (la fusion = le prédicteur)."""
-    def __init__(s, din, d, nv, T, nl, nh, sep=True):
+    def __init__(s, din, d, nv, T, nl, nh, sep=True, lv=0):
         super().__init__()
-        s.din, s.nv, s.T, s.sep = list(din), nv, T, sep
+        s.din, s.nv, s.T, s.sep, s.lv = list(din), nv, T, sep, lv      # lv > 0 : on peut aussi rendre la sortie de l'ÉTAGE lv (pyramide à 2 étages)
         s.inp = nn.ModuleList([nn.Linear(k, d) for k in din]); s.mod = nn.Embedding(4, d); s.pos = nn.Embedding(nv + 3 * T, d)
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
     def modality(s, idx): return (idx >= s.nv).long() + (idx >= s.nv + s.T).long() + (idx >= s.nv + 2 * s.T).long()
-    def forward(s, tok, idx):
+    def run(s, x, allow=None):
+        """les étages un par un -> (sortie du haut, sortie de l'étage lv ou None)."""
+        low = None
+        for i, L in enumerate(s.tr.layers):
+            x = L(x) if allow is None else _layer_masked(L, x, allow)
+            if i + 1 == s.lv: low = x
+        return x, low
+    def forward(s, tok, idx, levels=False):
         md = s.modality(idx); e = 0
         for k, lin in enumerate(s.inp): e = e + (md == k).unsqueeze(-1) * lin(tok[..., :s.din[k]])
         x = e + s.mod(md) + s.pos(idx)
-        if not s.sep: return s.ln(s.tr(x))
+        if not s.sep:
+            top, low = s.run(x) if levels else (s.tr(x), None)
+            return (s.ln(top), low) if levels else s.ln(top)
         cnt = [(md == k).sum(1) for k in range(4)]
         if all(bool((c == c[0]).all()) for c in cnt):          # indices triés -> sens contigus : une passe par sens (rapide)
-            out, j = [], 0
+            out, lows, j = [], [], 0
             for c in cnt:
                 c = int(c[0])
-                if c: out.append(s.tr(x[:, j:j + c])); j += c
-            return s.ln(torch.cat(out, 1))
+                if c:
+                    if levels: t_, l_ = s.run(x[:, j:j + c]); out.append(t_); lows.append(l_)
+                    else: out.append(s.tr(x[:, j:j + c]))
+                    j += c
+            return (s.ln(torch.cat(out, 1)), torch.cat(lows, 1)) if levels else s.ln(torch.cat(out, 1))
         allow = (md.unsqueeze(2) == md.unsqueeze(1)).unsqueeze(1)
-        for L in s.tr.layers: x = _layer_masked(L, x, allow)
-        return s.ln(x)
+        top, low = s.run(x, allow)
+        return (s.ln(top), low) if levels else s.ln(top)
 
 class PredAC(nn.Module):
     """prédicteur conditionné par la VOLONTÉ : [contexte | commandes des T frames | requêtes] -> latents des requêtes.
@@ -89,9 +101,10 @@ class PredAC(nn.Module):
         q = torch.gather(pos, 2, last.clamp_min(0)); q = torch.where(last >= 0, q, -1)[b_, s.cell_of[tgt_idx], s.frame_of[tgt_idx]]
         z = F.layer_norm(torch.gather(ctx.detach(), 1, q.clamp_min(0).unsqueeze(-1).expand(-1, -1, d)).float(), (d,))   # base SANS gradient (run 2a : effondrement)
         return z * (q >= 0).unsqueeze(-1)
-    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None, ret_ctx=False):
+    def forward(s, ctx, tgt_idx, cmd, ctx_idx=None, ret_ctx=False, ret_low=False):
         c = s.ec(cmd) + s.tpos.weight[:cmd.size(1)]; tg = s.mask_token + s.pos(tgt_idx)
         x = s.tr(torch.cat([ctx, c, tg], 1)); out = s.head(s.ln(x[:, -tgt_idx.size(1):]))
+        if ret_low: return out, s.head_low(s.ln(x[:, -tgt_idx.size(1):]))     # PYRAMIDE : prédiction de l'étage bas (fin, local)
         if s.resid:
             assert ctx_idx is not None, "prédicteur résiduel : passer ctx_idx"
             out = s.base(ctx, ctx_idx, tgt_idx) + out
@@ -159,21 +172,29 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0):
         super().__init__()
-        s.enc = Enc4(din, d, nv, T, nl, nh, sep)
+        s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels)
         s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
         assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
         if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
         s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
         if std_tgt: s.register_buffer("tstd", torch.ones(4, d))       # écart-type courant des latents CIBLES par sens et par dimension
+        if levels:                                                     # PYRAMIDE À 2 ÉTAGES : l'imagination reçoit l'étage bas (fin) + le haut (résumé)
+            assert not split, "pyramide : prédicteur unique seulement"
+            s.fuse = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, d)); s.pred.head_low = nn.Linear(d, d)
+    def context(s, tok, idx):
+        """ce que reçoit l'IMAGINATION : la sortie de l'œil, ou (pyramide) la fusion de l'étage bas et du haut."""
+        if not s.levels: return s.enc(tok, idx)
+        top, low = s.enc(tok, idx, levels=True); d = top.size(-1)
+        return s.fuse(torch.cat([F.layer_norm(top, (d,)), F.layer_norm(low, (d,))], -1))
 
 def baby_from_cfg(cfg, dev):
     """reconstruit le bébé d'un instantané (toutes options) — pour les scripts d'examen / de planification.
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -251,7 +272,7 @@ def errs(m, tgt, b, st, v, P, ctx_m, tgt_m, dev, d, b_tgt=None, lie=False, bs=50
         if lie: cmd = cmd.roll(1, 0)
         z = F.layer_norm(tgt(ttok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,))
         ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-        out.append((m.pred(m.enc(_gather(tok, ci), ci), ti, cmd, ci).float() - _gather(z, ti)).abs().mean(-1).cpu())
+        out.append((m.pred(m.context(_gather(tok, ci), ci), ti, cmd, ci).float() - _gather(z, ti)).abs().mean(-1).cpu())
     return torch.cat(out)
 
 @torch.no_grad()
@@ -370,6 +391,9 @@ def main():
                    "à l'image précédente, relatif à la moyenne du lot)^γ, γ = cette valeur, plafonné à 5 ; le fond immobile compte moins, la main et l'objet poussé plus")
     p.add_argument("--ctx_on", type=str, default="pred", choices=["pred", "enc"], help="où corriger les cases visibles : pred = sorties du PRÉDICTEUR (V-JEPA 2.1 ; "
                    "l'imagination apprend aussi à les redonner) ; enc = directement l'ŒIL (sa sortie sur les cases visibles vs l'œil-cible qui voit tout), le prédicteur n'est pas touché")
+    p.add_argument("--levels", type=int, default=0, help="PYRAMIDE À 2 ÉTAGES (inspirée de la supervision en profondeur de V-JEPA 2.1) : l'imagination reçoit aussi "
+                   "l'étage N de l'œil (fin, local) fusionné avec le haut, et doit prédire la cible aux DEUX étages ; 0 = désactivée, ex. 2")
+    p.add_argument("--low_w", type=float, default=1.0, help="poids de la prédiction de l'étage bas")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
     p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
@@ -384,6 +408,7 @@ def main():
     p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
+    assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc, sans split/resid/act_w"
     global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; npf = nP * nP; nv = T * npf; din = (a.P * a.P * 3, 4 * NB, 8, 4)
@@ -399,14 +424,14 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -439,7 +464,9 @@ def main():
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad():
-                z = F.layer_norm(tgt(tok, full).float(), (a.d,))
+                if a.levels:
+                    z_top, z_low = tgt(tok, full, levels=True); z = F.layer_norm(z_top.float(), (a.d,)); z_low = F.layer_norm(z_low.float(), (a.d,))
+                else: z = F.layer_norm(tgt(tok, full).float(), (a.d,))
                 if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
                     for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
             wmot = None
@@ -447,20 +474,31 @@ def main():
                 zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1); ch_ = torch.cat([ch_[:, :1], ch_], 1)
                 wv_ = (ch_ / ch_.mean((1, 2), keepdim=True).clamp_min(1e-8)).pow(a.motion_w).clamp(max=5.0).reshape(B, nv)
                 wmot = torch.cat([wv_, torch.ones(B, N - nv, device=dev)], 1)
-            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev)
+            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev); ll = torch.zeros((), device=dev)
             cw = a.ctx_w * min(1.0, max(0.0, (it - a.ctx_from) / max(1, a.ctx_ramp)))     # poids courant de la perte de contexte
             if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
                 braw = tok[:, nv + 2 * T:, :4].float(); bk = dict(body_real=braw)
                 rl = F.mse_loss(m.pred.read(z[:, md_t == 3].detach().float()), braw)
             for c_, g_ in pairs:
                 cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
-                zc = m.enc(_gather(tok, cidx), cidx); summ.append(zc.float().mean(1))
+                if a.levels:                                            # PYRAMIDE : l'œil rend le haut ET l'étage bas
+                    zc, zl_c = m.enc(_gather(tok, cidx), cidx, levels=True)
+                    ctx_in = m.fuse(torch.cat([F.layer_norm(zc, (a.d,)), F.layer_norm(zl_c, (a.d,))], -1))
+                else: zc = m.enc(_gather(tok, cidx), cidx); ctx_in = zc
+                summ.append(zc.float().mean(1))
                 if cw > 0 and a.ctx_on == "enc":                        # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
                     dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
-                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs)
+                    if a.levels:
+                        o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
+                        ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
+                    else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 elif cw > 0:                                            # INTERVENTION 1 : les cases visibles décrivent leur endroit
                     out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
                     cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
+                elif a.levels:
+                    o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
+                    ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
                 else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
@@ -489,18 +527,18 @@ def main():
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0 and not a.freeze_eye:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl
+        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         if not a.freeze_eye:
             with torch.no_grad():
                 for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item(), cl.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item(), cl.item(), ll.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
-                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + (f" | CONTEXTE {ma[6]:.4f} (poids {cw:.2f})" if a.ctx_w > 0 else "") + f" | {time.time() - t0:.0f}s", flush=True)
+                  f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + (f" | CONTEXTE {ma[6]:.4f} (poids {cw:.2f})" if a.ctx_w > 0 else "") + (f" | ÉTAGE BAS {ma[7]:.4f}" if a.levels else "") + f" | {time.time() - t0:.0f}s", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)

@@ -58,7 +58,7 @@ def main():
             ti = torch.from_numpy(np.where((fr >= h) & (md == 0))[0]).to(dev)[None]
             with torch.no_grad():
                 tk, cmd = to_tok0({k: x[torch.from_numpy(show)] for k, x in b.items()}, ck["norm"], v, P, dev); B_ = len(tk)
-                ctx = m.enc(torch.gather(tk, 1, ci.expand(B_, -1).unsqueeze(-1).expand(-1, -1, tk.size(-1))), ci.expand(B_, -1))
+                ctx = m.context(torch.gather(tk, 1, ci.expand(B_, -1).unsqueeze(-1).expand(-1, -1, tk.size(-1))), ci.expand(B_, -1))
                 zi = F.layer_norm(m.pred(ctx, ti.expand(B_, -1), cmd, ci.expand(B_, -1)).float(), (d,)).view(B_, T - h, npf, d)
             Zs[:, h:] = zi.half().cpu()
         # sonde linéaire 3 classes, équilibrée (les cases main/objet sont rares)

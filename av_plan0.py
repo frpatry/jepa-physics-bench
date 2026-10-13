@@ -230,7 +230,7 @@ def main():
             for i in range(0, len(bt["X"]), 50):
                 tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bt.items()}, st, v, P_, dev); B = len(tok)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci); kw = {}
+                ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci); kw = {}
                 if body is not None:
                     sb = m.pred.body(ctx, ci, cmd)[1]; kw = dict(body_real=sb if body == "vrai" else sb.roll(1, 0))
                 if lie: cmd = cmd.roll(1, 0)
@@ -277,7 +277,7 @@ def main():
             with torch.no_grad():
                 for i in range(0, len(bb["X"]), 50):
                     tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
-                    out.append(m.pred(m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
+                    out.append(m.pred(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), ti, cmd, ci).float().view(B, nf, npf, d).half().cpu())
             return torch.cat(out)
         Ztr_i = imag_lat({k: x[:ntr] for k, x in b.items()}).flatten(0, 1); Zte_i = imag_lat(bt).flatten(0, 1)
         Ytr_i, Yte_i = Y[:ntr, h:h + nf].flatten(0, 1), Yt[:, h:h + nf].flatten(0, 1)
@@ -307,7 +307,7 @@ def main():
         tis = torch.stack([torch.from_numpy(np.where((fr == t + hh) & (md == 0))[0]) for hh in range(1, Hh + 1)]).to(dev); ti = tis[-1:]
         vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
         with torch.no_grad():
-            ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
+            ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
             zt = F.layer_norm(tgt(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi).float(), (d,))[:, -npf:]
             now = read(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
         gt = torch.from_numpy(env.g).to(dev)
@@ -429,7 +429,7 @@ def main():
                         b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
                         ci = torch.from_numpy(np.where(fr <= t0)[0]).to(dev)[None]
                         tis = torch.stack([torch.from_numpy(np.where((fr == t0 + hh) & (md == 0))[0]) for hh in range(1, Hh_ + 1)]).to(dev)
-                        ctx = m.enc(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
+                        ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
                         cmd = cmd0.expand(Hh_, -1, -1).clone(); cmd[:, t0 + 1:] = 0; cmd[:, t0 + 1:t0 + 1 + Hh_] = plan[None] / 0.05
                         zi = m.pred(ctx.expand(Hh_, -1, -1), tis, cmd, ci.expand(Hh_, -1)).float()          # (Hh, npf, d) IMAGINÉ
                         e2 = copy.deepcopy(env)
