@@ -356,7 +356,10 @@ def main():
                 act = mu_[0].cpu().numpy()
                 if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
                     plan = mu_.repeat_interleave(rep, 0)[:Hh]; gh = cost(plan[None], raw=True)[0].cpu().numpy()
-                    rec.append(dict(t=int(env.t), act=[float(x) for x in act], ghost=[float(x) for x in gh], Hh=int(Hh)))
+                    imt = cost.traj(plan).cpu().numpy(); e3 = copy.deepcopy(env); ret = []           # le plan : IMAGINÉ pas à pas vs EXÉCUTÉ (copie du monde)
+                    for ac in plan.cpu().numpy(): e3.step(ac, render=False); ret.append([float(x) for x in np.concatenate([e3.P, e3.Hp])])
+                    rec.append(dict(t=int(env.t), act=[float(x) for x in act], ghost=[float(x) for x in gh], Hh=int(Hh),
+                                    now=[float(x) for x in cost.now.cpu().numpy()], imag=imt.round(4).tolist(), real=ret))
                 if stats is not None or film is not None:                # le plan ENTIER : imaginé pas à pas vs exécuté pour de vrai (copie du monde)
                     plan = mu_.repeat_interleave(rep, 0)[:Hh]; im = cost.traj(plan).cpu().numpy(); now = cost.now.cpu().numpy()
                     e2 = copy.deepcopy(env); re = []

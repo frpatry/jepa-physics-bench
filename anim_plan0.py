@@ -45,12 +45,18 @@ def main():
                     gh = g_[-1]["ghost"]
                     ax.plot(gh[2], gh[3], "o", ms=13, mfc="none", mec="yellow", mew=2)                       # main IMAGINÉE (fin du plan)
                     if task not in ("main", "main_loin"): ax.plot(gh[0], gh[1], "s", ms=12, mfc="none", mec="red", mew=2)   # objet IMAGINÉ
+                    s_ = g_[-1]
+                    if "imag" in s_:                                                                           # le PLAN en cours : imaginé vs ce qui arriverait vraiment
+                        im_, re_ = np.array(s_["imag"]), np.array(s_["real"])
+                        ax.plot(im_[:, 2], im_[:, 3], ".-", c="yellow", lw=1, ms=4, alpha=0.9)
+                        ax.plot(re_[:, 2], re_[:, 3], ".-", c="magenta", lw=1, ms=4, alpha=0.9)
+                        ax.plot(s_["now"][2], s_["now"][3], "x", c="cyan", ms=10, mew=2)                       # main PERÇUE maintenant
                 phase = "il gigote" if f < D["plan_c"] else "il PLANIFIE"
                 ax.set_title(f"épisode {eps[k]['ep']} · t={f} · {phase}", fontsize=8); ax.set_xlim(0, 1); ax.set_ylim(1, 0)
-            fig.suptitle(f"{TITRES.get(task, task)}  —  jaune : où il IMAGINE sa main"
-                         + (" · rouge : où il IMAGINE l'objet" if task not in ("main", "main_loin") else "") + " (à la fin de son plan)", fontsize=9)
+            fig.suptitle(f"{TITRES.get(task, task)}  —  croix cyan : main PERÇUE · pointillés jaunes : plan IMAGINÉ · magenta : ce que ce plan ferait VRAIMENT · cercle jaune : main imaginée en fin de plan\n"
+                         + (" · rouge : où il IMAGINE l'objet" if task not in ("main", "main_loin") else "") + " (à la fin de son plan)", fontsize=7)
         anim = FuncAnimation(fig, draw, frames=T_, interval=400)
-        out = f"anim_{task}.gif"; anim.save(out, writer=PillowWriter(fps=2.5)); plt.close(fig); print("->", out)
+        out = f"anim_{task}{sys.argv[2] if len(sys.argv) > 2 else ''}.gif"; anim.save(out, writer=PillowWriter(fps=2.5)); plt.close(fig); print("->", out)
 
 if __name__ == "__main__":
     main()
