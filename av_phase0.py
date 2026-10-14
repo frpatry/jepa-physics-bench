@@ -42,10 +42,13 @@ KEYS = ("X", "A", "TOUCH", "PROP", "CMD")
 # ---------------------------------------------------------------- modèle
 class Enc4(nn.Module):
     """encodeur des 4 SENS (la commande n'y entre JAMAIS). Indices : vue [0,nv), ouïe [nv,nv+T), toucher, bras.
-    sep : attention à l'intérieur d'un sens seulement (la fusion = le prédicteur)."""
-    def __init__(s, din, d, nv, T, nl, nh, sep=True, lv=0):
+    sep : attention à l'intérieur d'un sens seulement (la fusion = le prédicteur).
+    nreg > 0 : CASES RÉSUMÉ (« registres », Darcet et al. 2024) — nreg cases apprises SANS endroit, ajoutées à la vue : elles lisent
+    toute l'image et ne sont jamais corrigées vers un coin ; rendues seulement avec regs=True (pour l'imagination)."""
+    def __init__(s, din, d, nv, T, nl, nh, sep=True, lv=0, nreg=0):
         super().__init__()
-        s.din, s.nv, s.T, s.sep, s.lv = list(din), nv, T, sep, lv      # lv > 0 : on peut aussi rendre la sortie de l'ÉTAGE lv (pyramide à 2 étages)
+        s.din, s.nv, s.T, s.sep, s.lv, s.nreg = list(din), nv, T, sep, lv, nreg   # lv > 0 : on peut aussi rendre la sortie de l'ÉTAGE lv (pyramide à 2 étages)
+        if nreg: s.reg = nn.Parameter(torch.randn(nreg, d) * 0.02)
         s.inp = nn.ModuleList([nn.Linear(k, d) for k in din]); s.mod = nn.Embedding(4, d); s.pos = nn.Embedding(nv + 3 * T, d)
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
@@ -57,10 +60,19 @@ class Enc4(nn.Module):
             x = L(x) if allow is None else _layer_masked(L, x, allow)
             if i + 1 == s.lv: low = x
         return x, low
-    def forward(s, tok, idx, levels=False):
+    def forward(s, tok, idx, levels=False, regs=False):
         md = s.modality(idx); e = 0
         for k, lin in enumerate(s.inp): e = e + (md == k).unsqueeze(-1) * lin(tok[..., :s.din[k]])
         x = e + s.mod(md) + s.pos(idx)
+        if s.nreg:                                                     # CASES RÉSUMÉ en tête, comptées comme de la vue (même groupe d'attention)
+            R = s.nreg; x = torch.cat([(s.reg + s.mod.weight[0]).to(x.dtype).expand(len(x), -1, -1), x], 1)
+            md = torch.cat([torch.zeros_like(md[:, :1]).expand(-1, R), md], 1)
+            out = s._fwd(x, md, levels)
+            top, low = out if levels else (out, None)
+            res = (top[:, R:], low[:, R:]) if levels else top[:, R:]
+            return (res, top[:, :R]) if regs else res
+        return s._fwd(x, md, levels)
+    def _fwd(s, x, md, levels):
         if not s.sep:
             top, low = s.run(x) if levels else (s.tr(x), None)
             return (s.ln(top), low) if levels else s.ln(top)
@@ -172,9 +184,10 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0):
         super().__init__()
-        s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels)
+        s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs)
+        assert not (regs and (levels or split or resid)), "cases résumé : prédicteur unique non résiduel, sans pyramide"
         s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
         assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
         if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
@@ -184,7 +197,8 @@ class Baby0(nn.Module):
             assert not split, "pyramide : prédicteur unique seulement"
             s.fuse = nn.Sequential(nn.Linear(2 * d, d), nn.GELU(), nn.Linear(d, d)); s.pred.head_low = nn.Linear(d, d)
     def context(s, tok, idx):
-        """ce que reçoit l'IMAGINATION : la sortie de l'œil, ou (pyramide) la fusion de l'étage bas et du haut."""
+        """ce que reçoit l'IMAGINATION : la sortie de l'œil (+ ses CASES RÉSUMÉ en fin), ou (pyramide) la fusion de l'étage bas et du haut."""
+        if s.enc.nreg: return torch.cat(s.enc(tok, idx, regs=True), 1)
         if not s.levels: return s.enc(tok, idx)
         top, low = s.enc(tok, idx, levels=True); d = top.size(-1)
         return s.fuse(torch.cat([F.layer_norm(top, (d,)), F.layer_norm(low, (d,))], -1))
@@ -194,7 +208,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -394,6 +408,9 @@ def main():
     p.add_argument("--levels", type=int, default=0, help="PYRAMIDE À 2 ÉTAGES (inspirée de la supervision en profondeur de V-JEPA 2.1) : l'imagination reçoit aussi "
                    "l'étage N de l'œil (fin, local) fusionné avec le haut, et doit prédire la cible aux DEUX étages ; 0 = désactivée, ex. 2")
     p.add_argument("--low_w", type=float, default=1.0, help="poids de la prédiction de l'étage bas")
+    p.add_argument("--regs", type=int, default=0, help="CASES RÉSUMÉ (registres, Darcet et al. 2024 ; idée de la pyramide : le général ET le détail ensemble) : "
+                   "N cases de l'œil sans endroit, qui lisent toute l'image et vont à l'imagination avec les cases visibles ; la perte de contexte "
+                   "(--ctx_on enc) ne touche que les cases-endroits -> les détails deviennent locaux, le résumé (ex. où va la main) reste global ; 0 = aucune")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
     p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
@@ -410,6 +427,7 @@ def main():
     assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
     assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc/enc_low, sans split/resid/act_w"
     assert not (a.ctx_on == "enc_low" and not a.levels), "--ctx_on enc_low : avec --levels seulement"
+    assert not (a.regs and (a.levels or a.split or a.resid or (a.ctx_w > 0 and a.ctx_on == "pred"))), "cases résumé : sans pyramide/split/resid, perte de contexte dans l'œil"
     global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
     nP = H // a.P; npf = nP * nP; nv = T * npf; din = (a.P * a.P * 3, 4 * NB, 8, 4)
@@ -425,14 +443,14 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -485,6 +503,7 @@ def main():
                 if a.levels:                                            # PYRAMIDE : l'œil rend le haut ET l'étage bas
                     zc, zl_c = m.enc(_gather(tok, cidx), cidx, levels=True)
                     ctx_in = m.fuse(torch.cat([F.layer_norm(zc, (a.d,)), F.layer_norm(zl_c, (a.d,))], -1))
+                elif a.regs: zc, rg_ = m.enc(_gather(tok, cidx), cidx, regs=True); ctx_in = torch.cat([zc, rg_], 1)   # cases-endroits + CASES RÉSUMÉ
                 else: zc = m.enc(_gather(tok, cidx), cidx); ctx_in = zc
                 summ.append(zc.float().mean(1))
                 if cw > 0 and a.ctx_on in ("enc", "enc_low"):          # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
@@ -494,14 +513,14 @@ def main():
                     if a.levels:
                         o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
                         ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
-                    else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                    else: dif = m.pred(ctx_in, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 elif cw > 0:                                            # INTERVENTION 1 : les cases visibles décrivent leur endroit
                     out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
                     cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
                 elif a.levels:
                     o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
                     ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
-                else: dif = m.pred(zc, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                else: dif = m.pred(ctx_in, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
                 dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
                 if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
                     ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
@@ -519,7 +538,7 @@ def main():
             if a.act_w > 0:                                          # CONTRASTE D'ACTION (« compare avec un autre geste »)
                 t0_ = int(rng.integers(3, T - 2)); cm_ = torch.from_numpy(fr_np <= t0_).to(dev)
                 cidx_ = torch.where(cm_)[0].expand(B, -1); tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)   # futur, sans l'ouïe
-                zc_ = m.enc(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
+                zc_ = m.context(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
                 cmd_l = cmd.clone(); cmd_l[:, t0_ + 1:] = cmd.roll(1, 0)[:, t0_ + 1:]                    # mêmes souvenirs, AUTRES gestes futurs
                 def err_(c):
                     d_ = m.pred(zc_, tidx_, c, cidx_).float() - zt_
