@@ -110,10 +110,10 @@ class PredAC(nn.Module):
     """prédicteur conditionné par la VOLONTÉ : [contexte | commandes des T frames | requêtes] -> latents des requêtes.
     resid (run 2) : prédiction = DERNIER latent VU de la même case (même sens, frame la plus récente ≤ cible, normalisé)
     + changement (tête zéro-init) — run 1 : l'imagination PERDAIT l'objet, même immobile (diag av_plan0 --obj_diag)."""
-    def __init__(s, d, ntok, T, nl, nh, resid=False, nv=0, npf=1):
+    def __init__(s, d, ntok, T, nl, nh, resid=False, nv=0, npf=1, causal=False):
         super().__init__()
-        s.resid = resid
-        if resid:                                                      # case (0..npf-1 vue, npf ouïe, npf+1 toucher, npf+2 bras) et frame de chaque token
+        s.resid, s.causal = resid, causal
+        if resid or causal:                                            # case (0..npf-1 vue, npf ouïe, npf+1 toucher, npf+2 bras) et frame de chaque token
             idx = torch.arange(ntok); cell = torch.where(idx < nv, idx % npf, npf + (idx - nv) // T); fr = torch.where(idx < nv, idx // npf, (idx - nv) % T)
             s.register_buffer("cell_of", cell, persistent=False); s.register_buffer("frame_of", fr, persistent=False); s.ncell = npf + 3
         s.mask_token = nn.Parameter(torch.zeros(d)); s.pos = nn.Embedding(ntok, d); s.tpos = nn.Embedding(T, d)
@@ -131,7 +131,17 @@ class PredAC(nn.Module):
         return z * (q >= 0).unsqueeze(-1)
     def forward(s, ctx, tgt_idx, cmd, ctx_idx=None, ret_ctx=False, ret_low=False):
         c = s.ec(cmd) + s.tpos.weight[:cmd.size(1)]; tg = s.mask_token + s.pos(tgt_idx)
-        x = s.tr(torch.cat([ctx, c, tg], 1)); out = s.head(s.ln(x[:, -tgt_idx.size(1):]))
+        x = torch.cat([ctx, c, tg], 1)
+        if s.causal:                                                   # LE GESTE SEULEMENT JUSQU'À L'INSTANT PRÉDIT : une cible de l'image f ne reçoit
+            assert ctx_idx is not None and ctx_idx.size(1) == ctx.size(1), "prédicteur causal : passer ctx_idx (sans cases résumé)"   # que les gestes 0..f
+            B, nc, nt, Tc = ctx.size(0), ctx.size(1), tgt_idx.size(1), cmd.size(1)
+            fr = torch.cat([s.frame_of[ctx_idx].expand(B, -1), torch.arange(Tc, device=x.device).expand(B, -1), s.frame_of[tgt_idx].expand(B, -1)], 1)
+            kd = torch.cat([torch.zeros(nc), torch.ones(Tc), torch.full((nt,), 2.0)]).to(x.device)    # 0 contexte, 1 geste, 2 requête
+            qk, kk, early = kd[:, None], kd[None, :], fr.unsqueeze(1) <= fr.unsqueeze(2)              # early[b, q, k] : image de k ≤ image de q
+            allow = (kk == 0) | ((kk == 1) & (qk >= 1) & early) | ((kk == 2) & (qk == 2) & early)       # le contexte ne lit que le contexte
+            for L in s.tr.layers: x = _layer_masked(L, x, allow.unsqueeze(1))
+        else: x = s.tr(x)
+        out = s.head(s.ln(x[:, -tgt_idx.size(1):]))
         if ret_low: return out, s.head_low(s.ln(x[:, -tgt_idx.size(1):]))     # PYRAMIDE : prédiction de l'étage bas (fin, local)
         if s.resid:
             assert ctx_idx is not None, "prédicteur résiduel : passer ctx_idx"
@@ -200,11 +210,12 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False):
         super().__init__()
         s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs, reg_frame=reg_frame)
         assert not (regs and (levels or split or resid)), "cases résumé : prédicteur unique non résiduel, sans pyramide"
-        s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
+        s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf, causal)
+        assert not (causal and (split or regs)), "prédicteur causal : prédicteur unique, sans cases résumé"
         assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
         if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
         s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
@@ -224,7 +235,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -272,12 +283,14 @@ class Stream:
         while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks, touch=0):
+def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0):
     """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
     « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes)."""
     md, fr = layout(nv, nP * nP); N = len(md); pairs = []
     for _ in range(n_masks):
-        st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch); tg = np.zeros((B, N), bool)
+        if fut_share > 0: st = "future" if rng.random() < fut_share else rng.choice(["tube", "vblock", "cross"] + ["touch"] * touch)   # IMAGINER LA SUITE domine
+        else: st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch)
+        tg = np.zeros((B, N), bool)
         if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
         if st == "future":                                           # IMAGINER : tous les sens après t0, avec les gestes prévus
             t0 = rng.integers(3, T - 2); pairs.append((np.broadcast_to(fr <= t0, (B, N)).copy(), np.broadcast_to(fr > t0, (B, N)).copy())); continue
@@ -427,6 +440,11 @@ def main():
     p.add_argument("--regs", type=int, default=0, help="CASES RÉSUMÉ (registres, Darcet et al. 2024 ; idée de la pyramide : le général ET le détail ensemble) : "
                    "N cases de l'œil sans endroit, qui lisent toute l'image et vont à l'imagination avec les cases visibles ; la perte de contexte "
                    "(--ctx_on enc) ne touche que les cases-endroits -> les détails deviennent locaux, le résumé (ex. où va la main) reste global ; 0 = aucune")
+    p.add_argument("--causal", type=int, default=0, help="1 = PRÉDICTEUR CAUSAL (audit des exemples) : une cible de l'image f ne reçoit que les gestes 0..f "
+                   "(avant : TOUS les gestes, y compris à venir -> raccourcis, ex. « gestes nuls à venir = contact récent », et zéros du planificateur après son plan) ; "
+                   "le contexte ne lit que le contexte")
+    p.add_argument("--fut_share", type=float, default=0.0, help="part des devinettes « IMAGINE LA SUITE depuis le passé + tes gestes » (masque futur) ; "
+                   "0 = ancien tirage (2 sur 5 + toucher) ; ex. 0.7 : le geste devient nécessaire dans la plupart des devinettes")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
                    "au lieu d'une série pour toute la séquence (D7 : le résumé de séquence voyait aussi l'avenir visible pendant l'entraînement)")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
@@ -461,14 +479,14 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -497,7 +515,7 @@ def main():
             lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks); full = torch.arange(N, device=dev).expand(B, -1)
+        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad():
