@@ -314,11 +314,11 @@ def main():
         print(f"   {nm:>15s} | lecture du vrai futur {err(true_r, sl, k):5.2f} | COPIE {err(copy_r, sl, k):5.2f} | imaginé avec SES gestes {err(im_t, sl, k):5.2f} "
               f"| avec les gestes d'un AUTRE {err(im_l, sl, k):5.2f}", flush=True)
     if a.senses:                                # 2s AUDIT DES SENS : chaque sens IMAGINÉ dépend-il des gestes ?
-        def imag_sense(i0, lie):
-            out = []; tq_ = torch.arange(i0 + h, i0 + h + nf, device=dev)
+        def imag_sense(i0, lie, bb=None):
+            bb = bt if bb is None else bb; out = []; tq_ = torch.arange(i0 + h, i0 + h + nf, device=dev)
             with torch.no_grad():
-                for i in range(0, len(bt["X"]), 50):
-                    tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bt.items()}, st, v, P_, dev); B = len(tok); ci = ci0.expand(B, -1)
+                for i in range(0, len(bb["X"]), 50):
+                    tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bb.items()}, st, v, P_, dev); B = len(tok); ci = ci0.expand(B, -1)
                     if lie: cmd = cmd.roll(1, 0)
                     out.append(m.pred(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), tq_.expand(B, -1), cmd, ci).float().cpu())
             return torch.cat(out)                                         # (n_test, nf, d)
@@ -344,6 +344,22 @@ def main():
             print(f"   OUÏE imaginée — CHOC (AUC) : " + oA(lambda z_: auc(ra_c(z_).cpu(), Yc_t), None), flush=True)
             print(f"   OUÏE imaginée — objet qui GLISSE (AUC) : " + oA(lambda z_: auc(ra_m(z_).cpu(), Ym_t), None), flush=True)
             print(f"   OUÏE imaginée — vitesse de SA main (R²) : " + oA(lambda z_: r2(ra_s(z_).cpu(), Ys_t), None), flush=True)
+        # SONDES NEUVES entraînées sur l'IMAGINÉ (séquences d'entraînement), testées sur l'imaginé d'AUTRES séquences :
+        # l'info est-elle dans l'imagination (sonde neuve haute) ou la sonde du réel lit-elle mal l'imaginé (sonde neuve >> sonde du réel) ?
+        bb_tr = {k: x[:ntr] for k, x in b.items()}
+        with torch.no_grad():
+            Ia_tr, It_tr, Ib_tr = (imag_sense(i0_, False, bb_tr).flatten(0, 1) for i0_ in (nv, ic, ia))
+            It_te, Ib_te = imag_sense(ic, False).flatten(0, 1).to(dev), imag_sense(ia, False).flatten(0, 1).to(dev)
+        sl_ = lambda Y_: Y_[:ntr][:, h:h + nf].flatten(0, 1)
+        na_c, na_m = fit(Ia_tr, sl_(Yc_)[:, None], 1, bce=True), fit(Ia_tr, sl_(Ym_)[:, None], 1, bce=True)
+        na_s, nt_c = fit(Ia_tr, sl_(Ys_)[:, None], 1), fit(It_tr, sl_(Yc_)[:, None], 1, bce=True)
+        nb_h = fit(Ib_tr, sl_(Yh_).reshape(-1, 2), 2)
+        with torch.no_grad():
+            print(f"   SONDES NEUVES sur l'IMAGINÉ ({ntr} séq. -> {len(Yh_t)} autres) : TOUCHER contact AUC {auc(nt_c(It_te).cpu(), Yc_t):.2f} "
+                  f"(sonde du réel {auc(tch[False], Yc_t):.2f}) | OUÏE choc AUC {auc(na_c(aud[False]).cpu(), Yc_t):.2f} (réel {auc(ra_c(aud[False]).cpu(), Yc_t):.2f}) "
+                  f"| OUÏE objet qui glisse AUC {auc(na_m(aud[False]).cpu(), Ym_t):.2f} (réel {auc(ra_m(aud[False]).cpu(), Ym_t):.2f}, copie {auc(ra_m(aud_copy).cpu(), Ym_t):.2f}) "
+                  f"| OUÏE vitesse main R² {r2(na_s(aud[False]).cpu(), Ys_t):+.2f} | BRAS main {float((nb_h(Ib_te).cpu().view(-1, nf, 2) - Yh_t).norm(dim=-1).mean() * 32):.2f} px "
+                  f"(réel {pxh(arm[False]):.2f})", flush=True)
     if cfg.get("split", 0):                     # 2d LE MONDE EST-IL EXTÉRIEUR AU CORPS ? (corps/monde séparés)
         dpx = lambda u, w, k: float(((u - w)[..., 2 * k:2 * k + 2].norm(dim=-1) * 32).mean())
         i_lie_v, i_fake = imagined(True, "vrai"), imagined(False, "faux")
