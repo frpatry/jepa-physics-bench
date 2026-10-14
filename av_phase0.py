@@ -44,11 +44,14 @@ class Enc4(nn.Module):
     """encodeur des 4 SENS (la commande n'y entre JAMAIS). Indices : vue [0,nv), ouïe [nv,nv+T), toucher, bras.
     sep : attention à l'intérieur d'un sens seulement (la fusion = le prédicteur).
     nreg > 0 : CASES RÉSUMÉ (« registres », Darcet et al. 2024) — nreg cases apprises SANS endroit, ajoutées à la vue : elles lisent
-    toute l'image et ne sont jamais corrigées vers un coin ; rendues seulement avec regs=True (pour l'imagination)."""
-    def __init__(s, din, d, nv, T, nl, nh, sep=True, lv=0, nreg=0):
+    toute l'image et ne sont jamais corrigées vers un coin ; rendues seulement avec regs=True (pour l'imagination).
+    reg_frame : cases résumé PAR IMAGE — nreg cases pour CHAQUE image t (avec son temps), qui ne lisent QUE les cases de l'image t
+    (D7, une seule série pour la séquence : elle pouvait résumer aussi l'avenir visible -> raccourci absent quand on planifie)."""
+    def __init__(s, din, d, nv, T, nl, nh, sep=True, lv=0, nreg=0, reg_frame=False):
         super().__init__()
-        s.din, s.nv, s.T, s.sep, s.lv, s.nreg = list(din), nv, T, sep, lv, nreg   # lv > 0 : on peut aussi rendre la sortie de l'ÉTAGE lv (pyramide à 2 étages)
+        s.din, s.nv, s.T, s.sep, s.lv, s.nreg, s.reg_frame = list(din), nv, T, sep, lv, nreg, reg_frame   # lv > 0 : on peut aussi rendre la sortie de l'ÉTAGE lv (pyramide à 2 étages)
         if nreg: s.reg = nn.Parameter(torch.randn(nreg, d) * 0.02)
+        if nreg and reg_frame: s.reg_t = nn.Embedding(T, d)
         s.inp = nn.ModuleList([nn.Linear(k, d) for k in din]); s.mod = nn.Embedding(4, d); s.pos = nn.Embedding(nv + 3 * T, d)
         layer = nn.TransformerEncoderLayer(d, nh, d * 2, batch_first=True, activation="gelu", dropout=0.0)
         s.tr = nn.TransformerEncoder(layer, nl); s.ln = nn.LayerNorm(d)
@@ -65,14 +68,25 @@ class Enc4(nn.Module):
         for k, lin in enumerate(s.inp): e = e + (md == k).unsqueeze(-1) * lin(tok[..., :s.din[k]])
         x = e + s.mod(md) + s.pos(idx)
         if s.nreg:                                                     # CASES RÉSUMÉ en tête, comptées comme de la vue (même groupe d'attention)
-            R = s.nreg; x = torch.cat([(s.reg + s.mod.weight[0]).to(x.dtype).expand(len(x), -1, -1), x], 1)
+            vis = None
+            if s.reg_frame:                                            # une série par IMAGE : la case résumé de l'image t ne lit que l'image t
+                rf = torch.arange(s.T, device=x.device).repeat_interleave(s.nreg); R = len(rf)
+                rx = s.reg.repeat(s.T, 1) + s.reg_t(rf)
+                fr = torch.cat([rf.expand(len(x), -1), torch.where(idx < s.nv, idx // (s.nv // s.T), -1)], 1)
+                isr = torch.zeros_like(fr, dtype=torch.bool); isr[:, :R] = True
+                vis = (~isr.unsqueeze(2)) | (fr.unsqueeze(2) == fr.unsqueeze(1))      # (B, N, N) : requête résumé -> clés de SON image seulement
+            else: R = s.nreg; rx = s.reg
+            x = torch.cat([(rx + s.mod.weight[0]).to(x.dtype).expand(len(x), -1, -1), x], 1)
             md = torch.cat([torch.zeros_like(md[:, :1]).expand(-1, R), md], 1)
-            out = s._fwd(x, md, levels)
+            out = s._fwd(x, md, levels, vis)
             top, low = out if levels else (out, None)
             res = (top[:, R:], low[:, R:]) if levels else top[:, R:]
             return (res, top[:, :R]) if regs else res
         return s._fwd(x, md, levels)
-    def _fwd(s, x, md, levels):
+    def _fwd(s, x, md, levels, vis=None):
+        if vis is not None and not s.sep:
+            top, low = s.run(x, vis.unsqueeze(1))
+            return (s.ln(top), low) if levels else s.ln(top)
         if not s.sep:
             top, low = s.run(x) if levels else (s.tr(x), None)
             return (s.ln(top), low) if levels else s.ln(top)
@@ -82,12 +96,14 @@ class Enc4(nn.Module):
             for c in cnt:
                 c = int(c[0])
                 if c:
-                    if levels: t_, l_ = s.run(x[:, j:j + c]); out.append(t_); lows.append(l_)
-                    else: out.append(s.tr(x[:, j:j + c]))
+                    al = vis[:, j:j + c, j:j + c].unsqueeze(1) if vis is not None and j == 0 and bool((md[:, 0] == 0).all()) else None   # bloc vue (+ résumés)
+                    if levels: t_, l_ = s.run(x[:, j:j + c], al); out.append(t_); lows.append(l_)
+                    else: out.append(s.tr(x[:, j:j + c]) if al is None else s.run(x[:, j:j + c], al)[0])
                     j += c
             return (s.ln(torch.cat(out, 1)), torch.cat(lows, 1)) if levels else s.ln(torch.cat(out, 1))
-        allow = (md.unsqueeze(2) == md.unsqueeze(1)).unsqueeze(1)
-        top, low = s.run(x, allow)
+        allow = (md.unsqueeze(2) == md.unsqueeze(1))
+        if vis is not None: allow = allow & vis
+        top, low = s.run(x, allow.unsqueeze(1))
         return (s.ln(top), low) if levels else s.ln(top)
 
 class PredAC(nn.Module):
@@ -184,9 +200,9 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False):
         super().__init__()
-        s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs)
+        s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs, reg_frame=reg_frame)
         assert not (regs and (levels or split or resid)), "cases résumé : prédicteur unique non résiduel, sans pyramide"
         s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf)
         assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
@@ -208,7 +224,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -411,6 +427,8 @@ def main():
     p.add_argument("--regs", type=int, default=0, help="CASES RÉSUMÉ (registres, Darcet et al. 2024 ; idée de la pyramide : le général ET le détail ensemble) : "
                    "N cases de l'œil sans endroit, qui lisent toute l'image et vont à l'imagination avec les cases visibles ; la perte de contexte "
                    "(--ctx_on enc) ne touche que les cases-endroits -> les détails deviennent locaux, le résumé (ex. où va la main) reste global ; 0 = aucune")
+    p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
+                   "au lieu d'une série pour toute la séquence (D7 : le résumé de séquence voyait aussi l'avenir visible pendant l'entraînement)")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
     p.add_argument("--ctx_ramp", type=int, default=5000)
     p.add_argument("--freeze_eye", type=int, default=0, help="1 = ŒIL GELÉ (période critique) : l'encodeur repris ne change plus (ni EMA, ni SIGReg) ; seuls le prédicteur et la tête de contingence apprennent")
@@ -443,14 +461,14 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
