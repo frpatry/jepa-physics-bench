@@ -181,6 +181,10 @@ def main():
                    "(comme avant) ; low = étage fin ; both = les DEUX étages ensemble (général + précis, chaque case = [haut | fin])")
     p.add_argument("--read_on", type=str, default="real", choices=["real", "imag"], help="sur quoi le lecteur de l'IMAGINATION est entraîné : real = vrais latents "
                    "(comme avant) ; imag = latents IMAGINÉS (babillage, vraies positions) — l'imagination peut « écrire » autrement que l'œil ; la perception du présent garde le lecteur du réel")
+    p.add_argument("--hand_sense", type=str, default="vue", choices=["vue", "bras"], help="AUDIT DES SENS : où le bébé sait où est SA MAIN — vue = lue dans l'image "
+                   "(imaginée) ; bras = lue dans le BRAS (proprioception, imaginée par le prédicteur) : planification et calibration utilisent alors la main du bras")
+    p.add_argument("--senses", type=int, default=0, help="1 = AUDIT DES SENS (section 2s) : la main lue dans le BRAS imaginé et le CONTACT lu dans le TOUCHER imaginé, "
+                   "vs copie et vs les gestes d'un AUTRE (l'imagination de chaque sens dépend-elle des gestes ?)")
     p.add_argument("--instr", type=int, default=0, help="MESURE DE L'INSTRUMENT (tâche main) : N épisodes ; pour des gestes de familles différentes (babillage, "
                    "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
@@ -230,6 +234,35 @@ def main():
         pt = torch.cat([read(Z[ntr:].flatten(0, 1)[i:i + 512].to(dev)).cpu() for i in range(0, (n - ntr) * T, 512)])
     e = (pt - Y[ntr:].flatten(0, 1)).view(-1, 2, 2).norm(dim=-1) * 32
     print(f"1 LECTEUR sur vrais latents ({n} séq. à 1 objet) : objet {e[:, 0].mean():.2f} px, main {e[:, 1].mean():.2f} px  ({time.time() - t0:.0f}s)", flush=True)
+    # ---------- 1b SENS DU CORPS : lecteurs de la main dans le BRAS (proprioception) et du CONTACT dans le TOUCHER (instruments, latents de l'œil-cible)
+    ia, ic = nv + 2 * T, nv + T                                          # premier indice du bras / du toucher
+    rb = rt = None
+    if a.hand_sense == "bras" or a.senses:
+        assert a.read_level == "top", "audit des sens : --read_level top"
+        Zs_ = []
+        with torch.no_grad():
+            for i in range(0, n, 50):
+                tok, _ = to_tok0({k: x[i:i + 50] for k, x in b.items()}, st, v, P_, dev); ix = torch.arange(nv + 3 * T, device=dev).expand(len(tok), -1)
+                Zs_.append(LN(tgt(tok, ix))[:, ic:].half().cpu())
+        Zs_ = torch.cat(Zs_); Ztch, Zarm = Zs_[:, :T].float(), Zs_[:, T:].float()          # (n, T, d) toucher, bras
+        Yh_ = torch.from_numpy(w["HAND"][keep]).float(); Yc_ = torch.from_numpy((np.abs(w["TOUCH"][keep]).sum(-1) > 0).astype(np.float32))
+        def fit(Zx, Yx, nout, bce=False, steps=3000):
+            torch.manual_seed(0); net = torch.nn.Sequential(torch.nn.Linear(d, 128), torch.nn.GELU(), torch.nn.Linear(128, nout)).to(dev)
+            mu_, sd_ = (torch.zeros(nout), torch.ones(nout)) if bce else (Yx.mean(0), Yx.std(0) + 1e-6)
+            o_ = torch.optim.AdamW(net.parameters(), 1e-3, weight_decay=0.01)
+            for _ in range(steps):
+                bi = torch.randint(0, len(Zx), (512,)); out = net(Zx[bi].to(dev)); yy = ((Yx[bi] - mu_) / sd_).to(dev)
+                l = F.binary_cross_entropy_with_logits(out, yy) if bce else F.mse_loss(out, yy); o_.zero_grad(); l.backward(); o_.step()
+            net.eval(); mu_, sd_ = mu_.to(dev), sd_.to(dev)
+            return (lambda z: torch.sigmoid(net(z.float()))) if bce else (lambda z: net(z.float()) * sd_ + mu_)
+        rb = fit(Zarm[:ntr].flatten(0, 1), Yh_[:ntr].flatten(0, 1).reshape(-1, 2), 2)
+        rt = fit(Ztch[:ntr].flatten(0, 1), Yc_[:ntr].flatten(0, 1)[:, None], 1, bce=True)
+        with torch.no_grad():
+            eb = (rb(Zarm[ntr:].flatten(0, 1).to(dev)).cpu() - Yh_[ntr:].flatten(0, 1)).norm(dim=-1) * 32
+            pc = rt(Ztch[ntr:].flatten(0, 1).to(dev)).cpu()[:, 0]; yc = Yc_[ntr:].flatten(0, 1)
+        acc = lambda p_, y_: float(((p_ > 0.5).float() == y_).float().mean())
+        print(f"1b SENS DU CORPS (lecteurs) : main lue dans le BRAS {eb.mean():.2f} px (dans la VUE {e[:, 1].mean():.2f} px) | contact lu dans le TOUCHER : "
+              f"justesse {acc(pc, yc):.0%} (contact dans {float(yc.mean()):.0%} des images)", flush=True)
     dho = (Y[ntr:, :, :2] - Y[ntr:, :, 2:]).flatten(0, 1).norm(dim=-1); eo = e[:, 0]               # B0 : la PERCEPTION de l'objet selon la distance à la main
     bins = [(0, 0.2, "au contact (< 0.2)"), (0.2, 0.35, "proche (0.2–0.35)"), (0.35, 9, "loin (> 0.35)")]
     print("   B0 objet perçu selon la distance main–objet : " + " | ".join(f"{nm} {eo[(dho >= lo) & (dho < hi)].mean():.2f} px (n={int(((dho >= lo) & (dho < hi)).sum())})" for lo, hi, nm in bins), flush=True)
@@ -264,6 +297,33 @@ def main():
         sl = moved if k == 0 else slice(None)
         print(f"   {nm:>15s} | lecture du vrai futur {err(true_r, sl, k):5.2f} | COPIE {err(copy_r, sl, k):5.2f} | imaginé avec SES gestes {err(im_t, sl, k):5.2f} "
               f"| avec les gestes d'un AUTRE {err(im_l, sl, k):5.2f}", flush=True)
+    if a.senses:                                # 2s AUDIT DES SENS : chaque sens IMAGINÉ dépend-il des gestes ?
+        def imag_sense(i0, lie):
+            out = []; tq_ = torch.arange(i0 + h, i0 + h + nf, device=dev)
+            with torch.no_grad():
+                for i in range(0, len(bt["X"]), 50):
+                    tok, cmd = to_tok0({k: x[i:i + 50] for k, x in bt.items()}, st, v, P_, dev); B = len(tok); ci = ci0.expand(B, -1)
+                    if lie: cmd = cmd.roll(1, 0)
+                    out.append(m.pred(m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci), tq_.expand(B, -1), cmd, ci).float().cpu())
+            return torch.cat(out)                                         # (n_test, nf, d)
+        Yh_t, Yc_t = Yh_[te][:, h:h + nf], Yc_[te][:, h:h + nf]
+        with torch.no_grad():
+            arm = {k: rb(imag_sense(ia, k).flatten(0, 1).to(dev)).cpu().view(-1, nf, 2) for k in (False, True)}
+            arm_true = rb(Zarm[te][:, h:h + nf].flatten(0, 1).to(dev)).cpu().view(-1, nf, 2); arm_copy = rb(Zarm[te][:, h - 1].to(dev)).cpu()[:, None].expand(-1, nf, -1)
+            tch = {k: rt(imag_sense(ic, k).flatten(0, 1).to(dev)).cpu().view(-1, nf) for k in (False, True)}
+            tch_copy = rt(Ztch[te][:, h - 1].to(dev)).cpu()[:, None].expand(-1, nf, -1)[..., 0]
+        pxh = lambda pr: float((pr - Yh_t).norm(dim=-1).mean() * 32)
+        def auc(p_, y_):
+            p_, y_ = p_.flatten(), y_.flatten(); pos, neg = p_[y_ > 0.5], p_[y_ < 0.5]
+            if len(pos) == 0 or len(neg) == 0: return float("nan")
+            return float((pos[:, None] > neg[None, :]).float().mean() + 0.5 * (pos[:, None] == neg[None, :]).float().mean())
+        Dr = (Yh_t[:, -1] - Yh_[te][:, h - 1]); Di = (arm[False][:, -1] - Yh_[te][:, h - 1]); okm = Dr.norm(dim=-1) > 0.5 / 32
+        cosb = float(F.cosine_similarity(Di[okm], Dr[okm], dim=-1).mean())
+        print(f"2s AUDIT DES SENS (frames {h}–{h + nf - 1}, {len(Yh_t)} séq.) :")
+        print(f"   MAIN dans le BRAS imaginé | lecture du vrai futur {pxh(arm_true):5.2f} px | COPIE {pxh(arm_copy):5.2f} | imaginé avec SES gestes {pxh(arm[False]):5.2f} "
+              f"| avec les gestes d'un AUTRE {pxh(arm[True]):5.2f} | direction du déplacement (fin) cos {cosb:+.2f}", flush=True)
+        print(f"   CONTACT dans le TOUCHER imaginé (AUC, 0.5 = hasard ; contact dans {float(Yc_t.mean()):.0%} des images) | COPIE {auc(tch_copy, Yc_t):.2f} "
+              f"| imaginé avec SES gestes {auc(tch[False], Yc_t):.2f} | avec les gestes d'un AUTRE {auc(tch[True], Yc_t):.2f}", flush=True)
     if cfg.get("split", 0):                     # 2d LE MONDE EST-IL EXTÉRIEUR AU CORPS ? (corps/monde séparés)
         dpx = lambda u, w, k: float(((u - w)[..., 2 * k:2 * k + 2].norm(dim=-1) * 32).mean())
         i_lie_v, i_fake = imagined(True, "vrai"), imagined(False, "faux")
@@ -344,6 +404,13 @@ def main():
             ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
             zt = teachN(torch.gather(tok, 1, vi.unsqueeze(-1).expand(-1, -1, tok.size(-1))), vi)[:, -npf:]
             now = read_now(zt)[0]                                            # objet x,y, main x,y PERÇUS maintenant (perception, pas imagination)
+            if rb is not None and a.hand_sense == "bras":                  # PROPRIOCEPTION : la main SENTIE maintenant (bras), pas vue
+                ai_ = torch.arange(ia, ia + t + 1, device=dev)[None]
+                now = now.clone(); now[2:] = rb(LN(tgt(torch.gather(tok, 1, ai_.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ai_))[:, -1])[0]
+        tib = torch.arange(ia + t + 1, ia + t + Hh + 1, device=dev)[:, None]      # bras imaginé à t+1 .. t+Hh (une requête par horizon)
+        def arm_hand(K, cmd, all_h):              # (K, Hh ou 1, 2) : la main lue dans le BRAS imaginé
+            if all_h: return rb(imagine(ctx.expand(K * Hh, -1, -1), tib.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0]).view(K, Hh, 2)
+            return rb(imagine(ctx.expand(K, -1, -1), tib[-1:].expand(K, -1), cmd, ci.expand(K, -1))[:, 0])[:, None]
         gt = torch.from_numpy(env.g).to(dev)
         if a.task in ("toucher", "bouger", "direction"): gt = now[:2]   # où est l'objet MAINTENANT
         phase, sub = 0, None                                             # SOUS-BUTS (le bébé décompose : d'abord la main, ensuite l'objet)
@@ -364,6 +431,7 @@ def main():
                 if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
                     r_ = read(imagine(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
                 else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
+                if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
@@ -372,7 +440,10 @@ def main():
             return c_.mean(1)
         def traj(plan):                         # plan (Hh, 2) -> positions IMAGINÉES (Hh, 4) à t+1 .. t+Hh (une requête par horizon)
             cmd = cmd0.expand(Hh, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = plan[None] / 0.05
-            with torch.no_grad(): return read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
+            with torch.no_grad():
+                r_ = read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
+                if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[:, 2:4] = rb(imagine(ctx.expand(Hh, -1, -1), tib, cmd, ci.expand(Hh, -1))[:, 0])
+                return r_
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
     def real_cost(env, cand):
@@ -471,6 +542,10 @@ def main():
                         tk2, _ = to_tok0(e2.batch(), st, v, P_, dev); ix = torch.arange(nvv, device=dev)[None]
                         zr = teachN(tk2[:, :nvv], ix).view(T, npf, dR)[t0 + 1:t0 + 1 + Hh_]   # VRAIES images
                         ri, rr = read(zi)[:, 2:4].cpu().numpy(), read_now(zr)[:, 2:4].cpu().numpy()
+                        if rb is not None and a.hand_sense == "bras":       # la main du BRAS : imaginée vs sentie pour de vrai
+                            tib_ = torch.arange(ia + t0 + 1, ia + t0 + Hh_ + 1, device=dev)[:, None]
+                            ri = rb(imagine(ctx.expand(Hh_, -1, -1), tib_, cmd, ci.expand(Hh_, -1))[:, 0]).cpu().numpy()
+                            rr = rb(LN(tgt(tk2[:, ia:ia + T], torch.arange(ia, ia + T, device=dev)[None]))[0, t0 + 1:t0 + 1 + Hh_]).cpu().numpy()
                     tru = e2.HAND[t0 + 1:t0 + 1 + Hh_]
                     rows[f].append(dict(ep=ep, zi=zi.half().cpu(), zr=zr.half().cpu(), tru=tru.copy(), ri=ri, rr=rr, h0=env.HAND[t0].copy()))
         print(f"MESURE DE L'INSTRUMENT ({a.instr} épisodes « main », {K} gestes par famille, horizon {Hh}) | {time.time() - tp:.0f}s", flush=True)
