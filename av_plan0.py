@@ -243,8 +243,8 @@ def main():
         with torch.no_grad():
             for i in range(0, n, 50):
                 tok, _ = to_tok0({k: x[i:i + 50] for k, x in b.items()}, st, v, P_, dev); ix = torch.arange(nv + 3 * T, device=dev).expand(len(tok), -1)
-                Zs_.append(LN(tgt(tok, ix))[:, ic:].half().cpu())
-        Zs_ = torch.cat(Zs_); Ztch, Zarm = Zs_[:, :T].float(), Zs_[:, T:].float()          # (n, T, d) toucher, bras
+                Zs_.append(LN(tgt(tok, ix))[:, nv:].half().cpu())
+        Zs_ = torch.cat(Zs_); Zaud, Ztch, Zarm = Zs_[:, :T].float(), Zs_[:, T:2 * T].float(), Zs_[:, 2 * T:].float()   # (n, T, d) ouïe, toucher, bras
         Yh_ = torch.from_numpy(w["HAND"][keep]).float(); Yc_ = torch.from_numpy((np.abs(w["TOUCH"][keep]).sum(-1) > 0).astype(np.float32))
         def fit(Zx, Yx, nout, bce=False, steps=3000):
             torch.manual_seed(0); net = torch.nn.Sequential(torch.nn.Linear(d, 128), torch.nn.GELU(), torch.nn.Linear(128, nout)).to(dev)
@@ -257,10 +257,26 @@ def main():
             return (lambda z: torch.sigmoid(net(z.float()))) if bce else (lambda z: net(z.float()) * sd_ + mu_)
         rb = fit(Zarm[:ntr].flatten(0, 1), Yh_[:ntr].flatten(0, 1).reshape(-1, 2), 2)
         rt = fit(Ztch[:ntr].flatten(0, 1), Yc_[:ntr].flatten(0, 1)[:, None], 1, bce=True)
+        # OUÏE : ce qu'on ENTEND — un choc (contact), l'objet qui GLISSE (frottement), la vitesse de SA main (froissement)
+        Po_ = torch.from_numpy(w["POS"][keep, :, 0]).float(); dP = torch.cat([torch.zeros_like(Po_[:, :1, 0]), (Po_[:, 1:] - Po_[:, :-1]).norm(dim=-1)], 1)
+        Ym_ = (dP * 32 > 0.3).float(); Ys_ = torch.cat([torch.zeros_like(Yh_[:, :1, 0]), (Yh_[:, 1:] - Yh_[:, :-1]).norm(dim=-1)], 1) * 32
+        ra_c = fit(Zaud[:ntr].flatten(0, 1), Yc_[:ntr].flatten(0, 1)[:, None], 1, bce=True)
+        ra_m = fit(Zaud[:ntr].flatten(0, 1), Ym_[:ntr].flatten(0, 1)[:, None], 1, bce=True)
+        ra_s = fit(Zaud[:ntr].flatten(0, 1), Ys_[:ntr].flatten(0, 1)[:, None], 1)
         with torch.no_grad():
             eb = (rb(Zarm[ntr:].flatten(0, 1).to(dev)).cpu() - Yh_[ntr:].flatten(0, 1)).norm(dim=-1) * 32
             pc = rt(Ztch[ntr:].flatten(0, 1).to(dev)).cpu()[:, 0]; yc = Yc_[ntr:].flatten(0, 1)
         acc = lambda p_, y_: float(((p_ > 0.5).float() == y_).float().mean())
+        def auc(p_, y_):
+            p_, y_ = p_.flatten(), y_.flatten(); pos, neg = p_[y_ > 0.5], p_[y_ < 0.5]
+            if len(pos) == 0 or len(neg) == 0: return float("nan")
+            if len(pos) * len(neg) > 4e7: pos, neg = pos[torch.randperm(len(pos))[:4000]], neg[torch.randperm(len(neg))[:10000]]
+            return float((pos[:, None] > neg[None, :]).float().mean() + 0.5 * (pos[:, None] == neg[None, :]).float().mean())
+        r2 = lambda p_, y_: float(1 - ((p_.flatten() - y_.flatten()) ** 2).mean() / y_.flatten().var().clamp_min(1e-9))
+        with torch.no_grad():
+            za_ = Zaud[ntr:].flatten(0, 1).to(dev)
+            print(f"1b OUÏE (lecteurs, vraies images) : choc/contact AUC {auc(ra_c(za_).cpu(), Yc_[ntr:]):.2f} | objet qui GLISSE AUC {auc(ra_m(za_).cpu(), Ym_[ntr:]):.2f} "
+                  f"(objet en mouvement dans {float(Ym_.mean()):.0%} des images) | vitesse de SA main R² {r2(ra_s(za_).cpu(), Ys_[ntr:]):+.2f}", flush=True)
         print(f"1b SENS DU CORPS (lecteurs) : main lue dans le BRAS {eb.mean():.2f} px (dans la VUE {e[:, 1].mean():.2f} px) | contact lu dans le TOUCHER : "
               f"justesse {acc(pc, yc):.0%} (contact dans {float(yc.mean()):.0%} des images)", flush=True)
     dho = (Y[ntr:, :, :2] - Y[ntr:, :, 2:]).flatten(0, 1).norm(dim=-1); eo = e[:, 0]               # B0 : la PERCEPTION de l'objet selon la distance à la main
@@ -313,10 +329,10 @@ def main():
             tch = {k: rt(imag_sense(ic, k).flatten(0, 1).to(dev)).cpu().view(-1, nf) for k in (False, True)}
             tch_copy = rt(Ztch[te][:, h - 1].to(dev)).cpu()[:, None].expand(-1, nf, -1)[..., 0]
         pxh = lambda pr: float((pr - Yh_t).norm(dim=-1).mean() * 32)
-        def auc(p_, y_):
-            p_, y_ = p_.flatten(), y_.flatten(); pos, neg = p_[y_ > 0.5], p_[y_ < 0.5]
-            if len(pos) == 0 or len(neg) == 0: return float("nan")
-            return float((pos[:, None] > neg[None, :]).float().mean() + 0.5 * (pos[:, None] == neg[None, :]).float().mean())
+        with torch.no_grad():
+            aud = {k: imag_sense(nv, k).flatten(0, 1).to(dev) for k in (False, True)}; aud_copy = Zaud[te][:, h - 1:h].expand(-1, nf, -1).flatten(0, 1).to(dev)
+            Ym_t, Ys_t = Ym_[te][:, h:h + nf], Ys_[te][:, h:h + nf]
+            oA = lambda f_, y_: " | ".join(f"{nm} {f_(z_):.2f}" for nm, z_ in (("COPIE", aud_copy), ("imaginé avec SES gestes", aud[False]), ("avec les gestes d'un AUTRE", aud[True])))
         Dr = (Yh_t[:, -1] - Yh_[te][:, h - 1]); Di = (arm[False][:, -1] - Yh_[te][:, h - 1]); okm = Dr.norm(dim=-1) > 0.5 / 32
         cosb = float(F.cosine_similarity(Di[okm], Dr[okm], dim=-1).mean())
         print(f"2s AUDIT DES SENS (frames {h}–{h + nf - 1}, {len(Yh_t)} séq.) :")
@@ -324,6 +340,10 @@ def main():
               f"| avec les gestes d'un AUTRE {pxh(arm[True]):5.2f} | direction du déplacement (fin) cos {cosb:+.2f}", flush=True)
         print(f"   CONTACT dans le TOUCHER imaginé (AUC, 0.5 = hasard ; contact dans {float(Yc_t.mean()):.0%} des images) | COPIE {auc(tch_copy, Yc_t):.2f} "
               f"| imaginé avec SES gestes {auc(tch[False], Yc_t):.2f} | avec les gestes d'un AUTRE {auc(tch[True], Yc_t):.2f}", flush=True)
+        with torch.no_grad():
+            print(f"   OUÏE imaginée — CHOC (AUC) : " + oA(lambda z_: auc(ra_c(z_).cpu(), Yc_t), None), flush=True)
+            print(f"   OUÏE imaginée — objet qui GLISSE (AUC) : " + oA(lambda z_: auc(ra_m(z_).cpu(), Ym_t), None), flush=True)
+            print(f"   OUÏE imaginée — vitesse de SA main (R²) : " + oA(lambda z_: r2(ra_s(z_).cpu(), Ys_t), None), flush=True)
     if cfg.get("split", 0):                     # 2d LE MONDE EST-IL EXTÉRIEUR AU CORPS ? (corps/monde séparés)
         dpx = lambda u, w, k: float(((u - w)[..., 2 * k:2 * k + 2].norm(dim=-1) * 32).mean())
         i_lie_v, i_fake = imagined(True, "vrai"), imagined(False, "faux")
