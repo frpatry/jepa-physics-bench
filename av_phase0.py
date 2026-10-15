@@ -449,6 +449,10 @@ def main():
                    "0 = ancien tirage (2 sur 5 + toucher) ; ex. 0.7 : le geste devient nécessaire dans la plupart des devinettes")
     p.add_argument("--touch_share", type=float, default=0.0, help="avec --fut_share : part GARDÉE pour la devinette « DEVINE CE QUE TU SENS » (toucher entier "
                    "depuis la vue, l'ouïe, le bras) ; D9 (fut_share 0.7 seul) l'avait réduite à < 8 %% -> examen « contact vu mais pas senti » 8 %% (vs ~90 %%) ; ex. 0.15")
+    p.add_argument("--blind", type=int, default=0, help="1 = JEU LIBRE : babillage AVEUGLE aux objets (aucun geste dirigé vers un objet, pas de pause "
+                   "scriptée après un contact) ; c'est le monde qui décide s'il y a contact (contrôle 2026-10-15 : l'imagination lisait l'objet dans les gestes scriptés)")
+    p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
+                   "le SURPRENNENT encore (tirage ∝ erreur d'imagination actuelle) — explorer soi-même ce qui reste à explorer ; 1 = désactivée")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
                    "au lieu d'une série pour toute la séquence (D7 : le résumé de séquence voyait aussi l'avenir visible pendant l'entraînement)")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
@@ -467,6 +471,7 @@ def main():
     assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
     assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc/enc_low, sans split/resid/act_w"
     assert not (a.ctx_on == "enc_low" and not a.levels), "--ctx_on enc_low : avec --levels seulement"
+    assert not (a.curious > 1 and a.levels), "curiosité : sans pyramide"
     assert not (a.regs and (a.levels or a.split or a.resid or (a.ctx_w > 0 and a.ctx_on == "pred"))), "cases résumé : sans pyramide/split/resid, perte de contexte dans l'œil"
     global T; T = a.T                                                          # longueur des séquences (tout le module la lit ici)
     torch.backends.cuda.matmul.allow_tf32 = True; rng = np.random.default_rng(a.seed)
@@ -475,7 +480,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent)
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
@@ -490,7 +495,7 @@ def main():
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -504,7 +509,7 @@ def main():
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
-    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None
+    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
@@ -518,7 +523,24 @@ def main():
             u = (it - a.lr_restart) / max(1, a.total - a.lr_restart)
             lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
-        bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
+        bt_ = S.next()
+        if a.curious > 1:                                            # CURIOSITÉ : il essaie plus de choses qu'il n'en étudie, et étudie surtout ce qui
+            cands = [bt_] + [S.next() for _ in range(a.curious - 1)]  # le SURPREND encore (erreur d'imagination actuelle) — tirage ∝ surprise
+            bt_ = {k: torch.cat([c_[k] for c_ in cands]) for k in bt_}
+            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
+                errs_ = []
+                for i0 in range(0, len(bt_["X"]), a.bs):
+                    tk_, cm_ = to_tok0({k: x[i0:i0 + a.bs] for k, x in bt_.items()}, st, v, a.P, dev); Bc, Nc, _ = tk_.shape
+                    z_ = F.layer_norm(tgt(tk_, torch.arange(Nc, device=dev).expand(Bc, -1)).float(), (a.d,)); t0c = int(rng.integers(3, T - 2))
+                    ci_ = torch.from_numpy(np.where(fr_np <= t0c)[0]).to(dev).expand(Bc, -1); ti_ = torch.from_numpy(np.where(fr_np > t0c)[0]).to(dev).expand(Bc, -1)
+                    pr_ = m.pred(m.context(_gather(tk_, ci_), ci_), ti_, cm_, ci_).float()
+                    errs_.append((pr_ - _gather(z_, ti_)).abs().mean((1, 2)))
+                e_ = torch.cat(errs_).clamp_min(1e-6)
+            pick = torch.multinomial(e_ / e_.sum(), a.bs, replacement=False).cpu()
+            had_c = (bt_["TOUCH"].abs().sum((1, 2)) > 0).float()
+            cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
+            bt_ = {k: x[pick] for k, x in bt_.items()}
+        tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
         pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
@@ -600,6 +622,8 @@ def main():
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
                   f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + (f" | CONTEXTE {ma[6]:.4f} (poids {cw:.2f})" if a.ctx_w > 0 else "") + (f" | ÉTAGE BAS {ma[7]:.4f}" if a.levels else "") + f" | {time.time() - t0:.0f}s", flush=True)
+        if it % 500 == 0 and cur_stats:
+            cs_ = np.array(cur_stats[-500:]); print(f"      CURIOSITÉ : séquences avec contact — essayées {cs_[:, 0].mean():.0%}, ÉTUDIÉES {cs_[:, 1].mean():.0%}", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
