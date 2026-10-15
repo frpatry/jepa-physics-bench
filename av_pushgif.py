@@ -36,9 +36,10 @@ def main():
     keep = np.where(w["NOBJ"] == 1)[0]; n = len(keep)
     b = to_torch(to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]))
     Y = torch.from_numpy(np.concatenate([w["POS"][keep, :, 0], w["HAND"][keep]], -1)).float()      # (n, T, 4) objet x,y, main x,y
-    moved = (np.linalg.norm(w["POS"][keep, T - 1, 0] - w["POS"][keep, h - 1, 0], axis=-1) * H > 3.0)   # l'objet a bougé de > 3 px pendant 8–15
+    po_ = w["POS"][keep, :, 0]; inview = ((po_ > 0.06) & (po_ < 0.94)).all((1, 2))                      # l'objet reste DANS le champ (sinon on ne voit rien)
+    moved = (np.linalg.norm(po_[:, T - 1] - po_[:, h - 1], axis=-1) * H > 3.0) & inview                 # l'objet a bougé de > 3 px pendant 8–15
     ntr = int(0.8 * n); show = np.where(moved[ntr:])[0][:a.show] + ntr
-    print(f"{n} séquences à 1 objet, {int(moved.sum())} où l'objet est poussé ; montrées : {len(show)} | {time.time() - t0:.0f}s", flush=True)
+    print(f"{n} séquences à 1 objet, {int(moved.sum())} où l'objet est poussé (et reste dans le champ) ; montrées : {len(show)} | {time.time() - t0:.0f}s", flush=True)
     md, fr = layout(nv, npf); ci0 = torch.from_numpy(np.where(fr < h)[0]).to(dev); ti0 = torch.from_numpy(np.where((fr >= h) & (md == 0))[0]).to(dev)
     res = []
     for c, ck in zip(names, cks):
