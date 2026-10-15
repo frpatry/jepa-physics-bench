@@ -26,12 +26,14 @@ def main():
     p.add_argument("--out", default="/content/drive/MyDrive/jepa_runs/pousse.gif"); p.add_argument("--n", type=int, default=4000)
     p.add_argument("--show", type=int, default=6); p.add_argument("--scale", type=int, default=8); p.add_argument("--blocks", type=int, default=0)
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--blind", type=int, default=0, help="1 = CONTRÔLE : gestes aveugles aux objets (aucun geste vers l'objet, pas de pause après contact) ; "
+                   "si l'objet imaginé se dégrade fortement, l'imagination lisait l'objet dans les GESTES et pas dans la physique")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     names = [c.strip() for c in a.ckpts.split(",")]
     cks = [torch.load(os.path.join(a.dir, c), map_location=dev, weights_only=False) for c in names]
     cfg0 = cks[0]["cfg"]; T = int(cfg0.get("T", 16)); av_phase0.T = T; P = cfg0["P"]; nP = H // P; npf = nP * nP; nv = T * npf; v = VIEW["0e"]
     h = T // 2; nf = T - h
-    wkw = {**cfg0.get("wkw", {}), "p_parent": 0.0, **({"blocks": 1.0} if a.blocks else {})}
+    wkw = {**cfg0.get("wkw", {}), "p_parent": 0.0, **({"blocks": 1.0} if a.blocks else {}), **({"blind": True} if a.blind else {})}
     w = gen_world0(a.n, "0e", T, H, seed=4242, **wkw)
     keep = np.where(w["NOBJ"] == 1)[0]; n = len(keep)
     b = to_torch(to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]))

@@ -70,7 +70,8 @@ def fric_sound(pos, mat, m, T, level):
     return sig
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
-               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0):
+               force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
+               blind=False):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -84,6 +85,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     p_parent : part des séquences où la MAIN D'UN PARENT (idée user) entre dans le champ, va derrière un objet et le POUSSE, puis
     repart : démonstration du principe de contact. Le bébé la voit et entend le choc, mais ne la SENT pas (ni toucher, ni bras) et
     elle ne suit pas ses commandes -> ce n'est pas sa main. Teinte peau, un peu plus grande. PAR (n,T,2) = position (examens).
+    blind : CONTRÔLE (évaluation seulement) — gestes AVEUGLES aux objets : aucun geste dirigé vers un objet et pas de « pause pour
+    regarder » après un contact ; la physique est inchangée. Sert à vérifier que l'imagination ne lit pas l'objet dans les GESTES
+    (le babillage normal vise les objets : la direction des gestes à venir révèle où est l'objet, la pause révèle le contact).
     calm (0..1) : MONDE LISIBLE / COMPLEXITÉ PROGRESSIVE (idées user) — après un contact actif, le bébé S'ARRÊTE POUR REGARDER (proba
     0.8·calm, 3–6 images) ; il fait aussi des pauses sans contact (0.35·calm des changements de geste) ; les objets sont AU REPOS par
     défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm).
@@ -155,10 +159,10 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if left <= 0:                                        # BABILLAGE (modes de v5)
                     left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
                     if N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
-                    elif N > 0 and u_ < p_obj:                          # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
+                    elif N > 0 and u_ < p_obj and not blind:            # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
                         k = rng.integers(N); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
                     else:
-                        if N > 0: u_ = 0.45 + (u_ - p_obj) / (1 - p_obj) * 0.55   # le reste garde les proportions d'origine
+                        if N > 0 and not blind: u_ = 0.45 + (u_ - p_obj) / (1 - p_obj) * 0.55   # le reste garde les proportions d'origine
                         if u_ < 0.6: tgt = rng.uniform(lo_c, hi_c, 2)  # 0b : la cible peut être HORS du champ
                         elif u_ < 0.7: mode = "immobile"
                         elif u_ < 1 - pg: a_ = rng.uniform(0, 2 * math.pi); dirv = np.array([math.cos(a_), math.sin(a_)]); mode = "direction"
@@ -232,7 +236,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     om *= 0.97 if fric < 0.003 else 0.9
                 if blk: V *= 0.25; om *= 0.5                         # bloc : il ne bouge que POUSSÉ
                 vact[t] = Hp - H0
-                if calm > 0 and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
+                if calm > 0 and not blind and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
                     mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire
                 if cf["mobile"]:                                     # le ruban : le mobile suit le geste RÉEL (avec retard si test)
                     LINK[i, t] = mt == 0 or (mt == 2 and t < tcut)
