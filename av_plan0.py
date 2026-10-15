@@ -45,7 +45,7 @@ class LocalReader(torch.nn.Module):
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
     def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False):
-        s.task, s.blocks = task, blocks                                                   # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
+        s.task, s.blocks, s.bowl = task, blocks, task == "bol"                            # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
         s.Rh, s.Lr = 0.07, 0.9; s.kind = int(rng.integers(0, 4))
         s.sz = rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
@@ -93,12 +93,18 @@ class Push0:
         if s.task == "bouger": return max(0.0, 0.05 - float(np.linalg.norm(s.P - s.P0)))                 # il reste à le déplacer de…
         if s.task == "direction": return max(0.0, 0.05 - float((s.P - s.P0) @ s.u))                       # …dans la bonne direction
         return float(np.linalg.norm((s.Hp if s.task.startswith("main") else s.P) - s.g))
+    def frame(s, P, Hp):
+        """image du monde avec l'objet en P et la main en Hp (le BOL, s'il y en a un, est un anneau gris fixe autour de la cible)."""
+        img = np.zeros((H, H, 3), np.float32)
+        if s.bowl:
+            r_ = np.sqrt((s.xx - s.g[0]) ** 2 + (s.yy - s.g[1]) ** 2); rb = s.rc + 0.035
+            ring = np.clip(1.0 - np.abs(r_ - rb) * H / 0.9, 0, 1)[..., None]; img = img * (1 - ring) + 0.45 * ring
+        al = shape_alpha(s.kind, s.sz, s.ang, P[0], P[1], s.xx, s.yy, H)[..., None]; img = img * (1 - al) + s.col * al
+        hx = np.clip((s.Rh * 0.85 - np.maximum(abs(s.xx - Hp[0]), abs(s.yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
+        return img * (1 - hx) + hx
     def record(s, t, render=True):
         s.POS[t], s.HAND[t] = s.P, s.Hp
-        if render:
-            al = shape_alpha(s.kind, s.sz, s.ang, s.P[0], s.P[1], s.xx, s.yy, H)[..., None]; img = s.col * al
-            hx = np.clip((s.Rh * 0.85 - np.maximum(abs(s.xx - s.Hp[0]), abs(s.yy - s.Hp[1]))) * H + 0.5, 0, 1)[..., None]
-            s.X[t] = img * (1 - hx) + hx
+        if render: s.X[t] = s.frame(s.P, s.Hp)
     def step(s, cmd, render=True):
         t = s.t = s.t + 1; rc, m = s.rc, s.m; s.CMD[t] = np.clip(cmd, -VMAX, VMAX)
         H0 = s.Hp.copy(); s.Hp = s.place(s.Hp + s.CMD[t])
@@ -162,7 +168,7 @@ def main():
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
     p.add_argument("--dump_n", type=int, default=0, help="enregistre les N premiers épisodes MPC (gestes + positions IMAGINÉES) pour les animations")
-    p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction"], help="main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
+    p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction", "bol"], help="bol : pousser le BLOC dans le BOL (anneau gris visible autour de la cible) ; main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     p.add_argument("--plan_hs", type=str, default="", help="balayage d'horizons pour le MPC, ex. 1,2,6 (même lecteur, un seul chargement)")
@@ -181,6 +187,8 @@ def main():
                    "(comme avant) ; low = étage fin ; both = les DEUX étages ensemble (général + précis, chaque case = [haut | fin])")
     p.add_argument("--read_on", type=str, default="real", choices=["real", "imag"], help="sur quoi le lecteur de l'IMAGINATION est entraîné : real = vrais latents "
                    "(comme avant) ; imag = latents IMAGINÉS (babillage, vraies positions) — l'imagination peut « écrire » autrement que l'œil ; la perception du présent garde le lecteur du réel")
+    p.add_argument("--goal_img", type=int, default=0, help="1 = le BUT est une IMAGE (le monde voulu : objet dans le bol), comparée dans les latents du bébé "
+                   "LÀ OÙ LA SCÈNE DOIT CHANGER (cases dont les pixels diffèrent entre maintenant et le but) ; aucun lecteur supervisé dans le coût")
     p.add_argument("--hand_sense", type=str, default="vue", choices=["vue", "bras"], help="AUDIT DES SENS : où le bébé sait où est SA MAIN — vue = lue dans l'image "
                    "(imaginée) ; bras = lue dans le BRAS (proprioception, imaginée par le prédicteur) : planification et calibration utilisent alors la main du bras")
     p.add_argument("--senses", type=int, default=0, help="1 = AUDIT DES SENS (section 2s) : la main lue dans le BRAS imaginé et le CONTACT lu dans le TOUCHER imaginé, "
@@ -461,6 +469,17 @@ def main():
                     if float(rel @ u) > -0.5 * a.behind: s_ = perp if float(rel @ perp) > 0 else -perp; sub = ob + s_ * (a.behind + 0.04) - u * 0.05
                     else: sub = behind
                 else: phase = 2
+        if a.goal_img:                          # BUT = IMAGE : la suite « le monde saute au but et y reste » encodée par l'œil-cible (comme une cible d'entraînement)
+            Xg = env.X.copy(); gf = env.frame(env.g, env.Hp); Xg[t + 1:] = gf
+            bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
+            with torch.no_grad():
+                tkg, _ = to_tok0(bg, st, v, P_, dev); ixg = torch.arange(nv, device=dev)[None]
+                zg_all = teachN(tkg[:, :nv], ixg).view(T, npf, dR)
+            dpx = np.abs(gf - env.X[t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
+            gmask = torch.from_numpy(dpx > 0.15).to(dev)
+            if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
+        def gcost(zi, hh):                      # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
+            return ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad():
@@ -469,6 +488,8 @@ def main():
                 else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
+            if a.goal_img:
+                with torch.no_grad(): return gcost(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)).view(K, npf, dR), Hh)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
             elif a.task == "direction": c_ = -((r_[..., :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
@@ -491,7 +512,7 @@ def main():
         return np.array(out)
     has_obj = not a.task.startswith("main")
     def qty(p4, ref):                           # la quantité visée par la tâche (pour le film) : distance au but / déplacement
-        if a.task == "objet": return float(np.linalg.norm(p4[:2] - ref))
+        if a.task in ("objet", "bol"): return float(np.linalg.norm(p4[:2] - ref))
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
@@ -614,7 +635,7 @@ def main():
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
     titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
              "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22",
-             "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
+             "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "bol": "pousser le BLOC dans le BOL (cible à 0.12–0.22, réussite < 0.06)" + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur supervisé"), "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s}")
     for pol in ("hasard", "oracle"):
