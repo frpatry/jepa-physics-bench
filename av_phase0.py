@@ -283,12 +283,14 @@ class Stream:
         while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0):
+def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0):
     """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
     « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes)."""
     md, fr = layout(nv, nP * nP); N = len(md); pairs = []
     for _ in range(n_masks):
-        if fut_share > 0: st = "future" if rng.random() < fut_share else rng.choice(["tube", "vblock", "cross"] + ["touch"] * touch)   # IMAGINER LA SUITE domine
+        if fut_share > 0:                                            # IMAGINER LA SUITE domine ; « DEVINE CE QUE TU SENS » garde sa part (touch_share)
+            r_ = rng.random()
+            st = "future" if r_ < fut_share else "touch" if r_ < fut_share + touch_share else rng.choice(["tube", "vblock", "cross"] + ([] if touch_share > 0 else ["touch"] * touch))
         else: st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch)
         tg = np.zeros((B, N), bool)
         if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
@@ -445,6 +447,8 @@ def main():
                    "le contexte ne lit que le contexte")
     p.add_argument("--fut_share", type=float, default=0.0, help="part des devinettes « IMAGINE LA SUITE depuis le passé + tes gestes » (masque futur) ; "
                    "0 = ancien tirage (2 sur 5 + toucher) ; ex. 0.7 : le geste devient nécessaire dans la plupart des devinettes")
+    p.add_argument("--touch_share", type=float, default=0.0, help="avec --fut_share : part GARDÉE pour la devinette « DEVINE CE QUE TU SENS » (toucher entier "
+                   "depuis la vue, l'ouïe, le bras) ; D9 (fut_share 0.7 seul) l'avait réduite à < 8 %% -> examen « contact vu mais pas senti » 8 %% (vs ~90 %%) ; ex. 0.15")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
                    "au lieu d'une série pour toute la séquence (D7 : le résumé de séquence voyait aussi l'avenir visible pendant l'entraînement)")
     p.add_argument("--ctx_from", type=int, default=3000, help="pas où la perte de contexte commence (poids 0 avant), puis montée linéaire sur --ctx_ramp pas")
@@ -486,7 +490,7 @@ def main():
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share)
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
@@ -515,7 +519,7 @@ def main():
             lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
         for g in opt.param_groups: g["lr"] = a.lr * lr_f
         bt_ = S.next(); tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share); full = torch.arange(N, device=dev).expand(B, -1)
+        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad():
