@@ -70,6 +70,18 @@ def main():
         cp = Y[ntr:, h - 1:h].expand(-1, nf, -1)
         print(f"  {c} : objet POUSSÉ imaginé {px(pi, 0):.2f} px (copie {px(cp, 0):.2f}, gestes d'un AUTRE {px(pl, 0):.2f}) | main {px(pi, 1):.2f} px "
               f"(copie {px(cp, 1):.2f}) | {time.time() - t0:.0f}s", flush=True)
+        # DÉPLACEMENT (remarque user : la copie est la VRAIE position, sans l'erreur du lecteur -> comparaison injuste). Ici tout est mesuré
+        # depuis l'image 8 avec le MÊME lecteur des deux côtés (son biais s'annule) : où va l'objet imaginé par rapport à là où il était imaginé en 8
+        def mv_(pr, k):
+            di = (pr[:, :, 2 * k:2 * k + 2] - pr[:, :1, 2 * k:2 * k + 2])[mv] * H; dr = (yt[:, :, 2 * k:2 * k + 2] - yt[:, :1, 2 * k:2 * k + 2])[mv] * H
+            fi, fr_ = di[:, -1], dr[:, -1]; big = fr_.norm(dim=-1) > 2.0                                        # séquences où l'objet a bougé > 2 px depuis l'image 8
+            cs = F.cosine_similarity(fi[big], fr_[big], dim=-1); amp = fi[big].norm(dim=-1) / fr_[big].norm(dim=-1)
+            return float((di - dr).norm(dim=-1).mean()), float(dr.norm(dim=-1).mean()), float(cs.mean()), float((cs > 0.5).float().mean() * 100), float(amp.median()), int(big.sum())
+        for nm_, k in (("objet", 0), ("main", 1)):
+            e, e0, cs, ok, amp, nb = mv_(pi, k); el, _, csl, okl, ampl, _ = mv_(pl, k)
+            print(f"      DÉPLACEMENT {nm_} depuis l'image 8 (même lecteur) : erreur {e:.2f} px (immobile {e0:.2f}, gestes d'un AUTRE {el:.2f}) | à la fin, "
+                  f"sur {nb} séq. où il a bougé > 2 px : bonne direction (cos > 0.5) {ok:.0f} % (autre {okl:.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}), "
+                  f"amplitude imaginée/réelle {amp:.2f} (autre {ampl:.2f})", flush=True)
         res.append((c.replace(".pt", "").replace("phase0_", ""), pi[show - ntr].numpy(), pl[show - ntr].numpy()))
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     # ---------- GIF : une colonne par modèle, même séquence
