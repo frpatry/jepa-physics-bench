@@ -71,7 +71,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0):
+               blind=False, circ=0.0, pause=True):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -254,7 +254,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     cb, dirv, spd = True, lastd, max(spd, 0.03); CIRC[i, t] = 1
                     if rng.random() < 0.3 or felt is None: mode, left = "direction", int(rng.integers(2, 6))   # il CONTINUE : il pousse
                     else: mode, rb, tgt = "retouche", int(rng.integers(1, 3)), felt + lastd * 0.04; left = rb + int(rng.integers(3, 6))   # il recule et y RETOURNE
-                if calm > 0 and not blind and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
+                if calm > 0 and not blind and pause and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
                     mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire
                 if cf["mobile"]:                                     # le ruban : le mobile suit le geste RÉEL (avec retard si test)
                     LINK[i, t] = mt == 0 or (mt == 2 and t < tcut)
