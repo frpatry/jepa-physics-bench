@@ -107,7 +107,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     POS = np.full((n, T, K, 2), np.nan, np.float32); ANG = np.full((n, T, K), np.nan, np.float32)
     SHAPE = -np.ones((n, K), np.int64); NOBJ = np.zeros(n, np.int64); IMP = np.zeros((n, T), bool); TSRC = np.zeros((n, T), np.int8)
     MOB = np.full((n, T, 2), np.nan, np.float32); LINK = np.zeros((n, T), bool); MTYPE = -np.ones(n, np.int64); VIS = np.zeros((n, T, K), bool)
-    PAR = np.full((n, T, 2), np.nan, np.float32); PCONT = np.zeros((n, T), bool)
+    PAR = np.full((n, T, 2), np.nan, np.float32); PCONT = np.zeros((n, T), bool); CIRC = np.zeros((n, T), np.int8)   # 1 = réaction circulaire déclenchée, 2 = rejoue sans contact
     win = np.hanning(SPF // a_sub).astype(np.float32); W = band_matrix(SPF // a_sub); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
         Rh = rng.uniform(*cf["hand"]); RH[i] = Rh; Lr = rng.uniform(*cf["reach"]) if cf["reach"] else None
@@ -165,7 +165,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if left <= 0:                                        # BABILLAGE (modes de v5)
                     left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"; cb = False
                     if circ > 0 and lastd is not None and rng.random() < 0.1:   # il rejoue un geste récent, SANS contact (rejouer ≠ contact)
-                        mode, dirv, rb = "rejoue", lastd, int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5)); spd = max(spd, 0.03)
+                        mode, dirv, rb = "rejoue", lastd, int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5)); spd = max(spd, 0.03); CIRC[i, t] = 2
                     elif N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
                     elif N > 0 and u_ < p_obj and not blind:            # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
                         k = rng.integers(N); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
@@ -251,7 +251,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 vact[t] = Hp - H0
                 if mode != "rejoue" and float(np.linalg.norm(CMD[i, t])) > 0.015: lastd = CMD[i, t] / float(np.linalg.norm(CMD[i, t]))
                 if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
-                    cb, dirv, spd = True, lastd, max(spd, 0.03)
+                    cb, dirv, spd = True, lastd, max(spd, 0.03); CIRC[i, t] = 1
                     if rng.random() < 0.3 or felt is None: mode, left = "direction", int(rng.integers(2, 6))   # il CONTINUE : il pousse
                     else: mode, rb, tgt = "retouche", int(rng.integers(1, 3)), felt + lastd * 0.04; left = rb + int(rng.integers(3, 6))   # il recule et y RETOURNE
                 if calm > 0 and not blind and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
@@ -281,7 +281,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         if cf["mobile"]: extra = extra + cont_sound(2 * hum * mspd / 0.03, MOB[i, :, 0], T, rng, "tinte", mf0)
         A[i] = render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, 1, IMP[i], extra)
     return dict(X=X, A=A, TOUCH=TOUCH, PROP=PROP, CMD=CMD, HAND=HAND, RH=RH, INVIEW=INVIEW, POS=POS, ANG=ANG, SHAPE=SHAPE,
-                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT)
+                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT, CIRC=CIRC)
 
 def baby_view(X, stage):
     """ce que le bébé VOIT à cette étape (numpy, pour les figures) : flou gaussien UNIFORME + gris + contraste réduit."""
