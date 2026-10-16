@@ -71,7 +71,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False):
+               blind=False, circ=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -93,7 +93,12 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     défaut (bougent seuls avec proba 3 % à calm 1) et s'arrêtent plus vite (frottement 0.008 avec proba calm).
     blocks (0..1) : part des séquences en MONDE DE BLOCS (option B) — les objets ne bougent QUE pendant qu'on les pousse (vitesse
     amortie ×0.25 par image : ils s'arrêtent dès que la main les lâche), au repos au départ, masse presque constante (0.8–1.25) :
-    le principe de contact (2.5 mois) avant l'élan et les glissades (plus tard)."""
+    le principe de contact (2.5 mois) avant l'élan et les glissades (plus tard).
+    circ (0..1) : RÉACTION CIRCULAIRE (Piaget, 4–8 mois ; idée user « babille puis des buts ») — quand SA main vient de toucher
+    quelque chose (il le SENT : toucher actif), avec proba circ il REFAIT son geste : soit il CONTINUE dans la même direction
+    (il pousse), soit il recule un peu puis REJOUE le même mouvement. La direction vient de SON propre geste, jamais de la position
+    de l'objet (pas de visée scriptée). Pour que « rejouer » ne trahisse pas le contact, il rejoue aussi parfois un geste récent
+    SANS contact (proba 0.1 à chaque changement de geste)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -153,12 +158,15 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             a_ = rng.uniform(0, 2 * math.pi); pu = np.array([math.cos(a_), math.sin(a_)], np.float32)     # direction de la poussée
             pwait, ppush, pspd = int(rng.integers(0, 4)), int(rng.integers(2, 5)), rng.uniform(0.03, 0.07); pmode = "attend"
         left, mode, spd, tgt, dirv = 0, "immobile", vmax, None, None
+        rb, cb, lastd = 0, False, None                               # réaction circulaire : pas de recul restants, geste rejoué en cours, dernière direction
         pg = 0.35 if stage == "0c" else 0.15                         # 0c : plus de gigotage (les coups de pied du mobile)
         for t in range(T):
             if t > 0:
                 if left <= 0:                                        # BABILLAGE (modes de v5)
-                    left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"
-                    if N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
+                    left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"; cb = False
+                    if circ > 0 and lastd is not None and rng.random() < 0.1:   # il rejoue un geste récent, SANS contact (rejouer ≠ contact)
+                        mode, dirv, rb = "rejoue", lastd, int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5)); spd = max(spd, 0.03)
+                    elif N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
                     elif N > 0 and u_ < p_obj and not blind:            # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
                         k = rng.integers(N); d = P[k] - Hp; tgt = P[k] + rng.uniform(0.0, 0.2) * d / (np.linalg.norm(d) + 1e-6)
                     else:
@@ -171,6 +179,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if mode == "immobile": a = rng.normal(0, 0.004, 2)
                 elif mode == "direction": a = spd * dirv + rng.normal(0, 0.015, 2)
                 elif mode == "gigote": a = rng.normal(0, 0.05, 2)
+                elif mode == "rejoue": a = spd * (-1.0 if rb > 0 else 1.0) * dirv + rng.normal(0, 0.015, 2); rb -= 1   # recule puis refait
                 else: d = tgt - Hp; a = spd * d / max(np.linalg.norm(d), spd) + rng.normal(0, 0.015, 2)
                 CMD[i, t] = np.clip(a, -vmax, vmax)
                 H0 = Hp.copy(); Hp = place(Hp + CMD[i, t])
@@ -236,6 +245,11 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     om *= 0.97 if fric < 0.003 else 0.9
                 if blk: V *= 0.25; om *= 0.5                         # bloc : il ne bouge que POUSSÉ
                 vact[t] = Hp - H0
+                if mode != "rejoue" and float(np.linalg.norm(CMD[i, t])) > 0.015: lastd = CMD[i, t] / float(np.linalg.norm(CMD[i, t]))
+                if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
+                    cb, dirv, spd = True, lastd, max(spd, 0.03)
+                    if rng.random() < 0.5: mode, left = "direction", int(rng.integers(2, 6))          # il CONTINUE : il pousse
+                    else: mode, rb = "rejoue", int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5))   # il recule et REFAIT le geste
                 if calm > 0 and not blind and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
                     mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire
                 if cf["mobile"]:                                     # le ruban : le mobile suit le geste RÉEL (avec retard si test)

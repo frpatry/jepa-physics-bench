@@ -451,6 +451,8 @@ def main():
                    "depuis la vue, l'ouïe, le bras) ; D9 (fut_share 0.7 seul) l'avait réduite à < 8 %% -> examen « contact vu mais pas senti » 8 %% (vs ~90 %%) ; ex. 0.15")
     p.add_argument("--blind", type=int, default=0, help="1 = JEU LIBRE : babillage AVEUGLE aux objets (aucun geste dirigé vers un objet, pas de pause "
                    "scriptée après un contact) ; c'est le monde qui décide s'il y a contact (contrôle 2026-10-15 : l'imagination lisait l'objet dans les gestes scriptés)")
+    p.add_argument("--circ", type=float, default=0.0, help="RÉACTION CIRCULAIRE (Piaget 4–8 mois) : après un contact SENTI, proba de REFAIRE son geste "
+                   "(continuer à pousser, ou reculer et rejouer) ; direction = son propre geste, jamais la position de l'objet ; rejoue aussi parfois sans contact")
     p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
                    "le SURPRENNENT encore (tirage ∝ erreur d'imagination actuelle) — explorer soi-même ce qui reste à explorer ; 1 = désactivée")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
@@ -480,7 +482,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
