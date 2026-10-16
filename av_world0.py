@@ -96,9 +96,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     le principe de contact (2.5 mois) avant l'élan et les glissades (plus tard).
     circ (0..1) : RÉACTION CIRCULAIRE (Piaget, 4–8 mois ; idée user « babille puis des buts ») — quand SA main vient de toucher
     quelque chose (il le SENT : toucher actif), avec proba circ il REFAIT son geste : soit il CONTINUE dans la même direction
-    (il pousse), soit il recule un peu puis REJOUE le même mouvement. La direction vient de SON propre geste, jamais de la position
-    de l'objet (pas de visée scriptée). Pour que « rejouer » ne trahisse pas le contact, il rejoue aussi parfois un geste récent
-    SANS contact (proba 0.1 à chaque changement de geste)."""
+    (il pousse, 30 %), soit il recule un peu puis RETOURNE là où il l'a SENTI (point de contact au moment du toucher, pas la position
+    actuelle de l'objet ; 70 %). Rejouer le geste seul ne suffit pas : l'objet a bougé (mesuré : contacts inchangés).
+    Pour que « rejouer » ne trahisse pas le contact, il rejoue aussi parfois un geste récent SANS contact (proba 0.1)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -158,7 +158,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             a_ = rng.uniform(0, 2 * math.pi); pu = np.array([math.cos(a_), math.sin(a_)], np.float32)     # direction de la poussée
             pwait, ppush, pspd = int(rng.integers(0, 4)), int(rng.integers(2, 5)), rng.uniform(0.03, 0.07); pmode = "attend"
         left, mode, spd, tgt, dirv = 0, "immobile", vmax, None, None
-        rb, cb, lastd = 0, False, None                               # réaction circulaire : pas de recul restants, geste rejoué en cours, dernière direction
+        rb, cb, lastd, felt = 0, False, None, None                               # réaction circulaire : pas de recul restants, geste rejoué en cours, dernière direction
         pg = 0.35 if stage == "0c" else 0.15                         # 0c : plus de gigotage (les coups de pied du mobile)
         for t in range(T):
             if t > 0:
@@ -180,6 +180,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 elif mode == "direction": a = spd * dirv + rng.normal(0, 0.015, 2)
                 elif mode == "gigote": a = rng.normal(0, 0.05, 2)
                 elif mode == "rejoue": a = spd * (-1.0 if rb > 0 else 1.0) * dirv + rng.normal(0, 0.015, 2); rb -= 1   # recule puis refait
+                elif mode == "retouche":                             # recule, puis retourne là où il a SENTI l'objet
+                    if rb > 0: a = -spd * dirv + rng.normal(0, 0.015, 2); rb -= 1
+                    else: d = tgt - Hp; a = spd * d / max(np.linalg.norm(d), spd) + rng.normal(0, 0.015, 2)
                 else: d = tgt - Hp; a = spd * d / max(np.linalg.norm(d), spd) + rng.normal(0, 0.015, 2)
                 CMD[i, t] = np.clip(a, -vmax, vmax)
                 H0 = Hp.copy(); Hp = place(Hp + CMD[i, t])
@@ -226,6 +229,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                             J = -2 * s_ * m[k] / (1 + m[k]); V[k] += J / m[k] * nv; om[k] += rng.normal(0, 0.1)
                             ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
                         TSRC[i, t] = max(TSRC[i, t], 1 if vh_n >= -vo_n else 2)  # qui est allé vers qui : moi (actif) / le monde (passif)
+                        if vh_n >= -vo_n: felt = (Hp + nv * (Rh + 0.6 * rc[k])).astype(np.float32)   # où il l'a SENTI (côté de sa main)
                         ov = lim - dist; w_ = m[k] / (1 + m[k])
                         Hp = place(Hp - nv * ov * w_); P[k] = np.clip(P[k] + nv * ov * (1 - w_), rc[k] - mg, 1 - rc[k] + mg)
                         TOUCH[i, t, 2 * side] += J; TOUCH[i, t, 2 * side + 1] = max(TOUCH[i, t, 2 * side + 1], w_)
@@ -248,8 +252,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if mode != "rejoue" and float(np.linalg.norm(CMD[i, t])) > 0.015: lastd = CMD[i, t] / float(np.linalg.norm(CMD[i, t]))
                 if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
                     cb, dirv, spd = True, lastd, max(spd, 0.03)
-                    if rng.random() < 0.5: mode, left = "direction", int(rng.integers(2, 6))          # il CONTINUE : il pousse
-                    else: mode, rb = "rejoue", int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5))   # il recule et REFAIT le geste
+                    if rng.random() < 0.3 or felt is None: mode, left = "direction", int(rng.integers(2, 6))   # il CONTINUE : il pousse
+                    else: mode, rb, tgt = "retouche", int(rng.integers(1, 3)), felt + lastd * 0.04; left = rb + int(rng.integers(3, 6))   # il recule et y RETOURNE
                 if calm > 0 and not blind and TSRC[i, t] == 1 and mode != "immobile" and rng.random() < 0.8 * calm:
                     mode, left = "immobile", int(rng.integers(3, 7))         # PAUSE POUR REGARDER ce qui vient de se produire
                 if cf["mobile"]:                                     # le ruban : le mobile suit le geste RÉEL (avec retard si test)
