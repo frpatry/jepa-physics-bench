@@ -7,17 +7,17 @@ Mêmes têtes apprises (80 % des séquences / 20 % test) qui devinent ce déplac
   A geste seul (repère bas)            B inertie : vitesse réelle de l'objet + geste
   C VRAI ÉTAT (main, objet, vitesse, forme) + geste (repère haut : la physique est apprenable)
   D PIXELS des images t-1, t + geste   E SA REPRÉSENTATION de l'image t (encodeur de contexte, images ≤ t) + geste
-et son IMAGINATION : F un lecteur de position appris sur les latents CIBLES réels (ce que l'imagination vise), appliqué à l'image t+1 IMAGINÉE (ses gestes / ceux d'un autre).
+et son IMAGINATION : G la même tête, SANS le geste, sur (image t, image t+1) — t+1 réelle (repère) ou IMAGINÉE (ses gestes / ceux d'un autre) :
+l'effet est-il DANS l'image imaginée ? (une tête apprise sur l'imaginé : les latents imaginés sont flous, un lecteur des latents réels s'y perd).
 Lecture : E ≈ C ≫ A, B -> l'info est là, c'est le prédicteur qui ne s'en sert pas ; E ≈ B -> la représentation ne la porte pas.
 
   python av_effect_diag.py --ckpts phase0_rD12_0e_60k.pt,phase0_rD9_0e_60k.pt
 """
-import argparse, copy, os, time
+import argparse, os, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from av_world0 import gen_world0
 import av_phase0
 from av_phase0 import baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, H
-from av_plan0 import LocalReader
 
 
 class Head(nn.Module):
@@ -108,42 +108,30 @@ def main():
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
         # (avec cases résumé, le contexte rend [cases | résumés] : les indices pt des cases restent valables)
-        tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()           # l'imagination vise les latents de l'encodeur CIBLE
-        Zt = torch.zeros(len(ev), npf, d, dtype=torch.half); Zi = torch.zeros_like(Zt); Zl = torch.zeros_like(Zt); Gt = torch.zeros_like(Zt); Gn = torch.zeros_like(Zt)
+        Zp = torch.zeros(len(ev), npf, d, dtype=torch.half); Zt = torch.zeros_like(Zp); Zn = torch.zeros_like(Zp); Zi = torch.zeros_like(Zp); Zl = torch.zeros_like(Zp)
         with torch.no_grad():
             for t in range(2, T - 1):
                 k_ = np.where(Tt == t)[0]
                 if not len(k_): continue
                 ci0 = torch.from_numpy(np.where(fr <= t)[0]).to(dev); cn0 = torch.from_numpy(np.where(fr <= t + 1)[0]).to(dev)
                 ti0 = torch.from_numpy(np.where((fr == t + 1) & (md == 0))[0]).to(dev)
-                pt = torch.from_numpy(np.searchsorted(ci0.cpu().numpy(), np.where((fr == t) & (md == 0))[0])).to(dev)
-                pn = torch.from_numpy(np.searchsorted(cn0.cpu().numpy(), np.where((fr == t + 1) & (md == 0))[0])).to(dev)
+                at = lambda c0, f_: torch.from_numpy(np.searchsorted(c0.cpu().numpy(), np.where((fr == f_) & (md == 0))[0])).to(dev)
+                pp, pt, pn = at(ci0, t - 1), at(ci0, t), at(cn0, t + 1)
                 for s_ in range(0, len(k_), 100):
                     kk = k_[s_:s_ + 100]; sl = torch.from_numpy(I[kk]); tok, cmd = to_tok0({k: x[sl] for k, x in b.items()}, ck["norm"], v, P, dev); B = len(tok)
                     ci, cn, ti = ci0.expand(B, -1), cn0.expand(B, -1), ti0.expand(B, -1)
                     g = lambda ix: torch.gather(tok, 1, ix.unsqueeze(-1).expand(-1, -1, tok.size(-1)))
-                    ctx = m.context(g(ci), ci); Zt[kk] = ctx[:, pt].half().cpu()
-                    z = F.layer_norm(tgt(tok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,)).view(B, -1, d)
-                    Gt[kk] = z[:, :nv].view(B, T, npf, d)[:, t].half().cpu(); Gn[kk] = z[:, :nv].view(B, T, npf, d)[:, t + 1].half().cpu()   # CIBLES réelles t, t+1
-                    ln = lambda q: F.layer_norm(q.float(), (d,)).view(B, npf, d).half().cpu()
-                    Zi[kk] = ln(m.pred(ctx, ti, cmd, ci))                                           # image t+1 IMAGINÉE, ses gestes
-                    Zl[kk] = ln(m.pred(ctx, ti, cmd.roll(1, 0), ci))                                # ... gestes d'un AUTRE
+                    ctx = m.context(g(ci), ci); Zp[kk] = ctx[:, pp].half().cpu(); Zt[kk] = ctx[:, pt].half().cpu()
+                    Zn[kk] = m.context(g(cn), cn)[:, pn].half().cpu()                                    # image t+1 RÉELLE (contexte ≤ t+1)
+                    Zi[kk] = m.pred(ctx, ti, cmd, ci).float().view(B, npf, d).half().cpu()                # image t+1 IMAGINÉE, ses gestes
+                    Zl[kk] = m.pred(ctx, ti, cmd.roll(1, 0), ci).float().view(B, npf, d).half().cpu()     # ... gestes d'un AUTRE
+        cat = lambda *Z: torch.cat(Z, -1)
         print(f"  {nm}", flush=True)
-        print(f"    E SA REPRÉSENTATION + geste: {score(fit(Zt, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
-        print(f"    sondes SA REPRÉSENTATION   : {probe(Zt, npf)}", flush=True)
-        # F : lecteur de position de l'objet appris sur les latents CIBLES réels (ce que l'imagination doit reproduire), images t et t+1
-        ix = tr.numpy(); Ztr = torch.cat([Gt[tr], Gn[tr]])
-        Ytr = torch.cat([torch.from_numpy(Po[I[ix], Tt[ix]]), torch.from_numpy(Po[I[ix], Tt[ix] + 1])]).float()
-        mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
-        torch.manual_seed(0); rd = LocalReader(d, npf, 2, mu=mu, sd=sd).to(dev); opt = torch.optim.AdamW(rd.parameters(), 3e-4, weight_decay=0.05)
-        for _ in range(4000):
-            bi = torch.randint(0, len(Ztr), (256,)); l = F.mse_loss(rd(Ztr[bi].to(dev)), ((Ytr[bi] - mu) / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
-        rd.eval()
-        with torch.no_grad():
-            rp = lambda Z: torch.cat([rd(Z[te[i:i + 512]].to(dev)).cpu() for i in range(0, len(te), 512)]) * sd + mu
-            p0 = rp(Gt)
-            for lab, Z in (("t+1 RÉELLE (lecteur)", Gn), ("IMAGINÉE, ses gestes", Zi), ("IMAGINÉE, gestes d'un AUTRE", Zl)):
-                print(f"    F {lab:28s}: {score((rp(Z) - p0) * H, yt, ht)}", flush=True)
+        print(f"    E SA REPRÉSENTATION (t-1, t) + geste : {score(fit(cat(Zp, Zt), c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
+        print(f"    sondes SA REPRÉSENTATION (t-1, t)    : {probe(cat(Zp, Zt), npf)}", flush=True)
+        # G : l'EFFET est-il dans l'image t+1 ? même tête, sans le geste, sur (t, t+1 réelle) / (t, t+1 imaginée avec ses gestes / ceux d'un autre)
+        for lab, Z in (("t+1 RÉELLE", Zn), ("t+1 IMAGINÉE, ses gestes", Zi), ("t+1 IMAGINÉE, gestes d'un AUTRE", Zl)):
+            print(f"    G (t, {lab:31s}) : {score(fit(cat(Zt, Z), z2, y, tr, te, dev, npf), yt, ht)}", flush=True)
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     print(f"total {time.time() - t0:.0f}s")
 
