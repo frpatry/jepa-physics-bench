@@ -71,7 +71,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True, echo=0.0):
+               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -104,7 +104,10 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     echo (0..1) : RÉMANENCE DU CONTACT (idée user) — un vrai bras qui frappe un objet VIBRE, et la sensation s'amortit sur quelques
     instants (un accéléromètre de poignet le verrait). Le CHOC dans le toucher et l'APPUI s'éteignent d'un facteur echo par image (au
     lieu de tomber à zéro d'un coup) ; le BRAS ressent un recul le long du contact qui oscille en s'amortissant (×−echo par image).
-    La physique est inchangée (seulement les sensations). Sans ça, un contact = 1–2 images de signal sur 16."""
+    La physique est inchangée (seulement les sensations). Sans ça, un contact = 1–2 images de signal sur 16.
+    damp (0..1) : FROTTEMENT D'UN JOUET SUR UNE TABLE (question user : « nos objets glissent-ils trop ? » — mesuré : 1 px pendant le
+    contact puis 10–20 px de glissade seule, une patinoire) — la vitesse des objets est multipliée par (1 − damp) à chaque image :
+    l'objet avance quand on le pousse et s'arrête peu après qu'on le lâche (principe de contact, 2–3 mois, avant l'élan)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -255,6 +258,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     v_ = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (v_ + 1e-9), 0, 1)
                     om *= 0.97 if fric < 0.003 else 0.9
                 if blk: V *= 0.25; om *= 0.5                         # bloc : il ne bouge que POUSSÉ
+                if damp > 0: V *= 1 - damp; om *= 1 - damp           # frottement d'une table : il s'arrête peu après qu'on le lâche
                 vact[t] = Hp - H0
                 if echo > 0:                                         # RÉMANENCE : la sensation du contact s'éteint doucement
                     tr_ = TOUCH[i, t - 1]

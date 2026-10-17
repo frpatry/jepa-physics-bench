@@ -457,6 +457,8 @@ def main():
                    "(--p_obj) restent : MÉLANGE visée / jeu libre")
     p.add_argument("--echo", type=float, default=0.0, help="RÉMANENCE DU CONTACT (idée user) : le choc et l'appui s'éteignent d'un facteur echo par image "
                    "dans le toucher, et le bras ressent un recul qui s'amortit (sensations seulement, physique inchangée)")
+    p.add_argument("--damp", type=float, default=0.0, help="FROTTEMENT (question user : les objets glissaient 10–20 px après une poussée de 1 px) : "
+                   "vitesse des objets ×(1 − damp) par image -> il avance quand on le pousse, s'arrête peu après")
     p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
                    "le SURPRENNENT encore (tirage ∝ erreur d'imagination actuelle) — explorer soi-même ce qui reste à explorer ; 1 = désactivée")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
@@ -486,7 +488,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
