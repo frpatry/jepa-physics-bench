@@ -108,13 +108,14 @@ def main():
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
         # (avec cases résumé, le contexte rend [cases | résumés] : les indices pt des cases restent valables)
-        Zp = torch.zeros(len(ev), npf, d, dtype=torch.half); Zt = torch.zeros_like(Zp); Zn = torch.zeros_like(Zp); Zi = torch.zeros_like(Zp); Zl = torch.zeros_like(Zp); Z0 = torch.zeros_like(Zp)
+        Zp = torch.zeros(len(ev), npf, d, dtype=torch.half); Zt = torch.zeros_like(Zp); Zn = torch.zeros_like(Zp); Zi = torch.zeros_like(Zp); Zl = torch.zeros_like(Zp); Z0 = torch.zeros_like(Zp); Ze = torch.zeros_like(Zp)
         with torch.no_grad():
             for t in range(2, T - 1):
                 k_ = np.where(Tt == t)[0]
                 if not len(k_): continue
                 ci0 = torch.from_numpy(np.where(fr <= t)[0]).to(dev); cn0 = torch.from_numpy(np.where(fr <= t + 1)[0]).to(dev)
                 ti0 = torch.from_numpy(np.where((fr == t + 1) & (md == 0))[0]).to(dev)
+                ce0 = torch.from_numpy(np.where((fr <= t) | ((fr == t + 1) & (md != 0)))[0]).to(dev)   # YEUX FERMÉS à t+1 : il sent et entend t+1
                 at = lambda c0, f_: torch.from_numpy(np.searchsorted(c0.cpu().numpy(), np.where((fr == f_) & (md == 0))[0])).to(dev)
                 pp, pt, pn = at(ci0, t - 1), at(ci0, t), at(cn0, t + 1)
                 for s_ in range(0, len(k_), 100):
@@ -128,12 +129,14 @@ def main():
                     c0 = cmd.clone(); c0[:, t + 1] = 0                                                     # biaisé -> on ne change QUE le geste t -> t+1
                     Zl[kk] = m.pred(ctx, ti, cl, ci).float().view(B, npf, d).half().cpu()                 # ... geste t->t+1 d'un AUTRE (passé intact)
                     Z0[kk] = m.pred(ctx, ti, c0, ci).float().view(B, npf, d).half().cpu()                 # ... « j'arrête » (aucun geste t->t+1)
+                    ce = ce0.expand(B, -1); Ze[kk] = m.pred(m.context(g(ce), ce), ti, cmd, ce).float().view(B, npf, d).half().cpu()   # ... yeux fermés
         cat = lambda *Z: torch.cat(Z, -1)
         print(f"  {nm}", flush=True)
         print(f"    E SA REPRÉSENTATION (t-1, t) + geste : {score(fit(cat(Zp, Zt), c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
         print(f"    sondes SA REPRÉSENTATION (t-1, t)    : {probe(cat(Zp, Zt), npf)}", flush=True)
         # G : l'EFFET est-il dans l'image t+1 ? même tête, sans le geste, sur (t, t+1 réelle) / (t, t+1 imaginée avec ses gestes / ceux d'un autre)
-        for lab, Z in (("t+1 RÉELLE", Zn), ("t+1 IMAGINÉE, ses gestes", Zi), ("t+1 IMAGINÉE, geste d'un AUTRE", Zl), ("t+1 IMAGINÉE, « j'arrête »", Z0)):
+        for lab, Z in (("t+1 RÉELLE", Zn), ("t+1 IMAGINÉE, ses gestes", Zi), ("t+1 IMAGINÉE, geste d'un AUTRE", Zl), ("t+1 IMAGINÉE, « j'arrête »", Z0),
+                       ("t+1 YEUX FERMÉS (sent+entend t+1)", Ze)):
             print(f"    G (t, {lab:31s}) : {score(fit(cat(Zt, Z), z2, y, tr, te, dev, npf), yt, ht)}", flush=True)
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     print(f"total {time.time() - t0:.0f}s")

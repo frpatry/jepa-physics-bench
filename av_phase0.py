@@ -283,17 +283,22 @@ class Stream:
         while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0):
+def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eyes_share=0.0):
     """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
-    « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes)."""
+    « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes).
+    eyes_share : part de la devinette « YEUX FERMÉS » (idée user) — il voit jusqu'à t0 puis plus rien, mais continue de SENTIR
+    (toucher, bras) et d'ENTENDRE ; il doit imaginer ce qu'il VERRA en rouvrant les yeux -> obligé de se servir du toucher et du son."""
     md, fr = layout(nv, nP * nP); N = len(md); pairs = []
     for _ in range(n_masks):
         if fut_share > 0:                                            # IMAGINER LA SUITE domine ; « DEVINE CE QUE TU SENS » garde sa part (touch_share)
             r_ = rng.random()
-            st = "future" if r_ < fut_share else "touch" if r_ < fut_share + touch_share else rng.choice(["tube", "vblock", "cross"] + ([] if touch_share > 0 else ["touch"] * touch))
+            st = "future" if r_ < fut_share else "touch" if r_ < fut_share + touch_share else "eyes" if r_ < fut_share + touch_share + eyes_share \
+                else rng.choice(["tube", "vblock", "cross"] + ([] if touch_share > 0 else ["touch"] * touch))
         else: st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch)
         tg = np.zeros((B, N), bool)
         if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
+        if st == "eyes":                                             # YEUX FERMÉS après t0 : il sent et entend tout, il imagine ce qu'il verra
+            t0 = rng.integers(3, T - 3); tg[:] = (md == 0) & (fr > t0); pairs.append((~tg, tg)); continue
         if st == "future":                                           # IMAGINER : tous les sens après t0, avec les gestes prévus
             t0 = rng.integers(3, T - 2); pairs.append((np.broadcast_to(fr <= t0, (B, N)).copy(), np.broadcast_to(fr > t0, (B, N)).copy())); continue
         if st == "tube": tg[:, :nv] = tube_masks(B, T, nP, 0.5, 1, rng)[0].numpy()
@@ -459,6 +464,8 @@ def main():
                    "dans le toucher, et le bras ressent un recul qui s'amortit (sensations seulement, physique inchangée)")
     p.add_argument("--damp", type=float, default=0.0, help="FROTTEMENT (question user : les objets glissaient 10–20 px après une poussée de 1 px) : "
                    "vitesse des objets ×(1 − damp) par image -> il avance quand on le pousse, s'arrête peu après")
+    p.add_argument("--eyes_share", type=float, default=0.0, help="avec --fut_share : part de la devinette « YEUX FERMÉS » (idée user) : il voit jusqu'à t0, "
+                   "puis sent (toucher, bras) et entend sans voir, et doit imaginer ce qu'il verra en rouvrant les yeux")
     p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
                    "le SURPRENNENT encore (tirage ∝ erreur d'imagination actuelle) — explorer soi-même ce qui reste à explorer ; 1 = désactivée")
     p.add_argument("--reg_frame", type=int, default=0, help="1 = cases résumé PAR IMAGE (--regs par image, avec son temps ; chacune ne lit que son image) "
@@ -549,7 +556,7 @@ def main():
             cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
             bt_ = {k: x[pick] for k, x in bt_.items()}
         tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share); full = torch.arange(N, device=dev).expand(B, -1)
+        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad():
