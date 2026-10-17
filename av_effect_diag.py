@@ -1,0 +1,135 @@
+"""
+DIAGNOSTIC DU VERROU « l'effet de MES gestes sur l'objet » (instrument seulement — le bébé n'apprend rien ici).
+Question : l'information nécessaire est-elle DANS sa représentation ? Et son imagination s'en sert-elle ?
+Cas étudiés : images t (monde à 1 objet, gestes AVEUGLES = contrôle sans fuite) où SA MAIN est PRÈS de l'objet ; à t+1 il le touche
+ou le rate selon où va le geste. Cible = déplacement de l'objet entre t et t+1 (px).
+Mêmes têtes apprises (80 % des séquences / 20 % test) qui devinent ce déplacement à partir de :
+  A geste seul (repère bas)            B inertie : vitesse réelle de l'objet + geste
+  C VRAI ÉTAT (main, objet, vitesse, forme) + geste (repère haut : la physique est apprenable)
+  D PIXELS des images t-1, t + geste   E SA REPRÉSENTATION de l'image t (encodeur de contexte, images ≤ t) + geste
+et son IMAGINATION : F un lecteur de position appris sur ses latents RÉELS, appliqué à l'image t+1 IMAGINÉE (ses gestes / ceux d'un autre).
+Lecture : E ≈ C ≫ A, B -> l'info est là, c'est le prédicteur qui ne s'en sert pas ; E ≈ B -> la représentation ne la porte pas.
+
+  python av_effect_diag.py --ckpts phase0_rD12_0e_60k.pt,phase0_rD9_0e_60k.pt
+"""
+import argparse, os, time
+import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
+from av_world0 import gen_world0
+import av_phase0
+from av_phase0 import baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, H
+from av_plan0 import LocalReader
+
+
+class Head(nn.Module):
+    """tête commune : par case (latent ou pixels) -> 16 nombres, mis bout à bout avec le geste -> déplacement (2)."""
+    def __init__(s, din, ncell, ncmd=2, h=256):
+        super().__init__(); s.cell = nn.Linear(din, 16) if ncell else None
+        s.mlp = nn.Sequential(nn.Linear(16 * ncell + din * (ncell == 0) + ncmd, h), nn.GELU(), nn.Linear(h, h), nn.GELU(), nn.Linear(h, 2))
+    def forward(s, x, c):
+        x = s.cell(x.float()).flatten(1) if s.cell is not None else x.float()
+        return s.mlp(torch.cat([x, c.float()], -1))
+
+
+def fit(x, c, y, tr, te, dev, ncell, steps=4000):
+    """apprend une tête sur tr, rend la prédiction sur te (déplacements en px)."""
+    torch.manual_seed(0); din = x.shape[-1]; hd = Head(din, ncell).to(dev); opt = torch.optim.AdamW(hd.parameters(), 1e-3, weight_decay=0.05)
+    sd = y[tr].std(0) + 1e-3
+    for _ in range(steps):
+        b = tr[torch.randint(0, len(tr), (256,))]
+        l = F.mse_loss(hd(x[b].to(dev), c[b].to(dev)), (y[b] / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
+    hd.eval()
+    with torch.no_grad(): return torch.cat([hd(x[te[i:i + 512]].to(dev), c[te[i:i + 512]].to(dev)).cpu() for i in range(0, len(te), 512)]) * sd
+
+
+def score(p, y, hit):
+    """R² global ; sur les CONTACTS (objet bougé > 1 px) : bonne direction (cos > 0.5) et amplitude ; sur les RATÉS : mouvement inventé."""
+    r2 = float(1 - ((p - y) ** 2).sum() / ((y - y.mean(0)) ** 2).sum())
+    cs = F.cosine_similarity(p[hit], y[hit], dim=-1); amp = (p[hit].norm(dim=-1) / y[hit].norm(dim=-1)).median()
+    miss = ~hit & (y.norm(dim=-1) < 0.3)
+    return f"R² {r2:+.2f} | contacts : bonne direction {float((cs > 0.5).float().mean()) * 100:3.0f} %, cos {float(cs.mean()):+.2f}, amplitude {float(amp):.2f} " \
+           f"| ratés : mouvement inventé {float(p[miss].norm(dim=-1).mean()):.2f} px"
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--ckpts", required=True); p.add_argument("--dir", default="/content/drive/MyDrive/jepa_runs")
+    p.add_argument("--n", type=int, default=12000); p.add_argument("--near", type=float, default=0.25)
+    a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
+    names = [c.strip() for c in a.ckpts.split(",")]
+    cks = [torch.load(os.path.join(a.dir, c), map_location=dev, weights_only=False) for c in names]
+    cfg0 = cks[0]["cfg"]; T = int(cfg0.get("T", 16)); av_phase0.T = T; P = cfg0["P"]; nP = H // P; npf = nP * nP; nv = T * npf; v = VIEW["0e"]
+    wkw = {**cfg0.get("wkw", {}), "p_parent": 0.0, "blind": True, "calm": 0.3}; wkw.pop("circ", None); wkw.pop("pause", None)
+    w = gen_world0(a.n, "0e", T, H, seed=5151, **wkw)
+    keep = np.where(w["NOBJ"] == 1)[0]; n = len(keep)
+    Po, Hd = w["POS"][keep, :, 0], w["HAND"][keep]; TS = w["TSRC"][keep]; CMD = w["CMD"][keep]; RH = w["RH"][keep]; SH = w["SHAPE"][keep, 0]
+    inv = ((Po > 0.06) & (Po < 0.94)).all(-1)
+    ev = [(i, t) for i in range(n) for t in range(2, T - 1)
+          if inv[i, t] and inv[i, t + 1] and np.linalg.norm(Po[i, t] - Hd[i, t]) < a.near]
+    ev = np.array(ev); I, Tt = ev[:, 0], ev[:, 1]
+    y = torch.from_numpy((Po[I, Tt + 1] - Po[I, Tt]) * H).float()
+    hit = torch.from_numpy(TS[I, Tt + 1] == 1) & (y.norm(dim=-1) > 1.0)          # il le TOUCHE et l'objet bouge > 1 px
+    c = torch.from_numpy(CMD[I, Tt + 1] / 0.05).float()                      # le geste qui mène de t à t+1
+    tr_seq = I < int(0.8 * n); tr, te = torch.from_numpy(np.where(tr_seq)[0]), torch.from_numpy(np.where(~tr_seq)[0])
+    print(f"{n} séquences à 1 objet, {len(ev)} cas « main près de l'objet » (test {len(te)}, dont contacts qui le font bouger : "
+          f"{int(hit[te].sum())}) ; déplacement moyen au contact {float(y[hit].norm(dim=-1).mean()):.2f} px | {time.time() - t0:.0f}s", flush=True)
+    yt, ht = y[te], hit[te]
+    vel = torch.from_numpy((Po[I, Tt] - Po[I, Tt - 1]) * H).float()
+    sh = F.one_hot(torch.from_numpy(SH[I]).clamp_min(0), 4).float()
+    truth = torch.cat([torch.from_numpy(Hd[I, Tt]).float(), torch.from_numpy(Po[I, Tt]).float(), torch.from_numpy(Po[I, Tt] - Hd[I, Tt]).float() * 4,
+                       vel, torch.from_numpy(RH[I])[:, None].float() * 10, sh], -1)
+    zero = torch.zeros(len(ev), 1)
+    print(f"  A geste seul               : {score(fit(zero, c, y, tr, te, dev, 0), yt, ht)}", flush=True)
+    print(f"  B inertie + geste          : {score(fit(vel, c, y, tr, te, dev, 0), yt, ht)}", flush=True)
+    print(f"  C VRAI ÉTAT + geste        : {score(fit(truth, c, y, tr, te, dev, 0), yt, ht)}", flush=True)
+    b = to_torch(to_np([{k: w[k][keep] for k in ("X", "A", "TOUCH", "PROP", "CMD")}]))
+    md, fr = layout(nv, npf)
+    with torch.no_grad():                                                    # pixels des cases (images t-1 et t), vue du bébé
+        pix = []
+        for s_ in range(0, len(ev), 200):
+            sl = torch.from_numpy(I[s_:s_ + 200]); tok, _ = to_tok0({k: x[sl] for k, x in b.items()}, cks[0]["norm"], v, P, dev)
+            vis = tok[:, :nv, :P * P * 3].view(len(sl), T, npf, -1); tt = torch.from_numpy(Tt[s_:s_ + 200]).to(dev)
+            pix.append(torch.cat([vis[torch.arange(len(sl)), tt - 1], vis[torch.arange(len(sl)), tt]], -1).half().cpu())
+        pix = torch.cat(pix)
+    print(f"  D PIXELS (t-1, t) + geste  : {score(fit(pix, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
+    del pix
+    for nm, ck in zip(names, cks):
+        cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
+        assert not m.enc.nreg, "diagnostic écrit pour un œil sans cases résumé"
+        Zt = torch.zeros(len(ev), npf, d, dtype=torch.half); Zn = torch.zeros_like(Zt); Zi = torch.zeros_like(Zt); Zl = torch.zeros_like(Zt)
+        with torch.no_grad():
+            for t in range(2, T - 1):
+                k_ = np.where(Tt == t)[0]
+                if not len(k_): continue
+                ci0 = torch.from_numpy(np.where(fr <= t)[0]).to(dev); cn0 = torch.from_numpy(np.where(fr <= t + 1)[0]).to(dev)
+                ti0 = torch.from_numpy(np.where((fr == t + 1) & (md == 0))[0]).to(dev)
+                pt = torch.from_numpy(np.searchsorted(ci0.cpu().numpy(), np.where((fr == t) & (md == 0))[0])).to(dev)
+                pn = torch.from_numpy(np.searchsorted(cn0.cpu().numpy(), np.where((fr == t + 1) & (md == 0))[0])).to(dev)
+                for s_ in range(0, len(k_), 100):
+                    kk = k_[s_:s_ + 100]; sl = torch.from_numpy(I[kk]); tok, cmd = to_tok0({k: x[sl] for k, x in b.items()}, ck["norm"], v, P, dev); B = len(tok)
+                    ci, cn, ti = ci0.expand(B, -1), cn0.expand(B, -1), ti0.expand(B, -1)
+                    g = lambda ix: torch.gather(tok, 1, ix.unsqueeze(-1).expand(-1, -1, tok.size(-1)))
+                    ctx = m.context(g(ci), ci); Zt[kk] = ctx[:, pt].half().cpu()
+                    Zn[kk] = m.context(g(cn), cn)[:, pn].half().cpu()                              # image t+1 RÉELLE (contexte ≤ t+1)
+                    Zi[kk] = m.pred(ctx, ti, cmd, ci).float().view(B, npf, d).half().cpu()          # image t+1 IMAGINÉE, ses gestes
+                    Zl[kk] = m.pred(ctx, ti, cmd.roll(1, 0), ci).float().view(B, npf, d).half().cpu()   # ... gestes d'un AUTRE
+        print(f"  {nm}", flush=True)
+        print(f"    E SA REPRÉSENTATION + geste: {score(fit(Zt, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
+        # F : lecteur de position de l'objet appris sur ses latents RÉELS (images t et t+1 des séquences d'entraînement)
+        ix = tr.numpy(); Ztr = torch.cat([Zt[tr], Zn[tr]])
+        Ytr = torch.cat([torch.from_numpy(Po[I[ix], Tt[ix]]), torch.from_numpy(Po[I[ix], Tt[ix] + 1])]).float()
+        mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
+        torch.manual_seed(0); rd = LocalReader(d, npf, 2, mu=mu, sd=sd).to(dev); opt = torch.optim.AdamW(rd.parameters(), 3e-4, weight_decay=0.05)
+        for _ in range(4000):
+            bi = torch.randint(0, len(Ztr), (256,)); l = F.mse_loss(rd(Ztr[bi].to(dev)), ((Ytr[bi] - mu) / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
+        rd.eval()
+        with torch.no_grad():
+            rp = lambda Z: torch.cat([rd(Z[te[i:i + 512]].to(dev)).cpu() for i in range(0, len(te), 512)]) * sd + mu
+            p0 = rp(Zt)
+            for lab, Z in (("t+1 RÉELLE (lecteur)", Zn), ("IMAGINÉE, ses gestes", Zi), ("IMAGINÉE, gestes d'un AUTRE", Zl)):
+                print(f"    F {lab:28s}: {score((rp(Z) - p0) * H, yt, ht)}", flush=True)
+        del m; torch.cuda.empty_cache() if dev == "cuda" else None
+    print(f"total {time.time() - t0:.0f}s")
+
+
+if __name__ == "__main__":
+    main()
