@@ -7,12 +7,12 @@ Mêmes têtes apprises (80 % des séquences / 20 % test) qui devinent ce déplac
   A geste seul (repère bas)            B inertie : vitesse réelle de l'objet + geste
   C VRAI ÉTAT (main, objet, vitesse, forme) + geste (repère haut : la physique est apprenable)
   D PIXELS des images t-1, t + geste   E SA REPRÉSENTATION de l'image t (encodeur de contexte, images ≤ t) + geste
-et son IMAGINATION : F un lecteur de position appris sur ses latents RÉELS, appliqué à l'image t+1 IMAGINÉE (ses gestes / ceux d'un autre).
+et son IMAGINATION : F un lecteur de position appris sur les latents CIBLES réels (ce que l'imagination vise), appliqué à l'image t+1 IMAGINÉE (ses gestes / ceux d'un autre).
 Lecture : E ≈ C ≫ A, B -> l'info est là, c'est le prédicteur qui ne s'en sert pas ; E ≈ B -> la représentation ne la porte pas.
 
   python av_effect_diag.py --ckpts phase0_rD12_0e_60k.pt,phase0_rD9_0e_60k.pt
 """
-import argparse, os, time
+import argparse, copy, os, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from av_world0 import gen_world0
 import av_phase0
@@ -95,7 +95,8 @@ def main():
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
         assert not m.enc.nreg, "diagnostic écrit pour un œil sans cases résumé"
-        Zt = torch.zeros(len(ev), npf, d, dtype=torch.half); Zn = torch.zeros_like(Zt); Zi = torch.zeros_like(Zt); Zl = torch.zeros_like(Zt)
+        tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()           # l'imagination vise les latents de l'encodeur CIBLE
+        Zt = torch.zeros(len(ev), npf, d, dtype=torch.half); Zi = torch.zeros_like(Zt); Zl = torch.zeros_like(Zt); Gt = torch.zeros_like(Zt); Gn = torch.zeros_like(Zt)
         with torch.no_grad():
             for t in range(2, T - 1):
                 k_ = np.where(Tt == t)[0]
@@ -109,13 +110,15 @@ def main():
                     ci, cn, ti = ci0.expand(B, -1), cn0.expand(B, -1), ti0.expand(B, -1)
                     g = lambda ix: torch.gather(tok, 1, ix.unsqueeze(-1).expand(-1, -1, tok.size(-1)))
                     ctx = m.context(g(ci), ci); Zt[kk] = ctx[:, pt].half().cpu()
-                    Zn[kk] = m.context(g(cn), cn)[:, pn].half().cpu()                              # image t+1 RÉELLE (contexte ≤ t+1)
-                    Zi[kk] = m.pred(ctx, ti, cmd, ci).float().view(B, npf, d).half().cpu()          # image t+1 IMAGINÉE, ses gestes
-                    Zl[kk] = m.pred(ctx, ti, cmd.roll(1, 0), ci).float().view(B, npf, d).half().cpu()   # ... gestes d'un AUTRE
+                    z = F.layer_norm(tgt(tok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,)).view(B, -1, d)
+                    Gt[kk] = z[:, :nv].view(B, T, npf, d)[:, t].half().cpu(); Gn[kk] = z[:, :nv].view(B, T, npf, d)[:, t + 1].half().cpu()   # CIBLES réelles t, t+1
+                    ln = lambda q: F.layer_norm(q.float(), (d,)).view(B, npf, d).half().cpu()
+                    Zi[kk] = ln(m.pred(ctx, ti, cmd, ci))                                           # image t+1 IMAGINÉE, ses gestes
+                    Zl[kk] = ln(m.pred(ctx, ti, cmd.roll(1, 0), ci))                                # ... gestes d'un AUTRE
         print(f"  {nm}", flush=True)
         print(f"    E SA REPRÉSENTATION + geste: {score(fit(Zt, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
-        # F : lecteur de position de l'objet appris sur ses latents RÉELS (images t et t+1 des séquences d'entraînement)
-        ix = tr.numpy(); Ztr = torch.cat([Zt[tr], Zn[tr]])
+        # F : lecteur de position de l'objet appris sur les latents CIBLES réels (ce que l'imagination doit reproduire), images t et t+1
+        ix = tr.numpy(); Ztr = torch.cat([Gt[tr], Gn[tr]])
         Ytr = torch.cat([torch.from_numpy(Po[I[ix], Tt[ix]]), torch.from_numpy(Po[I[ix], Tt[ix] + 1])]).float()
         mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
         torch.manual_seed(0); rd = LocalReader(d, npf, 2, mu=mu, sd=sd).to(dev); opt = torch.optim.AdamW(rd.parameters(), 3e-4, weight_decay=0.05)
@@ -124,8 +127,8 @@ def main():
         rd.eval()
         with torch.no_grad():
             rp = lambda Z: torch.cat([rd(Z[te[i:i + 512]].to(dev)).cpu() for i in range(0, len(te), 512)]) * sd + mu
-            p0 = rp(Zt)
-            for lab, Z in (("t+1 RÉELLE (lecteur)", Zn), ("IMAGINÉE, ses gestes", Zi), ("IMAGINÉE, gestes d'un AUTRE", Zl)):
+            p0 = rp(Gt)
+            for lab, Z in (("t+1 RÉELLE (lecteur)", Gn), ("IMAGINÉE, ses gestes", Zi), ("IMAGINÉE, gestes d'un AUTRE", Zl)):
                 print(f"    F {lab:28s}: {score((rp(Z) - p0) * H, yt, ht)}", flush=True)
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     print(f"total {time.time() - t0:.0f}s")
