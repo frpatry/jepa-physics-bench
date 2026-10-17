@@ -94,7 +94,7 @@ def main():
     del pix
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
-        assert not m.enc.nreg, "diagnostic écrit pour un œil sans cases résumé"
+        # (avec cases résumé, le contexte rend [cases | résumés] : les indices pt des cases restent valables)
         tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()           # l'imagination vise les latents de l'encodeur CIBLE
         Zt = torch.zeros(len(ev), npf, d, dtype=torch.half); Zi = torch.zeros_like(Zt); Zl = torch.zeros_like(Zt); Gt = torch.zeros_like(Zt); Gn = torch.zeros_like(Zt)
         with torch.no_grad():
