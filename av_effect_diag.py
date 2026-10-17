@@ -30,15 +30,22 @@ class Head(nn.Module):
         return s.mlp(torch.cat([x, c.float()], -1))
 
 
-def fit(x, c, y, tr, te, dev, ncell, steps=4000):
-    """apprend une tête sur tr, rend la prédiction sur te (déplacements en px)."""
+def fit(x, c, y, tr, te, dev, ncell, steps=6000):
+    """apprend une tête sur tr (10 % gardés pour ARRÊTER AU BON MOMENT : pas de sur-apprentissage qui avantagerait une source),
+    rend la prédiction sur te."""
     torch.manual_seed(0); din = x.shape[-1]; hd = Head(din, ncell).to(dev); opt = torch.optim.AdamW(hd.parameters(), 1e-3, weight_decay=0.05)
-    sd = y[tr].std(0) + 1e-3
-    for _ in range(steps):
-        b = tr[torch.randint(0, len(tr), (256,))]
+    sd = y[tr].std(0) + 1e-3; va, tr = tr[: len(tr) // 10], tr[len(tr) // 10:]
+    pr = lambda ix: torch.cat([hd(x[ix[i:i + 512]].to(dev), c[ix[i:i + 512]].to(dev)).cpu() for i in range(0, len(ix), 512)]) * sd
+    best, state = 1e9, None
+    for it in range(steps):
+        hd.train(); b = tr[torch.randint(0, len(tr), (256,))]
         l = F.mse_loss(hd(x[b].to(dev), c[b].to(dev)), (y[b] / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
-    hd.eval()
-    with torch.no_grad(): return torch.cat([hd(x[te[i:i + 512]].to(dev), c[te[i:i + 512]].to(dev)).cpu() for i in range(0, len(te), 512)]) * sd
+        if (it + 1) % 250 == 0:
+            hd.eval()
+            with torch.no_grad(): e = float(((pr(va) - y[va]) ** 2).mean())
+            if e < best: best, state = e, {k: v.clone() for k, v in hd.state_dict().items()}
+    hd.load_state_dict(state); hd.eval()
+    with torch.no_grad(): return pr(te)
 
 
 def score(p, y, hit):
@@ -70,6 +77,7 @@ def main():
     hit = torch.from_numpy(TS[I, Tt + 1] == 1) & (y.norm(dim=-1) > 1.0)          # il le TOUCHE et l'objet bouge > 1 px
     c = torch.from_numpy(CMD[I, Tt + 1] / 0.05).float()                      # le geste qui mène de t à t+1
     tr_seq = I < int(0.8 * n); tr, te = torch.from_numpy(np.where(tr_seq)[0]), torch.from_numpy(np.where(~tr_seq)[0])
+    tr = tr[np.argsort(I[tr.numpy()] % 10, kind="stable")]                       # 10 % des SÉQUENCES d'entraînement en tête = validation
     print(f"{n} séquences à 1 objet, {len(ev)} cas « main près de l'objet » (test {len(te)}, dont contacts qui le font bouger : "
           f"{int(hit[te].sum())}) ; déplacement moyen au contact {float(y[hit].norm(dim=-1).mean()):.2f} px | {time.time() - t0:.0f}s", flush=True)
     yt, ht = y[te], hit[te]
@@ -91,6 +99,11 @@ def main():
             pix.append(torch.cat([vis[torch.arange(len(sl)), tt - 1], vis[torch.arange(len(sl)), tt]], -1).half().cpu())
         pix = torch.cat(pix)
     print(f"  D PIXELS (t-1, t) + geste  : {score(fit(pix, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
+    rel = torch.from_numpy((Po[I, Tt] - Hd[I, Tt]) * H).float()
+    r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean(0)) ** 2).sum())
+    z2 = torch.zeros(len(ev), 2)
+    probe = lambda X_, nc: f"élan de l'objet R² {r2(fit(X_, z2, vel, tr, te, dev, nc), vel[te]):+.2f} | objet − main R² {r2(fit(X_, z2, rel, tr, te, dev, nc), rel[te]):+.2f}"
+    print(f"    sondes PIXELS              : {probe(pix, npf)}", flush=True)
     del pix
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
@@ -117,6 +130,7 @@ def main():
                     Zl[kk] = ln(m.pred(ctx, ti, cmd.roll(1, 0), ci))                                # ... gestes d'un AUTRE
         print(f"  {nm}", flush=True)
         print(f"    E SA REPRÉSENTATION + geste: {score(fit(Zt, c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
+        print(f"    sondes SA REPRÉSENTATION   : {probe(Zt, npf)}", flush=True)
         # F : lecteur de position de l'objet appris sur les latents CIBLES réels (ce que l'imagination doit reproduire), images t et t+1
         ix = tr.numpy(); Ztr = torch.cat([Gt[tr], Gn[tr]])
         Ytr = torch.cat([torch.from_numpy(Po[I[ix], Tt[ix]]), torch.from_numpy(Po[I[ix], Tt[ix] + 1])]).float()
