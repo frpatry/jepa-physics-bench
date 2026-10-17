@@ -108,7 +108,7 @@ def main():
     for nm, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
         # (avec cases résumé, le contexte rend [cases | résumés] : les indices pt des cases restent valables)
-        Zp = torch.zeros(len(ev), npf, d, dtype=torch.half); Zt = torch.zeros_like(Zp); Zn = torch.zeros_like(Zp); Zi = torch.zeros_like(Zp); Zl = torch.zeros_like(Zp)
+        Zp = torch.zeros(len(ev), npf, d, dtype=torch.half); Zt = torch.zeros_like(Zp); Zn = torch.zeros_like(Zp); Zi = torch.zeros_like(Zp); Zl = torch.zeros_like(Zp); Z0 = torch.zeros_like(Zp)
         with torch.no_grad():
             for t in range(2, T - 1):
                 k_ = np.where(Tt == t)[0]
@@ -124,13 +124,16 @@ def main():
                     ctx = m.context(g(ci), ci); Zp[kk] = ctx[:, pp].half().cpu(); Zt[kk] = ctx[:, pt].half().cpu()
                     Zn[kk] = m.context(g(cn), cn)[:, pn].half().cpu()                                    # image t+1 RÉELLE (contexte ≤ t+1)
                     Zi[kk] = m.pred(ctx, ti, cmd, ci).float().view(B, npf, d).half().cpu()                # image t+1 IMAGINÉE, ses gestes
-                    Zl[kk] = m.pred(ctx, ti, cmd.roll(1, 0), ci).float().view(B, npf, d).half().cpu()     # ... gestes d'un AUTRE
+                    cl = cmd.clone(); cl[:, t + 1] = cmd.roll(1, 0)[:, t + 1]                            # remarque user : le témoin ne doit pas être
+                    c0 = cmd.clone(); c0[:, t + 1] = 0                                                     # biaisé -> on ne change QUE le geste t -> t+1
+                    Zl[kk] = m.pred(ctx, ti, cl, ci).float().view(B, npf, d).half().cpu()                 # ... geste t->t+1 d'un AUTRE (passé intact)
+                    Z0[kk] = m.pred(ctx, ti, c0, ci).float().view(B, npf, d).half().cpu()                 # ... « j'arrête » (aucun geste t->t+1)
         cat = lambda *Z: torch.cat(Z, -1)
         print(f"  {nm}", flush=True)
         print(f"    E SA REPRÉSENTATION (t-1, t) + geste : {score(fit(cat(Zp, Zt), c, y, tr, te, dev, npf), yt, ht)} | {time.time() - t0:.0f}s", flush=True)
         print(f"    sondes SA REPRÉSENTATION (t-1, t)    : {probe(cat(Zp, Zt), npf)}", flush=True)
         # G : l'EFFET est-il dans l'image t+1 ? même tête, sans le geste, sur (t, t+1 réelle) / (t, t+1 imaginée avec ses gestes / ceux d'un autre)
-        for lab, Z in (("t+1 RÉELLE", Zn), ("t+1 IMAGINÉE, ses gestes", Zi), ("t+1 IMAGINÉE, gestes d'un AUTRE", Zl)):
+        for lab, Z in (("t+1 RÉELLE", Zn), ("t+1 IMAGINÉE, ses gestes", Zi), ("t+1 IMAGINÉE, geste d'un AUTRE", Zl), ("t+1 IMAGINÉE, « j'arrête »", Z0)):
             print(f"    G (t, {lab:31s}) : {score(fit(cat(Zt, Z), z2, y, tr, te, dev, npf), yt, ht)}", flush=True)
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     print(f"total {time.time() - t0:.0f}s")

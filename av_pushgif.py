@@ -52,7 +52,7 @@ def main():
             out = []
             for i in range(0, len(idx), 50):
                 sl = torch.from_numpy(idx[i:i + 50]); tok, cmd = to_tok0({k: x[sl] for k, x in b.items()}, ck["norm"], v, P, dev); B = len(tok)
-                if lie: cmd = cmd.roll(1, 0)
+                if lie: cmd = torch.cat([cmd[:, :h], cmd.roll(1, 0)[:, h:]], 1)   # gestes d'un AUTRE seulement sur les images IMAGINÉES (passé cohérent avec ce qu'il a vu)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
                 ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
                 out.append(m.pred(ctx, ti, cmd, ci).float().view(B, nf, npf, d).cpu())
