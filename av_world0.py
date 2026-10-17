@@ -71,7 +71,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True):
+               blind=False, circ=0.0, pause=True, echo=0.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -98,7 +98,13 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     quelque chose (il le SENT : toucher actif), avec proba circ il REFAIT son geste : soit il CONTINUE dans la même direction
     (il pousse, 30 %), soit il recule un peu puis RETOURNE là où il l'a SENTI (point de contact au moment du toucher, pas la position
     actuelle de l'objet ; 70 %). Rejouer le geste seul ne suffit pas : l'objet a bougé (mesuré : contacts inchangés).
-    Pour que « rejouer » ne trahisse pas le contact, il rejoue aussi parfois un geste récent SANS contact (proba 0.1)."""
+    Pour que « rejouer » ne trahisse pas le contact, il rejoue aussi parfois un geste récent SANS contact (proba 0.1).
+    pause=False : pas de « pause pour regarder » scriptée après un contact (elle trahit le moment du contact dans les gestes),
+    tout en gardant les gestes vers un objet (p_obj) : MÉLANGE visée / jeu libre sans indice de contact.
+    echo (0..1) : RÉMANENCE DU CONTACT (idée user) — un vrai bras qui frappe un objet VIBRE, et la sensation s'amortit sur quelques
+    instants (un accéléromètre de poignet le verrait). Le CHOC dans le toucher et l'APPUI s'éteignent d'un facteur echo par image (au
+    lieu de tomber à zéro d'un coup) ; le BRAS ressent un recul le long du contact qui oscille en s'amortissant (×−echo par image).
+    La physique est inchangée (seulement les sensations). Sans ça, un contact = 1–2 images de signal sur 16."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -151,7 +157,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             mt = mt if force_mtype is None else force_mtype; tcut = (tcut if force_tcut is None else force_tcut) if mt == 2 else T; MTYPE[i] = mt
             M0 = np.array([rng.uniform(0.25, 0.75), rng.uniform(0.15, 0.3)], np.float32); off = np.zeros(2, np.float32); mv = np.zeros(2, np.float32)
             mkind = int(rng.integers(0, 3)); mcol = PAL[rng.integers(len(PAL))]; mf0 = rng.uniform(850, 1150)
-        vact = np.zeros((T, 2), np.float32); mspd = np.zeros(T, np.float32); ev = []
+        vact = np.zeros((T, 2), np.float32); mspd = np.zeros(T, np.float32); ev = []; vib = np.zeros(2, np.float32)   # vib : recul ressenti dans le bras (rémanence)
         if par:                                                      # MAIN DU PARENT : arrive d'en face (haut), pousse un objet, repart
             Rp = 0.09; pcol = (np.array([0.95, 0.75, 0.6]) * rng.uniform(0.85, 1.0)).astype(np.float32)
             Pp = np.array([rng.uniform(0.2, 0.8), -0.2], np.float32); Ps = Pp.copy(); pk = int(rng.integers(N))
@@ -228,6 +234,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                         if s_ < 0:
                             J = -2 * s_ * m[k] / (1 + m[k]); V[k] += J / m[k] * nv; om[k] += rng.normal(0, 0.1)
                             ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
+                            if echo > 0: vib = vib - J * nv                     # le choc REPOUSSE le bras (ressenti, puis s'amortit)
                         TSRC[i, t] = max(TSRC[i, t], 1 if vh_n >= -vo_n else 2)  # qui est allé vers qui : moi (actif) / le monde (passif)
                         if vh_n >= -vo_n: felt = (Hp + nv * (Rh + 0.6 * rc[k])).astype(np.float32)   # où il l'a SENTI (côté de sa main)
                         ov = lim - dist; w_ = m[k] / (1 + m[k])
@@ -249,6 +256,10 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     om *= 0.97 if fric < 0.003 else 0.9
                 if blk: V *= 0.25; om *= 0.5                         # bloc : il ne bouge que POUSSÉ
                 vact[t] = Hp - H0
+                if echo > 0:                                         # RÉMANENCE : la sensation du contact s'éteint doucement
+                    tr_ = TOUCH[i, t - 1]
+                    TOUCH[i, t, 0::2] += np.where(echo * tr_[0::2] > 0.003, echo * tr_[0::2], 0)          # le choc vibre et s'éteint
+                    TOUCH[i, t, 1::2] = np.maximum(TOUCH[i, t, 1::2], np.where(echo * tr_[1::2] > 0.05, echo * tr_[1::2], 0))   # l'appui s'efface
                 if mode != "rejoue" and float(np.linalg.norm(CMD[i, t])) > 0.015: lastd = CMD[i, t] / float(np.linalg.norm(CMD[i, t]))
                 if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
                     cb, dirv, spd = True, lastd, max(spd, 0.03); CIRC[i, t] = 1
@@ -262,7 +273,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     elif LINK[i, t]: drive = 1.0 * vact[t - mobile_delay] if t - mobile_delay >= 1 else np.zeros(2)
                     else: drive = np.zeros(2)
                     mv = 0.75 * mv - 0.12 * off + drive; off = np.clip(off + mv, -0.15, 0.15); mspd[t] = float(np.linalg.norm(mv))
-            PROP[i, t] = np.concatenate([Hp, vact[t]]) + rng.normal(0, 0.005, 4)
+            PROP[i, t] = np.concatenate([Hp, vact[t] + vib]) + rng.normal(0, 0.005, 4)
+            vib = -echo * vib if float(np.abs(vib).max()) * echo > 0.002 else np.zeros(2, np.float32)   # oscillation amortie
             img = np.zeros((H, H, 3), np.float32)
             for k in range(N):
                 al = shape_alpha(kind[k], s[k], ang[k], P[k, 0], P[k, 1], xx, yy, H)[..., None]
