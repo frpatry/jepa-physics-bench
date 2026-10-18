@@ -44,8 +44,9 @@ class LocalReader(torch.nn.Module):
 
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
-    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False):
-        s.task, s.blocks, s.bowl = task, blocks, task == "bol"                            # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
+    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False, damp=0.0, echo=0.0):
+        s.task, s.blocks, s.bowl = task, blocks, task == "bol"
+        s.damp, s.echo, s.vib = damp, echo, np.zeros(2, np.float32)   # MÊME monde que le vécu (remarque user : pas de patinoire si le bébé a appris sur une table)                            # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
         s.Rh, s.Lr = 0.07, 0.9; s.kind = int(rng.integers(0, 4))
         s.sz = rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
@@ -123,13 +124,20 @@ class Push0:
             side = (0 if nv[0] > 0 else 1) if abs(nv[0]) >= abs(nv[1]) else (2 if nv[1] > 0 else 3); J = 0.0
             if s_ < 0:
                 J = -2 * s_ * m / (1 + m); s.V = s.V + J / m * nv; s.om += s.rng.normal(0, 0.1); s.ev.append((t - 0.5, 0, J, float((s.P[0] + s.Hp[0]) / 2)))
+                if s.echo > 0: s.vib = s.vib - J * nv                  # le choc repousse le bras (rémanence, comme le monde vécu)
             ov = lim - dist; w_ = m / (1 + m)
             s.Hp = s.place(s.Hp - nv * ov * w_); s.P = np.clip(s.P + nv * ov * (1 - w_), rc, 1 - rc).astype(np.float32)
             s.TOUCH[t, 2 * side] += J; s.TOUCH[t, 2 * side + 1] = max(s.TOUCH[t, 2 * side + 1], w_); s.touched = True
         v_ = float(np.linalg.norm(s.V)); s.V = (s.V * np.clip(1 - s.fric / (v_ + 1e-9), 0, 1)).astype(np.float32)
         s.om *= 0.97 if s.fric < 0.003 else 0.9
         if s.blocks: s.V = (s.V * 0.25).astype(np.float32); s.om *= 0.5        # BLOC : il ne bouge que poussé
-        s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t]]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
+        if s.damp > 0: s.V = (s.V * (1 - s.damp)).astype(np.float32); s.om *= 1 - s.damp   # frottement de table (--damp du vécu)
+        if s.echo > 0:                                                  # rémanence du toucher (--echo du vécu)
+            tr_ = s.TOUCH[t - 1]
+            s.TOUCH[t, 0::2] += np.where(s.echo * tr_[0::2] > 0.003, s.echo * tr_[0::2], 0)
+            s.TOUCH[t, 1::2] = np.maximum(s.TOUCH[t, 1::2], np.where(s.echo * tr_[1::2] > 0.05, s.echo * tr_[1::2], 0))
+        s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t] + s.vib]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
+        s.vib = (-s.echo * s.vib if float(np.abs(s.vib).max()) * s.echo > 0.002 else np.zeros(2)).astype(np.float32)
     def batch(s):
         """vécu jusqu'à t -> lot (1, T, ...) ; le futur est rempli « immobile » (hors contexte de toute façon)."""
         t = s.t; Pp, Hh = s.POS.copy(), s.HAND.copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[t], s.HAND[t]; vact = s.vact.copy(); vact[t + 1:] = 0
@@ -198,6 +206,7 @@ def main():
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
+    wk_ = cfg.get("wkw", {}); print(f"monde des tâches = monde vécu : frottement {wk_.get('damp', 0.0)}, rémanence {wk_.get('echo', 0.0)}", flush=True)
     global T; T = int(cfg.get("T", 16)); import av_phase0; av_phase0.T = T                 # longueur des séquences de l'instantané
     h = T // 2; nf = min(8, T - h)                                                   # contexte frames < h, imaginé h .. h+nf-1 (8 images comme à T=16)
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; md, fr = layout(nv, npf); v = VIEW["0e"]; d = cfg["d"]
@@ -516,7 +525,7 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task, blocks=bool(a.blocks)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
             Hh = min(a.plan_h, T - 1 - env.t)
