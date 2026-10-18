@@ -428,6 +428,9 @@ def main():
     p.add_argument("--loss", type=str, default="l1", choices=["l1", "mse"], help="mse (I-JEPA) : avec le résiduel, L1 donne le même poids à chaque case -> les cases immobiles votent « pas de changement » (run 2A sourd à la commande)")
     p.add_argument("--act_w", type=float, default=0.0, help="poids du CONTRASTE D'ACTION : l'avenir imaginé avec SES gestes doit être plus proche du vrai qu'avec ceux d'un autre")
     p.add_argument("--act_margin", type=float, default=0.2, help="écart exigé (fraction de l'erreur avec ses vrais gestes)")
+    p.add_argument("--act_focus", type=int, default=0, help="1 = CONTRASTE D'ACTION CIBLÉ (piste 1) : seulement sur la VUE, aux images où il SENT un contact "
+                   "(toucher, ses propres sens) et sur les cases qui CHANGENT (latent cible) — « c'est MON geste qui a fait bouger ça ». "
+                   "Aucune étiquette (pas de position d'objet) : valable sur vraie vidéo + capteur de toucher d'un robot")
     p.add_argument("--calm", type=int, default=0, help="1 = COMPLEXITÉ PROGRESSIVE (calme 1 -> 0) ; 2 = monde LISIBLE à progression LENTE (1 -> 0.7 en 0d, 0.7 -> 0.3 en 0e)")
     p.add_argument("--outside", type=int, default=0, help="1 = la TABLE DÉBORDE du champ dans une part croissante des séquences (0d 10 % -> 30 %, 0e 30 % -> 70 %) : objets qui sortent, entendus hors champ")
     p.add_argument("--T", type=int, default=16, help="images par séquence (16 ≈ 1 s ; 32 = 2 s : il faut repartir de zéro)")
@@ -614,14 +617,27 @@ def main():
             al, gap = torch.zeros((), device=dev), torch.zeros((), device=dev)
             if a.act_w > 0:                                          # CONTRASTE D'ACTION (« compare avec un autre geste »)
                 t0_ = int(rng.integers(3, T - 2)); cm_ = torch.from_numpy(fr_np <= t0_).to(dev)
-                cidx_ = torch.where(cm_)[0].expand(B, -1); tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)   # futur, sans l'ouïe
+                if a.act_focus: tidx_ = torch.where(~cm_ & (md_t == 0))[0].expand(B, -1)                  # CIBLÉ : la VUE future
+                else: tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)                          # futur, sans l'ouïe
+                cidx_ = torch.where(cm_)[0].expand(B, -1)
                 zc_ = m.context(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
                 cmd_l = cmd.clone(); cmd_l[:, t0_ + 1:] = cmd.roll(1, 0)[:, t0_ + 1:]                    # mêmes souvenirs, AUTRES gestes futurs
+                wf_ = None
+                if a.act_focus:                                      # poids par case : (il SENT un contact à cette image ou juste avant) × (la case CHANGE)
+                    zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1)
+                    ch_ = torch.cat([torch.zeros_like(ch_[:, :1]), ch_], 1)                                   # (B, T, npf) changement depuis l'image d'avant
+                    felt = contact.clone(); felt[:, 1:] = torch.maximum(felt[:, 1:], contact[:, :-1])         # contact senti à t ou t-1
+                    ft_ = fr_t[tidx_[0]]; pc_ = tidx_[0] % npf
+                    chg = ch_[:, ft_, pc_]; chg = (chg > chg.mean(1, keepdim=True)).float()                   # cases qui changent plus que la moyenne
+                    wf_ = torch.gather(felt, 1, ft_.expand(B, -1)) * chg                                      # (B, cibles)
                 def err_(c):
                     d_ = m.pred(zc_, tidx_, c, cidx_).float() - zt_
-                    return (d_ ** 2 if a.loss == "mse" else d_.abs()).mean((1, 2))
+                    d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(2)
+                    return d_.mean(1) if wf_ is None else (d_ * wf_).sum(1) / wf_.sum(1).clamp_min(1.0)
                 e_t, e_l = err_(cmd), err_(cmd_l)
-                al = F.relu(e_t - e_l + a.act_margin * e_t.detach()).mean(); gap = ((e_l - e_t) / e_t.clamp_min(1e-6)).mean().detach()
+                ok_ = torch.ones(B, device=dev) if wf_ is None else (wf_.sum(1) > 0).float()               # séquences où il a senti un contact (sinon rien à comparer)
+                al = (F.relu(e_t - e_l + a.act_margin * e_t.detach()) * ok_).sum() / ok_.sum().clamp_min(1.0)
+                gap = (((e_l - e_t) / e_t.clamp_min(1e-6)) * ok_).sum().detach() / ok_.sum().clamp_min(1.0)
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0 and not a.freeze_eye:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
