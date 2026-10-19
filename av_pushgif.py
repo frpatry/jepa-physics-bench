@@ -100,6 +100,13 @@ def main():
             print(f"      DÉPLACEMENT {nm_} depuis l'image 8 (même lecteur) : erreur {e:.2f} px (immobile {e0:.2f}, gestes d'un AUTRE {el:.2f}) | à la fin, "
                   f"sur {nb} séq. où il a bougé > 2 px : bonne direction (cos > 0.5) {ok:.0f} % (autre {okl:.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}), "
                   f"amplitude imaginée/réelle {amp:.2f} (autre {ampl:.2f})", flush=True)
+        def hz(pr, yy, nm_):                                                                             # COURBE PAR HORIZON (objet), même lecteur des 2 côtés
+            di = (pr[:, :, :2] - pr[:, :1, :2]) * H; dr = (yy[:, :, :2] - yy[:, :1, :2]) * H; out = []
+            for k in range(1, nf):
+                big = dr[:, k].norm(dim=-1) > 2.0; cs = F.cosine_similarity(di[big, k], dr[big, k], dim=-1)
+                out.append(f"+{k}: {float((di[:, k] - dr[:, k]).norm(dim=-1).mean()):.2f}/{float(dr[:, k].norm(dim=-1).mean()):.2f} px "
+                           f"{float((cs > 0.5).float().mean() * 100):.0f}% (n={int(big.sum())})")
+            print(f"      HORIZON {nm_:9s} (erreur/immobile, bonne direction) : " + " | ".join(out), flush=True)
         if ex_b:                                                                                         # GRAND TEST (poussées des mondes en plus + celles du test principal)
             with torch.no_grad():
                 ix = np.arange(len(Yx)); YY = torch.cat([yt[mv], Yx[:, h:]])
@@ -111,6 +118,7 @@ def main():
                       f"bonne direction {ok:.0f} ± {ci(ok):.0f} % (autre {okl:.0f} ± {ci(okl):.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}) | "
                       f"ses gestes MIEUX orientés que ceux d'un autre dans {float((v1 > v2).float().mean() * 100):.0f} % des séq. (50 % = pas d'effet) | "
                       f"amplitude {amp:.2f} (autre {ampl:.2f})", flush=True)
+            hz(PI, YY, "siens"); hz(PL, YY, "AUTRE")
             if a.real:                                                                                   # REPÈRE : même mesure sur les VRAIES images 8–15
                 rd = reader(imag(np.arange(ntr), real=True).flatten(0, 1))
                 with torch.no_grad(): PR = torch.cat([rp(imag(te, real=True))[mv], rp(imag(ix, bb=bx, real=True))])
@@ -118,6 +126,7 @@ def main():
                     e, e0, cs, ok, amp, nb, _ = mv_(PR, k, YY); ci = lambda q: 1.96 * (q / 100 * (1 - q / 100) / max(nb, 1)) ** 0.5 * 100
                     print(f"      REPÈRE VRAIES IMAGES {nm_} (lecteur entraîné sur les vrais latents) : erreur {e:.2f} px (immobile {e0:.2f}) | "
                           f"bonne direction {ok:.0f} ± {ci(ok):.0f} %, cos moyen {cs:+.2f}, amplitude {amp:.2f}", flush=True)
+                hz(PR, YY, "RÉEL")
         res.append((c.replace(".pt", "").replace("phase0_", ""), pi[show - ntr].numpy(), pl[show - ntr].numpy()))
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     # ---------- GIF : une colonne par modèle, même séquence
