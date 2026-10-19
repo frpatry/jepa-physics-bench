@@ -531,7 +531,7 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), L=EL); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), L=EL + (a.plan_h if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         while env.t < min(EL - 1, a.plan_c + a.plan_steps):         # même nombre de gestes quelle que soit T
             Hh = a.plan_h if a.slide else min(a.plan_h, T - 1 - env.t)
