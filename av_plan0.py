@@ -44,7 +44,7 @@ class LocalReader(torch.nn.Module):
 
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
-    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False, damp=0.0, echo=0.0):
+    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False, damp=0.0, echo=0.0, L=None):
         s.task, s.blocks, s.bowl = task, blocks, task == "bol"
         s.damp, s.echo, s.vib = damp, echo, np.zeros(2, np.float32)   # MÊME monde que le vécu (remarque user : pas de patinoire si le bébé a appris sur une table)                            # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
@@ -82,9 +82,10 @@ class Push0:
                 s.Hp = s.place(rng.uniform(s.Rh, 1 - s.Rh, 2)); dd = float(np.linalg.norm(s.P - s.Hp))
                 if 0.25 < dd < 0.45: break
             s.g = s.P.copy()
-        s.t = 0; s.X = np.zeros((T, H, H, 3), np.float32); s.POS = np.zeros((T, 2), np.float32); s.HAND = np.zeros((T, 2), np.float32)
-        s.CMD = np.zeros((T, 2), np.float32); s.TOUCH = np.zeros((T, 8), np.float32); s.PROP = np.zeros((T, 4), np.float32)
-        s.vact = np.zeros((T, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
+        L = s.L = L or T                                                # durée de l'épisode (> T : ÉPISODE LONG, le bébé voit une fenêtre de T images qui glisse)
+        s.t = 0; s.X = np.zeros((L, H, H, 3), np.float32); s.POS = np.zeros((L, 2), np.float32); s.HAND = np.zeros((L, 2), np.float32)
+        s.CMD = np.zeros((L, 2), np.float32); s.TOUCH = np.zeros((L, 8), np.float32); s.PROP = np.zeros((L, 4), np.float32)
+        s.vact = np.zeros((L, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
         s.PROP[0] = np.concatenate([s.Hp, s.vact[0]]) + s.rng.normal(0, 0.005, 4); s.record(0)
     def place(s, h):
         h = np.clip(h, s.Rh, 1 - s.Rh); d = h - SHOULDER; nd = float(np.linalg.norm(d))
@@ -138,14 +139,16 @@ class Push0:
             s.TOUCH[t, 1::2] = np.maximum(s.TOUCH[t, 1::2], np.where(s.echo * tr_[1::2] > 0.05, s.echo * tr_[1::2], 0))
         s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t] + s.vib]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
         s.vib = (-s.echo * s.vib if float(np.abs(s.vib).max()) * s.echo > 0.002 else np.zeros(2)).astype(np.float32)
-    def batch(s):
-        """vécu jusqu'à t -> lot (1, T, ...) ; le futur est rempli « immobile » (hors contexte de toute façon)."""
-        t = s.t; Pp, Hh = s.POS.copy(), s.HAND.copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[t], s.HAND[t]; vact = s.vact.copy(); vact[t + 1:] = 0
+    def batch(s, s0=0):
+        """vécu jusqu'à t -> lot (1, T, ...) des images s0 .. s0+T-1 (FENÊTRE ; s0 = 0 = comme avant) ; le futur est rempli « immobile » (hors contexte)."""
+        W = slice(s0, s0 + T); t = s.t - s0
+        Pp, Hh = s.POS[W].copy(), s.HAND[W].copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[s.t], s.HAND[s.t]; vact = s.vact[W].copy(); vact[t + 1:] = 0
         extra = cont_sound(2 * s.hum * np.linalg.norm(vact, axis=1) / 0.08, Hh[:, 0], T, s.rng, "froisse")
         extra = extra + hum_signal(Pp[:, None], np.array([s.mat]), np.array([s.m]), T, s.hum, 1, "fric")
-        Ls = SPF // s.a_sub; A = render_audio([e for e in s.ev], np.array([s.mat]), np.array([s.m]), T, s.a_sub, s.rng, band_matrix(Ls),
+        ev = [(e[0] - s0,) + tuple(e[1:]) for e in s.ev if 0 <= e[0] - s0 < T]                  # chocs dans la fenêtre (temps décalés)
+        Ls = SPF // s.a_sub; A = render_audio(ev, np.array([s.mat]), np.array([s.m]), T, s.a_sub, s.rng, band_matrix(Ls),
                                                np.hanning(Ls).astype(np.float32), np.arange(T * SPF) / SR, 1, np.zeros(T, bool), extra)
-        w = dict(X=s.X[None], A=A[None], TOUCH=s.TOUCH[None], PROP=s.PROP[None], CMD=s.CMD[None])
+        w = dict(X=s.X[W][None], A=A[None], TOUCH=s.TOUCH[W][None], PROP=s.PROP[W][None], CMD=s.CMD[W][None])
         return to_torch(to_np([w]))
 
 def oracle(env):
@@ -173,7 +176,9 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--episodes", type=int, default=60); p.add_argument("--diag", type=int, default=30)
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
-    p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
+    p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)");
+    p.add_argument("--slide", type=int, default=0, help="1 = ÉPISODES LONGS (idée user : un bébé plus jeune a besoin de plus de gestes) : --plan_steps peut dépasser T ; "
+                   "à chaque geste le bébé voit ses T dernières images (fenêtre qui glisse) et imagine --plan_h images plus loin, puis replanifie"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
     p.add_argument("--dump_n", type=int, default=0, help="enregistre les N premiers épisodes MPC (gestes + positions IMAGINÉES) pour les animations")
     p.add_argument("--task", type=str, default="objet", choices=["objet", "main", "main_loin", "toucher", "bouger", "direction", "bol"], help="bol : pousser le BLOC dans le BOL (anneau gris visible autour de la cible) ; main / main_loin : SA MAIN sur un point (pièce vide, 0.15–0.35 / 0.35–0.6) ; toucher : toucher un objet immobile")
@@ -449,7 +454,8 @@ def main():
         read = lambda z: ri_(z.float()) * sd + mu                        # l'imagination est lue par SON lecteur ; la perception garde read_now
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
-        t = env.t; b1 = env.batch(); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
+        s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
+        t = env.t - s0; b1 = env.batch(s0); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
         ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]
         tis = torch.stack([torch.from_numpy(np.where((fr == t + hh) & (md == 0))[0]) for hh in range(1, Hh + 1)]).to(dev); ti = tis[-1:]
         vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
@@ -479,12 +485,12 @@ def main():
                     else: sub = behind
                 else: phase = 2
         if a.goal_img:                          # BUT = IMAGE : la suite « le monde saute au but et y reste » encodée par l'œil-cible (comme une cible d'entraînement)
-            Xg = env.X.copy(); gf = env.frame(env.g, env.Hp); Xg[t + 1:] = gf
+            Xg = env.X[s0:s0 + T].copy(); gf = env.frame(env.g, env.Hp); Xg[t + 1:] = gf
             bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
             with torch.no_grad():
                 tkg, _ = to_tok0(bg, st, v, P_, dev); ixg = torch.arange(nv, device=dev)[None]
                 zg_all = teachN(tkg[:, :nv], ixg).view(T, npf, dR)
-            dpx = np.abs(gf - env.X[t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
+            dpx = np.abs(gf - env.X[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
             gmask = torch.from_numpy(dpx > 0.15).to(dev)
             if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
         def gcost(zi, hh):                      # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
@@ -525,10 +531,10 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), L=EL); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
-        while env.t < min(T - 1, a.plan_c + a.plan_steps):          # même nombre de gestes quelle que soit T
-            Hh = min(a.plan_h, T - 1 - env.t)
+        while env.t < min(EL - 1, a.plan_c + a.plan_steps):         # même nombre de gestes quelle que soit T
+            Hh = a.plan_h if a.slide else min(a.plan_h, T - 1 - env.t)
             if policy == "diag":
                 from scipy.stats import spearmanr
                 cost = imag_cost(env, Hh); torch.manual_seed(ep); K = 48
@@ -573,6 +579,7 @@ def main():
             env.step(np.asarray(act, np.float32))
         ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         return d0, env.dist(), float(ok)
+    EL = a.plan_c + a.plan_steps + 1 if a.slide else T                  # durée d'un épisode (fenêtre qui glisse si > T)
     succ = 0.04 if a.task.startswith("main") else 0.06
     near = 3.0 / H                                                       # critère « PRÈS » (bébé de 4–6 mois : arrive près puis corrige) : à moins de 3 px
     if a.instr > 0:                                                      # ---------- MESURE DE L'INSTRUMENT (lecteur) vs IMAGINATION
@@ -646,7 +653,7 @@ def main():
     titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
              "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22",
              "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "bol": "pousser le BLOC dans le BOL (cible à 0.12–0.22, réussite < 0.06)" + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur supervisé"), "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)"}[a.task]
-    print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(T - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
+    print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(EL - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes{' (ÉPISODE LONG, fenêtre qui glisse)' if a.slide else ''}, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
     for pol in ("hasard", "oracle"):
         tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
