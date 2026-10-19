@@ -26,6 +26,8 @@ def main():
     p.add_argument("--out", default="/content/drive/MyDrive/jepa_runs/pousse.gif"); p.add_argument("--n", type=int, default=4000)
     p.add_argument("--show", type=int, default=6); p.add_argument("--scale", type=int, default=8); p.add_argument("--blocks", type=int, default=0)
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--extra", type=int, default=0, help="GRAND TEST : k mondes de plus (graines différentes, --n séquences chacun) dont on ne garde que les "
+                   "séquences POUSSÉES -> beaucoup plus de poussées pour mesurer (le monde principal n'en a qu'une centaine en test : ±5–10 points de bruit)")
     p.add_argument("--blind", type=int, default=0, help="1 = CONTRÔLE : gestes aveugles aux objets (aucun geste vers l'objet, pas de pause après contact) ; "
                    "si l'objet imaginé se dégrade fortement, l'imagination lisait l'objet dans les GESTES et pas dans la physique")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
@@ -42,16 +44,24 @@ def main():
     moved = (np.linalg.norm(po_[:, T - 1] - po_[:, h - 1], axis=-1) * H > 3.0) & inview                 # l'objet a bougé de > 3 px pendant 8–15
     ntr = int(0.8 * n); show = np.where(moved[ntr:])[0][:a.show] + ntr
     print(f"{n} séquences à 1 objet, {int(moved.sum())} où l'objet est poussé (et reste dans le champ) ; montrées : {len(show)} | {time.time() - t0:.0f}s", flush=True)
+    ex_b, ex_Y = [], []
+    for j in range(a.extra):                                                                            # GRAND TEST : seulement les poussées, autres graines
+        w2 = gen_world0(a.n, "0e", T, H, seed=5000 + j, **wkw); k2 = np.where(w2["NOBJ"] == 1)[0]; p2 = w2["POS"][k2, :, 0]
+        k2 = k2[(np.linalg.norm(p2[:, T - 1] - p2[:, h - 1], axis=-1) * H > 3.0) & ((p2 > 0.06) & (p2 < 0.94)).all((1, 2))]
+        ex_b.append(to_torch(to_np([{k: w2[k][k2] for k in ("X", "A", "TOUCH", "PROP", "CMD")}])))
+        ex_Y.append(torch.from_numpy(np.concatenate([w2["POS"][k2, :, 0], w2["HAND"][k2]], -1)).float()); del w2
+        print(f"  monde de test {j + 1}/{a.extra} : {len(k2)} poussées | {time.time() - t0:.0f}s", flush=True)
+    if ex_b: bx = {k: torch.cat([e[k] for e in ex_b]) for k in ex_b[0]}; Yx = torch.cat(ex_Y)
     md, fr = layout(nv, npf); ci0 = torch.from_numpy(np.where(fr < h)[0]).to(dev); ti0 = torch.from_numpy(np.where((fr >= h) & (md == 0))[0]).to(dev)
     res = []
     for c, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
 
         @torch.no_grad()
-        def imag(idx, lie=False):
-            out = []
+        def imag(idx, lie=False, bb=None):
+            out = []; bb = b if bb is None else bb
             for i in range(0, len(idx), 50):
-                sl = torch.from_numpy(idx[i:i + 50]); tok, cmd = to_tok0({k: x[sl] for k, x in b.items()}, ck["norm"], v, P, dev); B = len(tok)
+                sl = torch.from_numpy(idx[i:i + 50]); tok, cmd = to_tok0({k: x[sl] for k, x in bb.items()}, ck["norm"], v, P, dev); B = len(tok)
                 if lie: cmd = torch.cat([cmd[:, :h], cmd.roll(1, 0)[:, h:]], 1)   # gestes d'un AUTRE seulement sur les images IMAGINÉES (passé cohérent avec ce qu'il a vu)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
                 ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
@@ -72,16 +82,28 @@ def main():
               f"(copie {px(cp, 1):.2f}) | {time.time() - t0:.0f}s", flush=True)
         # DÉPLACEMENT (remarque user : la copie est la VRAIE position, sans l'erreur du lecteur -> comparaison injuste). Ici tout est mesuré
         # depuis l'image 8 avec le MÊME lecteur des deux côtés (son biais s'annule) : où va l'objet imaginé par rapport à là où il était imaginé en 8
-        def mv_(pr, k):
-            di = (pr[:, :, 2 * k:2 * k + 2] - pr[:, :1, 2 * k:2 * k + 2])[mv] * H; dr = (yt[:, :, 2 * k:2 * k + 2] - yt[:, :1, 2 * k:2 * k + 2])[mv] * H
+        def mv_(pr, k, yy=None):
+            yy = yt[mv] if yy is None else yy; pr = pr[mv] if len(pr) != len(yy) else pr
+            di = (pr[:, :, 2 * k:2 * k + 2] - pr[:, :1, 2 * k:2 * k + 2]) * H; dr = (yy[:, :, 2 * k:2 * k + 2] - yy[:, :1, 2 * k:2 * k + 2]) * H
             fi, fr_ = di[:, -1], dr[:, -1]; big = fr_.norm(dim=-1) > 2.0                                        # séquences où l'objet a bougé > 2 px depuis l'image 8
             cs = F.cosine_similarity(fi[big], fr_[big], dim=-1); amp = fi[big].norm(dim=-1) / fr_[big].norm(dim=-1)
-            return float((di - dr).norm(dim=-1).mean()), float(dr.norm(dim=-1).mean()), float(cs.mean()), float((cs > 0.5).float().mean() * 100), float(amp.median()), int(big.sum())
+            return float((di - dr).norm(dim=-1).mean()), float(dr.norm(dim=-1).mean()), float(cs.mean()), float((cs > 0.5).float().mean() * 100), float(amp.median()), int(big.sum()), cs
         for nm_, k in (("objet", 0), ("main", 1)):
-            e, e0, cs, ok, amp, nb = mv_(pi, k); el, _, csl, okl, ampl, _ = mv_(pl, k)
+            e, e0, cs, ok, amp, nb, _ = mv_(pi, k); el, _, csl, okl, ampl, _, _ = mv_(pl, k)
             print(f"      DÉPLACEMENT {nm_} depuis l'image 8 (même lecteur) : erreur {e:.2f} px (immobile {e0:.2f}, gestes d'un AUTRE {el:.2f}) | à la fin, "
                   f"sur {nb} séq. où il a bougé > 2 px : bonne direction (cos > 0.5) {ok:.0f} % (autre {okl:.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}), "
                   f"amplitude imaginée/réelle {amp:.2f} (autre {ampl:.2f})", flush=True)
+        if ex_b:                                                                                         # GRAND TEST (poussées des mondes en plus + celles du test principal)
+            with torch.no_grad():
+                ix = np.arange(len(Yx)); YY = torch.cat([yt[mv], Yx[:, h:]])
+                PI = torch.cat([pi[mv], rp(imag(ix, bb=bx))]); PL = torch.cat([pl[mv], rp(imag(ix, lie=True, bb=bx))])
+            for nm_, k in (("objet", 0), ("main", 1)):
+                e, e0, cs, ok, amp, nb, v1 = mv_(PI, k, YY); el, _, csl, okl, ampl, _, v2 = mv_(PL, k, YY)
+                ci = lambda q: 1.96 * (q / 100 * (1 - q / 100) / max(nb, 1)) ** 0.5 * 100
+                print(f"      GRAND TEST {nm_} ({len(YY)} poussées) : erreur {e:.2f} px (immobile {e0:.2f}, AUTRE {el:.2f}) | sur {nb} séq. bougé > 2 px : "
+                      f"bonne direction {ok:.0f} ± {ci(ok):.0f} % (autre {okl:.0f} ± {ci(okl):.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}) | "
+                      f"ses gestes MIEUX orientés que ceux d'un autre dans {float((v1 > v2).float().mean() * 100):.0f} % des séq. (50 % = pas d'effet) | "
+                      f"amplitude {amp:.2f} (autre {ampl:.2f})", flush=True)
         res.append((c.replace(".pt", "").replace("phase0_", ""), pi[show - ntr].numpy(), pl[show - ntr].numpy()))
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     # ---------- GIF : une colonne par modèle, même séquence
