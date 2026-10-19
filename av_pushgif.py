@@ -26,6 +26,8 @@ def main():
     p.add_argument("--out", default="/content/drive/MyDrive/jepa_runs/pousse.gif"); p.add_argument("--n", type=int, default=4000)
     p.add_argument("--show", type=int, default=6); p.add_argument("--scale", type=int, default=8); p.add_argument("--blocks", type=int, default=0)
     p.add_argument("--steps", type=int, default=3000)
+    p.add_argument("--real", type=int, default=0, help="1 = REPÈRE de l'instrument : un lecteur entraîné sur les VRAIS latents futurs (contexte avec "
+                   "toutes les images vues) lit-il le mouvement de l'objet poussé ? Sinon c'est la mesure qui ne voit rien, pas l'imagination")
     p.add_argument("--extra", type=int, default=0, help="GRAND TEST : k mondes de plus (graines différentes, --n séquences chacun) dont on ne garde que les "
                    "séquences POUSSÉES -> beaucoup plus de poussées pour mesurer (le monde principal n'en a qu'une centaine en test : ±5–10 points de bruit)")
     p.add_argument("--blind", type=int, default=0, help="1 = CONTRÔLE : gestes aveugles aux objets (aucun geste vers l'objet, pas de pause après contact) ; "
@@ -53,25 +55,30 @@ def main():
         print(f"  monde de test {j + 1}/{a.extra} : {len(k2)} poussées | {time.time() - t0:.0f}s", flush=True)
     if ex_b: bx = {k: torch.cat([e[k] for e in ex_b]) for k in ex_b[0]}; Yx = torch.cat(ex_Y)
     md, fr = layout(nv, npf); ci0 = torch.from_numpy(np.where(fr < h)[0]).to(dev); ti0 = torch.from_numpy(np.where((fr >= h) & (md == 0))[0]).to(dev)
+    ca0 = torch.arange(len(fr), device=dev)
     res = []
     for c, ck in zip(names, cks):
         cfg = ck["cfg"]; d = cfg["d"]; m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval()
 
         @torch.no_grad()
-        def imag(idx, lie=False, bb=None):
+        def imag(idx, lie=False, bb=None, real=False):
             out = []; bb = b if bb is None else bb
             for i in range(0, len(idx), 50):
                 sl = torch.from_numpy(idx[i:i + 50]); tok, cmd = to_tok0({k: x[sl] for k, x in bb.items()}, ck["norm"], v, P, dev); B = len(tok)
+                if real:                                                                          # VRAIES images 8–15 vues (contexte = tout)
+                    out.append(m.context(tok, ca0.expand(B, -1))[:, ti0].float().view(B, nf, npf, d).cpu()); continue
                 if lie: cmd = torch.cat([cmd[:, :h], cmd.roll(1, 0)[:, h:]], 1)   # gestes d'un AUTRE seulement sur les images IMAGINÉES (passé cohérent avec ce qu'il a vu)
                 ci, ti = ci0.expand(B, -1), ti0.expand(B, -1)
                 ctx = m.context(torch.gather(tok, 1, ci.unsqueeze(-1).expand(-1, -1, tok.size(-1))), ci)
                 out.append(m.pred(ctx, ti, cmd, ci).float().view(B, nf, npf, d).cpu())
             return torch.cat(out)
-        Ztr = imag(np.arange(ntr)).flatten(0, 1); Ytr = Y[:ntr, h:].flatten(0, 1); mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
-        torch.manual_seed(0); rd = LocalReader(d, npf, 4, mu=mu, sd=sd).to(dev); opt = torch.optim.AdamW(rd.parameters(), 3e-4, weight_decay=0.05)
-        for _ in range(a.steps):
-            bi = torch.randint(0, len(Ztr), (256,)); l = F.mse_loss(rd(Ztr[bi].to(dev)), ((Ytr[bi] - mu) / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
-        rd.eval(); te = np.arange(ntr, n)
+        Ytr = Y[:ntr, h:].flatten(0, 1); mu, sd = Ytr.mean(0), Ytr.std(0) + 1e-6
+        def reader(Ztr):
+            torch.manual_seed(0); rd = LocalReader(d, npf, 4, mu=mu, sd=sd).to(dev); opt = torch.optim.AdamW(rd.parameters(), 3e-4, weight_decay=0.05)
+            for _ in range(a.steps):
+                bi = torch.randint(0, len(Ztr), (256,)); l = F.mse_loss(rd(Ztr[bi].to(dev)), ((Ytr[bi] - mu) / sd).to(dev)); opt.zero_grad(); l.backward(); opt.step()
+            return rd.eval()
+        rd = reader(imag(np.arange(ntr)).flatten(0, 1)); te = np.arange(ntr, n)
         with torch.no_grad():
             rp = lambda Z: (rd(Z.flatten(0, 1).to(dev)).cpu() * sd + mu).view(-1, nf, 4)
             pi, pl = rp(imag(te)), rp(imag(te, lie=True))
@@ -104,6 +111,13 @@ def main():
                       f"bonne direction {ok:.0f} ± {ci(ok):.0f} % (autre {okl:.0f} ± {ci(okl):.0f} %), cos moyen {cs:+.2f} (autre {csl:+.2f}) | "
                       f"ses gestes MIEUX orientés que ceux d'un autre dans {float((v1 > v2).float().mean() * 100):.0f} % des séq. (50 % = pas d'effet) | "
                       f"amplitude {amp:.2f} (autre {ampl:.2f})", flush=True)
+            if a.real:                                                                                   # REPÈRE : même mesure sur les VRAIES images 8–15
+                rd = reader(imag(np.arange(ntr), real=True).flatten(0, 1))
+                with torch.no_grad(): PR = torch.cat([rp(imag(te, real=True))[mv], rp(imag(ix, bb=bx, real=True))])
+                for nm_, k in (("objet", 0), ("main", 1)):
+                    e, e0, cs, ok, amp, nb, _ = mv_(PR, k, YY); ci = lambda q: 1.96 * (q / 100 * (1 - q / 100) / max(nb, 1)) ** 0.5 * 100
+                    print(f"      REPÈRE VRAIES IMAGES {nm_} (lecteur entraîné sur les vrais latents) : erreur {e:.2f} px (immobile {e0:.2f}) | "
+                          f"bonne direction {ok:.0f} ± {ci(ok):.0f} %, cos moyen {cs:+.2f}, amplitude {amp:.2f}", flush=True)
         res.append((c.replace(".pt", "").replace("phase0_", ""), pi[show - ntr].numpy(), pl[show - ntr].numpy()))
         del m; torch.cuda.empty_cache() if dev == "cuda" else None
     # ---------- GIF : une colonne par modèle, même séquence
