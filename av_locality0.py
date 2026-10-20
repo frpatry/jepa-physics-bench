@@ -65,6 +65,7 @@ def main():
     names = [c.strip() for c in a.ckpts.split(",")]
     ref = next((c for c in names if c != "init"), None)
     cks = {c: torch.load(os.path.join(a.dir, c), map_location=dev, weights_only=False) for c in names if c != "init"}
+    assert len({int(c_["cfg"].get("T", 16)) for c_ in cks.values()}) <= 1, "ckpts de longueurs T différentes (16 vs 32 images) : les comparer séparément"
     cfg0 = cks[ref]["cfg"] if ref else None
     T = int(cfg0.get("T", 16)); av_phase0.T = T; P = cfg0["P"]; nP = H // P; npf = nP * nP; nv = T * npf; v = VIEW["0e"]
     # ---------- données : un seul monde pour tous les yeux (celui du premier instantané)

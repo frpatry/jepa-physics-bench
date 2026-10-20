@@ -517,6 +517,7 @@ def main():
     state = dict(it=0, hist=[], exams=[])
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
+        assert int(ck["cfg"].get("T", 16)) == T, f"reprise : le ckpt est à T={ck['cfg'].get('T', 16)} images, relancer avec --T {ck['cfg'].get('T', 16)}"
         fresh = a.split and not any(k.startswith("pred.b_") for k in ck["m"])   # œil d'un bébé à prédicteur unique -> corps/monde NEUFS
         if fresh: m.load_state_dict({k: w for k, w in ck["m"].items() if not k.startswith("pred.")}, strict=False); print("œil repris, prédicteur CORPS / MONDE neuf", flush=True)
         else: m.load_state_dict(ck["m"])

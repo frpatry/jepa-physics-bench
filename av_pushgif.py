@@ -35,6 +35,7 @@ def main():
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
     names = [c.strip() for c in a.ckpts.split(",")]
     cks = [torch.load(os.path.join(a.dir, c), map_location=dev, weights_only=False) for c in names]
+    assert len({int(c_["cfg"].get("T", 16)) for c_ in cks if isinstance(c_, dict) and "cfg" in c_}) <= 1, "ckpts de longueurs T différentes (16 vs 32 images) : les comparer séparément"
     cfg0 = cks[0]["cfg"]; T = int(cfg0.get("T", 16)); av_phase0.T = T; P = cfg0["P"]; nP = H // P; npf = nP * nP; nv = T * npf; v = VIEW["0e"]
     h = T // 2; nf = T - h
     wkw = {**cfg0.get("wkw", {}), "p_parent": 0.0, **({"blocks": 1.0} if a.blocks else {}), **({"blind": True} if a.blind else {})}
