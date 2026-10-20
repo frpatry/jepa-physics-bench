@@ -513,7 +513,7 @@ def main():
                 else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
-            if a.goal_img:
+            if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
                 with torch.no_grad(): return gcost(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)).view(K, npf, dR), Hh)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
@@ -701,7 +701,7 @@ def main():
                 pickle.dump(dict(films=films, has_obj=has_obj, res=res[:a.film]), open(out + ".pkl", "wb"))
                 for i, fl in enumerate(films):
                     film_fig([fl], f"{out}_ep{i}.png", f"{titre} — {nm} — épisode {i} : {'RÉUSSI' if res[i, 2] else 'raté'} (distance finale {res[i, 1]:.2f})", has_obj,
-                             {"objet": "objet→cible", "bouger": "déplacement objet", "direction": "déplacement objet"}.get(a.task, "main→but"))
+                             {"objet": "objet→cible", "pusht": "T→cible", "bouger": "déplacement objet", "direction": "déplacement objet"}.get(a.task, "main→but"))
                 print(f"      films -> {out}_ep*.png", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
