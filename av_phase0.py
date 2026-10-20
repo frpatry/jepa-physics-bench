@@ -283,7 +283,7 @@ class Stream:
         while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eyes_share=0.0):
+def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eyes_share=0.0, fut_max=0):
     """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
     « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes).
     eyes_share : part de la devinette « YEUX FERMÉS » (idée user) — il voit jusqu'à t0 puis plus rien, mais continue de SENTIR
@@ -298,9 +298,11 @@ def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eye
         tg = np.zeros((B, N), bool)
         if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
         if st == "eyes":                                             # YEUX FERMÉS après t0 : il sent et entend tout, il imagine ce qu'il verra
-            t0 = rng.integers(3, T - 3); tg[:] = (md == 0) & (fr > t0); pairs.append((~tg, tg)); continue
+            t0 = rng.integers(3, T - 3); tg[:] = (md == 0) & (fr > t0) & ((fr <= t0 + fut_max) if fut_max else True)
+            cm = ~tg & ((fr <= t0 + fut_max) if fut_max else True); pairs.append((cm, tg)); continue
         if st == "future":                                           # IMAGINER : tous les sens après t0, avec les gestes prévus
-            t0 = rng.integers(3, T - 2); pairs.append((np.broadcast_to(fr <= t0, (B, N)).copy(), np.broadcast_to(fr > t0, (B, N)).copy())); continue
+            t0 = rng.integers(3, T - 2); g_ = (fr > t0) & ((fr <= t0 + fut_max) if fut_max else True)   # HORIZON PLAFONNÉ (--fut_max) : t0+1 .. t0+K
+            pairs.append((np.broadcast_to(fr <= t0, (B, N)).copy(), np.broadcast_to(g_, (B, N)).copy())); continue
         if st == "tube": tg[:, :nv] = tube_masks(B, T, nP, 0.5, 1, rng)[0].numpy()
         elif st == "vblock":
             for b in range(B): t0 = rng.integers(0, T - 2); tg[b] = (md == 0) & (fr >= t0) & (fr < t0 + 3)
@@ -467,6 +469,9 @@ def main():
                    "dans le toucher, et le bras ressent un recul qui s'amortit (sensations seulement, physique inchangée)")
     p.add_argument("--damp", type=float, default=0.0, help="FROTTEMENT (question user : les objets glissaient 10–20 px après une poussée de 1 px) : "
                    "vitesse des objets ×(1 − damp) par image -> il avance quand on le pousse, s'arrête peu après")
+    p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
+                   "après t0 (0 = jusqu'à la fin). D19 (T=32, causal) n'apprenait PAS à se servir de ses gestes avec des horizons jusqu'à 28 images ; "
+                   "K=8 = comme à T=16, avec un passé deux fois plus long")
     p.add_argument("--eyes_share", type=float, default=0.0, help="avec --fut_share : part de la devinette « YEUX FERMÉS » (idée user) : il voit jusqu'à t0, "
                    "puis sent (toucher, bras) et entend sans voir, et doit imaginer ce qu'il verra en rouvrant les yeux")
     p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
@@ -560,7 +565,7 @@ def main():
             cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
             bt_ = {k: x[pick] for k, x in bt_.items()}
         tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share); full = torch.arange(N, device=dev).expand(B, -1)
+        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
             with torch.no_grad():
