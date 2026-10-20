@@ -26,6 +26,7 @@ import math
 import numpy as np
 from av_jepa import PAL, NB, SPF, SR, F_MAT, band_matrix, render_audio, hum_signal
 from av_world5 import shape_alpha
+from av_shape import contact as shape_contact
 
 SHOULDER = np.array([0.5, 1.15], np.float32)          # épaule sous le bas de l'image (table vue de dessus) -> portée du bras
 STAGES = {  # taille de la main (R) | boîte du centre de la main | nb objets | mobile | longueur du bras | part d'objets au repos
@@ -71,7 +72,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0):
+               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -220,6 +221,13 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     elif pmode == "repart": d_ = Ps - Pp; Vp = (d_ * min(1.0, 0.08 / max(float(np.linalg.norm(d_)), 1e-6))).astype(np.float32)
                     Pp = Pp + Vp
                     for k in range(N):                               # main du parent -> objet (elle est menée : pas de recul)
+                        if shape_phys:                               # PHYSIQUE DE FORME (main du parent : masse 3, menée)
+                            c_ = shape_contact(kind[k], s[k], ang[k], P[k], V[k], om[k], m[k], Pp, Vp, Rp, m_hand=3.0)
+                            if c_ is not None:
+                                PCONT[i, t] = True; V[k], om[k] = c_["V"], c_["om"]
+                                if c_["J"] > 0: ev.append((t - 0.5, k, c_["J"], float((P[k, 0] + Pp[0]) / 2)))
+                                P[k] = np.clip(P[k] + c_["nv"] * c_["ov"], rc[k] - mg, 1 - rc[k] + mg)
+                            continue
                         dv = P[k] - Pp; dist = float(np.linalg.norm(dv)); lim = rc[k] + Rp
                         if 1e-6 < dist < lim:
                             nv = dv / dist; s_ = float((V[k] - Vp) @ nv); PCONT[i, t] = True
@@ -230,17 +238,24 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 vh = Hp - H0
                 for k in range(N):                                   # main <-> objet : choc + PEAU + le lourd repousse la main
                     dv = P[k] - Hp; dist = float(np.linalg.norm(dv)); lim = rc[k] + Rh
-                    if 1e-6 < dist < lim:
-                        nv = dv / dist; vh_n = float(vh @ nv); vo_n = float(V[k] @ nv); s_ = vo_n - vh_n
+                    c_ = shape_contact(kind[k], s[k], ang[k], P[k], V[k], om[k], m[k], Hp, vh, Rh) if shape_phys else None
+                    if (c_ is not None) if shape_phys else (1e-6 < dist < lim):
+                        if shape_phys: nv = c_["nv"]; ov_s = c_["ov"]          # normale et enfoncement sur la VRAIE forme
+                        else: nv = dv / dist
+                        vh_n = float(vh @ nv); vo_n = float(V[k] @ nv); s_ = vo_n - vh_n
                         side = (0 if nv[0] > 0 else 1) if abs(nv[0]) >= abs(nv[1]) else (2 if nv[1] > 0 else 3)
                         J = 0.0
-                        if s_ < 0:
+                        if shape_phys and c_["J"] > 0:               # impulsion AU POINT DE CONTACT : elle fait tourner
+                            J = c_["J"]; V[k], om[k] = c_["V"], c_["om"]
+                            ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
+                            if echo > 0: vib = vib - J * nv
+                        elif not shape_phys and s_ < 0:
                             J = -2 * s_ * m[k] / (1 + m[k]); V[k] += J / m[k] * nv; om[k] += rng.normal(0, 0.1)
                             ev.append((t - 0.5, k, J, float((P[k, 0] + Hp[0]) / 2)))
                             if echo > 0: vib = vib - J * nv                     # le choc REPOUSSE le bras (ressenti, puis s'amortit)
                         TSRC[i, t] = max(TSRC[i, t], 1 if vh_n >= -vo_n else 2)  # qui est allé vers qui : moi (actif) / le monde (passif)
                         if vh_n >= -vo_n: felt = (Hp + nv * (Rh + 0.6 * rc[k])).astype(np.float32)   # où il l'a SENTI (côté de sa main)
-                        ov = lim - dist; w_ = m[k] / (1 + m[k])
+                        ov = ov_s if shape_phys else lim - dist; w_ = m[k] / (1 + m[k])
                         Hp = place(Hp - nv * ov * w_); P[k] = np.clip(P[k] + nv * ov * (1 - w_), rc[k] - mg, 1 - rc[k] + mg)
                         TOUCH[i, t, 2 * side] += J; TOUCH[i, t, 2 * side + 1] = max(TOUCH[i, t, 2 * side + 1], w_)
                 for k in range(N):                                   # objet <-> objet

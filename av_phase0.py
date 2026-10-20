@@ -469,6 +469,9 @@ def main():
                    "dans le toucher, et le bras ressent un recul qui s'amortit (sensations seulement, physique inchangée)")
     p.add_argument("--damp", type=float, default=0.0, help="FROTTEMENT (question user : les objets glissaient 10–20 px après une poussée de 1 px) : "
                    "vitesse des objets ×(1 − damp) par image -> il avance quand on le pousse, s'arrête peu après")
+    p.add_argument("--shape_phys", type=int, default=0, help="1 = PHYSIQUE DE FORME (av_shape.py) : le contact main <-> objet se calcule sur la vraie forme "
+                   "et l'impulsion au point de contact fait TOURNER l'objet (pousser une branche du T le fait pivoter ; un disque ne tourne pas). "
+                   "Avant : toutes les formes se poussaient comme des disques (rotation = bruit). Nécessaire pour Push-T (orientation)")
     p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
                    "après t0 (0 = jusqu'à la fin). D19 (T=32, causal) n'apprenait PAS à se servir de ses gestes avec des horizons jusqu'à 28 images ; "
                    "K=8 = comme à T=16, avec un passé deux fois plus long")
@@ -503,7 +506,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
