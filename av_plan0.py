@@ -187,6 +187,8 @@ def main():
     p.add_argument("--ckpt", required=True); p.add_argument("--episodes", type=int, default=60); p.add_argument("--diag", type=int, default=30)
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)");
+    p.add_argument("--chain", type=int, default=0, help="1 = IMAGINER PAS À PAS en planifiant (idée user, sans réentraînement) : l'image t+1 depuis le vrai passé, "
+                   "puis t+2 en repartant de t+1 IMAGINÉE (tous les sens, remise à l'échelle des latents de contexte), etc. — au lieu des Hh images d'un coup")
     p.add_argument("--slide", type=int, default=0, help="1 = ÉPISODES LONGS (idée user : un bébé plus jeune a besoin de plus de gestes) : --plan_steps peut dépasser T ; "
                    "à chaque geste le bébé voit ses T dernières images (fenêtre qui glisse) et imagine --plan_h images plus loin, puis replanifie"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
@@ -503,6 +505,14 @@ def main():
             dpx = np.abs(gf - env.X[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
             gmask = torch.from_numpy(dpx > 0.15).to(dev)
             if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
+        fidx = [torch.from_numpy(np.where(fr == t + hh)[0]).to(dev) for hh in range(1, Hh + 1)]   # TOUS les jetons de l'image t+hh (vue d'abord)
+        cs_, cm_ = ctx.float().std(-1).mean(), ctx.float().mean(-1).mean()   # échelle des latents de CONTEXTE (l'imaginé est à l'échelle normalisée)
+        def chain(K, cmd):                      # --chain : IMAGINER PAS À PAS (idée user) — image t+1 depuis le vrai passé, puis t+2 en repartant de t+1
+            cx, cid, out = ctx.expand(K, -1, -1), ci.expand(K, -1), []   # IMAGINÉE (tous les sens), etc. -> [(K, npf, dR) vue à t+1 .. t+Hh]
+            for hh in range(1, Hh + 1):
+                o = imagine(cx, fidx[hh - 1][None].expand(K, -1), cmd, cid); out.append(o[:, :npf])
+                if hh < Hh: cx = torch.cat([cx, (o.float() * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fidx[hh - 1][None].expand(K, -1)], 1)
+            return out
         def gcost(zi, hh):                      # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
             return ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
@@ -510,11 +520,12 @@ def main():
             with torch.no_grad():
                 if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
                     r_ = read(imagine(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
+                elif a.chain: r_ = read(chain(K, cmd)[-1])[:, None]
                 else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
-                with torch.no_grad(): return gcost(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)).view(K, npf, dR), Hh)
+                with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
             elif a.task == "direction": c_ = -((r_[..., :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
@@ -523,7 +534,7 @@ def main():
         def traj(plan):                         # plan (Hh, 2) -> positions IMAGINÉES (Hh, 4) à t+1 .. t+Hh (une requête par horizon)
             cmd = cmd0.expand(Hh, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = plan[None] / 0.05
             with torch.no_grad():
-                r_ = read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
+                r_ = torch.cat([read(z_) for z_ in chain(1, cmd[:1])]) if a.chain else read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[:, 2:4] = rb(imagine(ctx.expand(Hh, -1, -1), tib, cmd, ci.expand(Hh, -1))[:, 0])
                 return r_
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
