@@ -213,6 +213,9 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
+    p.add_argument("--gif", type=int, default=0, help="GIF ANIMÉ (demande user) des N premiers épisodes de CHAQUE politique (hasard, oracle, bébé) : "
+                   "à gauche ce qui se passe, à droite l'image-but (sans la main) ; dans --film_dir, préfixe --gif_tag")
+    p.add_argument("--gif_tag", type=str, default="gif")
     p.add_argument("--reader", type=str, default="attn", choices=["attn", "local"], help="INSTRUMENT de lecture des positions : attn = lecteur attentionnel "
                    "(conçu pour des cases globales) ; local = chaque case dit « la chose est chez moi + décalage » (adapté à un œil local)")
     p.add_argument("--read_level", type=str, default="top", choices=["top", "low", "both"], help="PYRAMIDE : à quel étage on LIT les positions — top = sortie du haut "
@@ -634,6 +637,9 @@ def main():
                                          qi=qty(im[-1], ref), qr=qty(re[-1], env.P if a.task in ("bouger", "direction") else ref)))
             env.step(np.asarray(act, np.float32))
         ok = ok_now()                                                    # PUSH-T : position ET orientation
+        if a.gif and ep < a.gif:
+            save_gif(env, a.plan_c, f"{a.film_dir}/{a.gif_tag}_{a.task}_{'bebe' if policy == 'MPC' else policy}_ep{ep}.gif",
+                     f"{a.task} | {'bébé' if policy == 'MPC' else policy} | ép. {ep} | {'RÉUSSI' if ok else 'raté'}")
         if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
         return d0, env.dist(), float(ok)
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
@@ -747,6 +753,20 @@ def main():
                              {"objet": "objet→cible", "pusht": "T→cible", "bouger": "déplacement objet", "direction": "déplacement objet"}.get(a.task, "main→but"))
                 print(f"      films -> {out}_ep*.png", flush=True)
     print(f"total {time.time() - t0:.0f}s")
+
+def save_gif(env, t0, path, label, scale=4, max_frames=160):
+    """GIF animé d'un épisode : à gauche les images vécues (t0 .. env.t), à droite le BUT (objet seul) ; texte = politique, résultat, geste."""
+    from PIL import Image, ImageDraw
+    up = lambda x: Image.fromarray((np.clip(x, 0, 1) * 255).astype(np.uint8)).resize((x.shape[1] * scale, x.shape[0] * scale), Image.NEAREST)
+    goal = up(env.frame(env.g, env.Hp, getattr(env, "g_ang", None), hand=False)); W, Hh_ = goal.size
+    ts = list(range(t0, env.t + 1)); k = max(1, -(-len(ts) // max_frames)); ts = ts[::k] + ([env.t] if ts[::k][-1] != env.t else [])
+    frames = []
+    for t in ts:
+        im = Image.new("RGB", (2 * W + 6, Hh_ + 30), (20, 20, 20)); im.paste(up(env.X[t]), (0, 30)); im.paste(goal, (W + 6, 30))
+        d = ImageDraw.Draw(im); d.text((3, 2), label, fill=(255, 255, 255)); d.text((3, 15), f"geste {t - t0}   |   but ->", fill=(200, 200, 200))
+        frames.append(im)
+    frames += [frames[-1]] * 8                                           # pause sur la fin
+    frames[0].save(path, save_all=True, append_images=frames[1:], duration=80, loop=0)
 
 def film_fig(films, path, title, has_obj, qlab="fin du plan"):
     """une case par geste planifié : image vue AVANT le geste ; pointillés = le plan IMAGINÉ (rouge objet, jaune main),
