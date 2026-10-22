@@ -476,6 +476,8 @@ def main():
                    "(--roll_k pas, comparés à la vraie suite à chaque pas ; gradient à travers la chaîne). Test planif 2026-10-21 : 1 geste à la fois 18 % "
                    "(objet->cible) mais 6 gestes enchaînés sans entraînement 5 % -> ses erreurs s'empilent ; ici il apprend à repartir de sa propre imagination")
     p.add_argument("--roll_k", type=int, default=3)
+    p.add_argument("--roll_obj", type=float, default=0.0, help="DÉROULE CENTRÉ OBJET : fenêtre tirée là où il SENT des contacts + poids (1 + w) sur les cases de vue "
+                   "qui changent plus que la moyenne après un contact senti (ce que son geste a mis en mouvement). D17k : le déroule seul aide le corps, pas l'objet")
     p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
                    "après t0 (0 = jusqu'à la fin). D19 (T=32, causal) n'apprenait PAS à se servir de ses gestes avec des horizons jusqu'à 28 images ; "
                    "K=8 = comme à T=16, avec un passé deux fois plus long")
@@ -540,7 +542,7 @@ def main():
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
-    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []
+    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []; roll_obj_hist = []
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
@@ -651,16 +653,30 @@ def main():
                 ok_ = torch.ones(B, device=dev) if wf_ is None else (wf_.sum(1) > 0).float()               # séquences où il a senti un contact (sinon rien à comparer)
                 al = (F.relu(e_t - e_l + a.act_margin * e_t.detach()) * ok_).sum() / ok_.sum().clamp_min(1.0)
                 gap = (((e_l - e_t) / e_t.clamp_min(1e-6)) * ok_).sum().detach() / ok_.sum().clamp_min(1.0)
-            ro_l = torch.zeros((), device=dev); ro_e = []
+            ro_l = torch.zeros((), device=dev); ro_e = []; ro_o = []
             if a.roll_w > 0:                                         # DÉROULE (idée user « un geste à la fois ») : imaginer l'image suivante, puis REPARTIR
-                K_ = a.roll_k; t0r = int(rng.integers(3, T - 1 - K_))   # de ce qu'il vient d'imaginer (tous les sens) pour la suivante, etc.
+                K_ = a.roll_k; t0s = np.arange(3, T - 1 - K_)           # de ce qu'il vient d'imaginer (tous les sens) pour la suivante, etc.
+                if a.roll_obj > 0:                                   # OBJET : fenêtre tirée là où il SENT des contacts (toucher, pas de position privilégiée)
+                    nc_ = np.array([float((contact[:, s_:s_ + K_].sum(1) > 0).sum()) for s_ in t0s]) + 0.5
+                    t0r = int(rng.choice(t0s, p=nc_ / nc_.sum()))
+                else: t0r = int(rng.choice(t0s))
                 cid = torch.from_numpy(np.where(fr_np <= t0r)[0]).to(dev).expand(B, -1)   # vrai passé jusqu'à t0r
                 cx = m.context(_gather(tok, cid), cid); cs_, cm_ = cx.float().std(-1).mean().detach(), cx.float().mean(-1).mean().detach()
+                if a.roll_obj > 0:
+                    zv_r = z[:, :nv].view(B, T, npf, -1); chr_ = (zv_r[:, 1:] - zv_r[:, :-1]).abs().mean(-1)
+                    chr_ = torch.cat([torch.zeros_like(chr_[:, :1]), chr_], 1)                       # (B, T, npf) changement depuis l'image d'avant
                 for k_ in range(1, K_ + 1):
                     fi = torch.from_numpy(np.where(fr_np == t0r + k_)[0]).to(dev).expand(B, -1)    # TOUS les jetons de l'image t0r+k
                     o_ = m.pred(cx, fi, cmd, cid).float(); d_ = o_ - _gather(z, fi)
                     d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(-1)
                     w_r = torch.gather(wmot, 1, fi) if wmot is not None else torch.ones_like(d_)
+                    if a.roll_obj > 0:                               # cases de VUE qui changent plus que la moyenne de l'image, une fois qu'il a SENTI un
+                        isv = md_t[fi[0]] == 0; pc_ = fi[0][isv] % npf   # contact (t0r..t0r+k) : ce que son geste a mis en mouvement (objet poussé, + sa main)
+                        ch_k = chr_[:, t0r + k_][:, pc_]; ch_k = (ch_k > ch_k.mean(1, keepdim=True)).float()
+                        felt_k = contact[:, t0r:t0r + k_ + 1].amax(1, keepdim=True)
+                        wo_ = torch.zeros_like(d_); wo_[:, isv] = felt_k * ch_k
+                        w_r = w_r * (1 + a.roll_obj * wo_)
+                        ro_o.append(float((d_ * wo_).sum() / wo_.sum().clamp_min(1.0)))
                     e_k = (d_ * w_r).sum() / w_r.sum(); ro_l = ro_l + e_k / K_; ro_e.append(float(e_k))
                     if k_ < K_:                                      # l'IMAGINÉ devient du passé (remis à l'échelle des latents de contexte, même règle que av_plan0 --chain)
                         cx = torch.cat([cx, (o_ * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fi], 1)
@@ -671,6 +687,9 @@ def main():
         if ro_e:
             roll_hist.append(ro_e)
             if len(roll_hist) > 1000: del roll_hist[:-500]
+        if ro_o:
+            roll_obj_hist.append(ro_o)
+            if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
         opt.zero_grad(); loss.backward()
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
@@ -684,6 +703,8 @@ def main():
                   f"| SIGReg {ma[2]:.3f} | écart-type cibles {ma[3]:.3f}" + (f" | AUTRES gestes : erreur {ma[4]:+.0%}" if a.act_w > 0 else "") + (f" | état du corps (lecture) {ma[5]:.4f}" if a.split else "") + (f" | CONTEXTE {ma[6]:.4f} (poids {cw:.2f})" if a.ctx_w > 0 else "") + (f" | ÉTAGE BAS {ma[7]:.4f}" if a.levels else "") + f" | {time.time() - t0:.0f}s", flush=True)
         if it % 500 == 0 and roll_hist:
             rh_ = np.array(roll_hist[-500:]); print("      DÉROULE (erreur par pas, en repartant de son imagination) : " + " | ".join(f"pas {k + 1} {x:.4f}" for k, x in enumerate(rh_.mean(0))), flush=True)
+            if roll_obj_hist:
+                ro_ = np.array(roll_obj_hist[-500:]); print("      DÉROULE OBJET (cases qui bougent après un contact senti) : " + " | ".join(f"pas {k + 1} {x:.4f}" for k, x in enumerate(ro_.mean(0))), flush=True)
         if it % 500 == 0 and cur_stats:
             cs_ = np.array(cur_stats[-500:]); print(f"      CURIOSITÉ : séquences avec contact — essayées {cs_[:, 0].mean():.0%}, ÉTUDIÉES {cs_[:, 1].mean():.0%}", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
