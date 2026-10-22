@@ -72,7 +72,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False):
+               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False, nohand=False):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -112,6 +112,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
+    XNH = np.zeros((n, T, H, H, 3), np.float32) if nohand else None    # nohand : la même image SANS sa main (but « objet seulement »)
     TOUCH = np.zeros((n, T, 8), np.float32); PROP = np.zeros((n, T, 4), np.float32); CMD = np.zeros((n, T, 2), np.float32)
     HAND = np.zeros((n, T, 2), np.float32); RH = np.zeros(n, np.float32); INVIEW = np.zeros((n, T), bool)
     POS = np.full((n, T, K, 2), np.nan, np.float32); ANG = np.full((n, T, K), np.nan, np.float32)
@@ -305,14 +306,16 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 PAR[i, t] = Pp; ph = np.clip((Rp * 0.85 - np.maximum(abs(xx - Pp[0]), abs(yy - Pp[1]))) * H + 0.5, 0, 1)[..., None]
                 img = img * (1 - ph) + pcol * ph
             hx = np.clip((Rh * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
-            X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp; INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))
+            X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp
+            if nohand: XNH[i, t] = img
+            INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))
             POS[i, t, :N] = P; ANG[i, t, :N] = ang; VIS[i, t, :N] = np.all((P > -s[:, None]) & (P < 1 + s[:, None]), axis=-1)
         extra = cont_sound(2 * hum * np.linalg.norm(vact, axis=1) / 0.08, HAND[i, :, 0], T, rng, "froisse")
         if N > 0 and hum > 0: extra = extra + fric_sound(POS[i, :, :N], mat, m, T, hum)          # identique à hum « fric » dans le champ, atténué hors champ
         if cf["mobile"]: extra = extra + cont_sound(2 * hum * mspd / 0.03, MOB[i, :, 0], T, rng, "tinte", mf0)
         A[i] = render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, 1, IMP[i], extra)
     return dict(X=X, A=A, TOUCH=TOUCH, PROP=PROP, CMD=CMD, HAND=HAND, RH=RH, INVIEW=INVIEW, POS=POS, ANG=ANG, SHAPE=SHAPE,
-                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT, CIRC=CIRC)
+                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT, CIRC=CIRC, **({"XNH": XNH} if nohand else {}))
 
 def baby_view(X, stage):
     """ce que le bébé VOIT à cette étape (numpy, pour les figures) : flou gaussien UNIFORME + gris + contraste réduit."""

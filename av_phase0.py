@@ -210,21 +210,35 @@ class DiffHead(nn.Module):
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
 class GoalHead(nn.Module):
-    """GESTES MANQUANTS (idée user 2026-10-22, « à la JEPA : voici le but, remplis les gestes ») : MAINTENANT (vue de l'image t0 + bras senti à t0,
-    encodés depuis le SEUL passé — l'œil voit toutes les images d'une séquence : encoder la séquence entière laisserait fuir la suite) + une IMAGE-BUT
-    K images plus tard (encodée seule) -> les K gestes qui y mènent. Appris sur son propre jeu : chaque séquence vécue = un exemple « comment aller
-    de A à B » (réétiquetage après coup : HER / GCSL ; jeu libre : Lynch 2019). Sert au planificateur à PROPOSER des gestes que l'imagination vérifie."""
+    """GESTES MANQUANTS (idée user 2026-10-22, « à la JEPA : voici le but, remplis les gestes ») : MAINTENANT (vue de l'image t0 + bras senti à t0)
+    + une IMAGE-BUT K images plus tard -> les K gestes qui y mènent. Appris sur son propre jeu : chaque séquence vécue = un exemple « comment aller
+    de A à B » (réétiquetage après coup : HER / GCSL ; jeu libre : Lynch 2019). Sert au planificateur à PROPOSER des gestes que l'imagination vérifie.
+    v2 (diag av_goal_diag) : latents NORMALISÉS à l'entrée (l'œil en ligne sort à grande échelle -> v1 restait constante, R² 0) et, par case,
+    [but − maintenant, but, maintenant] (la différence case à case, comme la tête de contingence qui marche)."""
     def __init__(s, d, npf, kmax, h=192, nl=3):
         super().__init__()
-        s.kmax = kmax; s.inp = nn.Linear(d, h); s.pos = nn.Parameter(torch.randn(1, 2 * npf + 1, h) * 0.02)
+        s.kmax = kmax; s.inp = nn.Linear(3 * d, h); s.inp_arm = nn.Linear(d, h); s.pos = nn.Parameter(torch.randn(1, npf + 1, h) * 0.02)
         s.q = nn.Parameter(torch.randn(1, kmax, h) * 0.02); s.kemb = nn.Embedding(kmax + 1, h)
         s.tr = nn.TransformerEncoder(nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.0, activation="gelu"), nl); s.out = nn.Linear(h, 2)
     def forward(s, z_now, z_goal, z_arm, K):
         """z_now, z_goal (B, npf, d), z_arm (B, 1, d), K = nb de gestes jusqu'au but -> (B, kmax, 2) commandes (normalisées comme cmd) ; seules les K premières comptent."""
-        B = len(z_now); x = s.inp(torch.cat([z_now, z_goal, z_arm], 1).to(s.inp.weight.dtype)) + s.pos
+        n_ = lambda z: F.layer_norm(z.float(), (z.size(-1),)); zn, zg, za = n_(z_now), n_(z_goal), n_(z_arm)
+        dt = s.inp.weight.dtype; B = len(zn)
+        x = torch.cat([s.inp(torch.cat([zg - zn, zg, zn], -1).to(dt)), s.inp_arm(za.to(dt))], 1) + s.pos
         kk = K if torch.is_tensor(K) else torch.full((B,), int(K), dtype=torch.long, device=x.device)
         q = s.q.expand(B, -1, -1) + s.kemb(kk)[:, None]
         return s.out(s.tr(torch.cat([x, q], 1))[:, -s.kmax:])
+
+def goal_encode(enc, tok, tok_goal, t0, K, nv, npf, T, fr_np):
+    """« maintenant + but » vus ENSEMBLE par l'œil, dans l'ordre des sens (l'œil groupe les sens par blocs contigus) : le vrai passé (tous les sens
+    jusqu'à t0) + la seule VUE de l'image t0+K prise dans tok_goal (p.ex. l'image SANS la main = but « objet seulement ») ; rien entre les deux.
+    -> (vue de t0 (B, npf, d), vue du but (B, npf, d), bras à t0 (B, 1, d))."""
+    gi_np = np.arange((t0 + K) * npf, (t0 + K + 1) * npf); ci_np = np.sort(np.concatenate([np.where(fr_np <= t0)[0], gi_np]))
+    B = len(tok); ci = torch.from_numpy(ci_np).to(tok.device).expand(B, -1)
+    tm = tok.clone(); tm[:, gi_np] = tok_goal[:, gi_np]
+    z = enc(torch.gather(tm, 1, ci.unsqueeze(-1).expand(-1, -1, tm.size(-1))), ci)
+    pos = lambda idx: torch.from_numpy(np.searchsorted(ci_np, idx)).to(tok.device)
+    return z[:, pos(np.arange(t0 * npf, (t0 + 1) * npf))], z[:, pos(gi_np)], z[:, pos(np.array([nv + 2 * T + t0]))]
 
 class Baby0(nn.Module):
     def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0):
@@ -280,9 +294,11 @@ def to_tok0(b, st, v, P, dev):
 
 def to_np(ws):
     cat = lambda k: np.concatenate([w[k] for w in ws])
-    return dict(X=(cat("X") * 255).round().astype(np.uint8), A=cat("A").astype(np.float16), TOUCH=cat("TOUCH"), PROP=cat("PROP"), CMD=cat("CMD"))
+    out = dict(X=(cat("X") * 255).round().astype(np.uint8), A=cat("A").astype(np.float16), TOUCH=cat("TOUCH"), PROP=cat("PROP"), CMD=cat("CMD"))
+    if "XNH" in ws[0]: out["XNH"] = (cat("XNH") * 255).round().astype(np.uint8)        # image SANS sa main (but « objet seulement »)
+    return out
 
-def to_torch(w, sl=slice(None)): return {k: torch.from_numpy(np.ascontiguousarray(w[k][sl])) for k in KEYS}
+def to_torch(w, sl=slice(None)): return {k: torch.from_numpy(np.ascontiguousarray(w[k][sl])) for k in KEYS + tuple(x for x in ("XNH",) if x in w)}
 
 def _batch0(job):
     seed, mix, wkw = job
@@ -500,6 +516,8 @@ def main():
     p.add_argument("--goal_k", type=int, default=8)
     p.add_argument("--goal_lr", type=float, default=1.0, help="taux d'apprentissage de la tête GESTES MANQUANTS = goal_lr × --lr, SANS le --lr_peak de la relance "
                    "(une tête NEUVE à 0.15 × lr n'apprenait rien : R² ≈ 0 après 1000 pas, D17m 1er essai)")
+    p.add_argument("--goal_nohand", type=int, default=1, help="1 = l'image-BUT est l'image t0+K SANS sa main (but « objet seulement », comme Push-T : "
+                   "sinon la tête apprend surtout « amène la main là où elle est sur l'image-but », et un but Push-T dessiné main sur place dit « ne bouge pas »)")
     p.add_argument("--goal_obj", type=float, default=0.0, help="> 0 : fenêtre des gestes manquants tirée surtout là où il SENT des contacts (comme --roll_obj)")
     p.add_argument("--roll_obj", type=float, default=0.0, help="DÉROULE CENTRÉ OBJET : fenêtre tirée là où il SENT des contacts + poids (1 + w) sur les cases de vue "
                    "qui changent plus que la moyenne après un contact senti (ce que son geste a mis en mouvement). D17k : le déroule seul aide le corps, pas l'objet")
@@ -537,7 +555,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"nohand": True} if a.goal_w > 0 and a.goal_nohand else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
@@ -554,7 +572,7 @@ def main():
     opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith("goal.")]}]
                             + ([{"params": gparams, "goal": True}] if gparams else []), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0, goal_nohand=a.goal_nohand)
     state = dict(it=0, hist=[], exams=[])
     fresh_opt = False
     if os.path.exists(a.ckpt):
@@ -726,13 +744,11 @@ def main():
                     ncg = np.array([float((contact[:, s_ + 1:s_ + Kg + 1].sum(1) > 0).sum()) for s_ in t0s_g]) * a.goal_obj + 0.5
                     t0g = int(rng.choice(t0s_g, p=ncg / ncg.sum()))
                 else: t0g = int(rng.choice(t0s_g))
-                cg_np = np.where(fr_np <= t0g)[0]; cg = torch.from_numpy(cg_np).to(dev).expand(B, -1)
-                zgc = m.enc(_gather(tok, cg), cg)                    # le SEUL passé (tous les sens) jusqu'à t0
-                vpos = torch.from_numpy(np.searchsorted(cg_np, np.arange(t0g * npf, (t0g + 1) * npf))).to(dev)   # vue de l'image t0
-                apos = int(np.searchsorted(cg_np, nv + 2 * T + t0g))                                              # bras senti à t0
-                gi = torch.arange((t0g + Kg) * npf, (t0g + Kg + 1) * npf, device=dev).expand(B, -1)
-                zgg = m.enc(_gather(tok, gi), gi)                    # l'image-BUT, encodée seule
-                pg = m.goal(zgc[:, vpos], zgg, zgc[:, apos:apos + 1], Kg)[:, :Kg].float(); yg = cmd[:, t0g + 1:t0g + Kg + 1].float()
+                tok_g = tok
+                if a.goal_nohand:                                    # but « objet seulement » : l'image t0+K SANS sa main (le vrai but de Push-T)
+                    bg_ = dict(bt_); bg_["X"] = bt_["XNH"]; tok_g, _ = to_tok0(bg_, st, v, a.P, dev)
+                zn_, zg_, za_ = goal_encode(m.enc, tok, tok_g, t0g, Kg, nv, npf, T, fr_np)   # maintenant + but vus ENSEMBLE (rien entre les deux)
+                pg = m.goal(zn_, zg_, za_, Kg)[:, :Kg].float(); yg = cmd[:, t0g + 1:t0g + Kg + 1].float()
                 gl = F.smooth_l1_loss(pg, yg)
                 with torch.no_grad():                                # R² (0 = deviner la moyenne du lot) : tous, 1er geste, séquences où il pousse (contact senti)
                     r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean((0, 1), keepdim=True)) ** 2).sum().clamp_min(1e-8))

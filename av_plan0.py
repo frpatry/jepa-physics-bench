@@ -22,7 +22,7 @@ from av_world0 import gen_world0, cont_sound, SHOULDER
 from av_world5 import shape_alpha
 from av_shape import contact as shape_contact
 from av_dev_long import _PosReader
-from av_phase0 import Baby0, baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, T, H
+from av_phase0 import Baby0, baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, T, H, goal_encode
 
 VMAX = 0.1
 
@@ -101,13 +101,14 @@ class Push0:
         return float(np.linalg.norm((s.Hp if s.task.startswith("main") else s.P) - s.g))
     def ang_err(s):
         return abs((s.ang - s.g_ang + math.pi) % (2 * math.pi) - math.pi)
-    def frame(s, P, Hp, ang=None):
-        """image du monde avec l'objet en P et la main en Hp (le BOL, s'il y en a un, est un anneau gris fixe autour de la cible)."""
+    def frame(s, P, Hp, ang=None, hand=True):
+        """image du monde avec l'objet en P et la main en Hp (le BOL, s'il y en a un, est un anneau gris fixe autour de la cible) ; hand=False : sans la main."""
         img = np.zeros((H, H, 3), np.float32)
         if s.bowl:
             r_ = np.sqrt((s.xx - s.g[0]) ** 2 + (s.yy - s.g[1]) ** 2); rb = s.rc + 0.035
             ring = np.clip(1.0 - np.abs(r_ - rb) * H / 0.9, 0, 1)[..., None]; img = img * (1 - ring) + 0.45 * ring
         al = shape_alpha(s.kind, s.sz, s.ang if ang is None else ang, P[0], P[1], s.xx, s.yy, H)[..., None]; img = img * (1 - al) + s.col * al
+        if not hand: return img
         hx = np.clip((s.Rh * 0.85 - np.maximum(abs(s.xx - Hp[0]), abs(s.yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
         return img * (1 - hx) + hx
     def record(s, t, render=True):
@@ -547,18 +548,14 @@ def main():
         return cost
     Kp_ = (a.propose_k or m.goal.kmax) if a.propose else 0
     if a.propose: assert hasattr(m, "goal"), "--propose : bébé entraîné avec --goal_w (tête GESTES MANQUANTS)"; assert a.task in ("objet", "pusht"), "--propose : objet / pusht"
-    def propose(env):                                                    # GESTES MANQUANTS : maintenant (passé seul) + image-but Kp plus loin -> Kp gestes bruts
+    def propose(env):                                                    # GESTES MANQUANTS : maintenant + image-but Kp plus loin (vus ENSEMBLE) -> Kp gestes bruts
         s0p = max(0, env.t + Kp_ - (T - 1)); tp = env.t - s0p; b1 = env.batch(s0p)
-        Xg = env.X[s0p:s0p + T].copy(); Xg[tp + Kp_] = env.frame(env.g, env.Hp, getattr(env, "g_ang", None))   # le BUT à l'image t+Kp (comme --goal_img)
+        Xg = env.X[s0p:s0p + T].copy(); Xg[tp + Kp_] = env.frame(env.g, env.Hp, getattr(env, "g_ang", None), hand=not cfg.get("goal_nohand", 1))   # le BUT (objet seul)
         bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
         tok, _ = to_tok0(b1, st, v, P_, dev); tkg, _ = to_tok0(bg, st, v, P_, dev)
-        cg_np = np.where(fr <= tp)[0]; cg = torch.from_numpy(cg_np).to(dev)[None]
-        vpos = torch.from_numpy(np.searchsorted(cg_np, np.arange(tp * npf, (tp + 1) * npf))).to(dev); apos = int(np.searchsorted(cg_np, ia + tp))
-        gi = torch.arange((tp + Kp_) * npf, (tp + Kp_ + 1) * npf, device=dev)[None]
         with torch.no_grad():
-            zc = m.enc(torch.gather(tok, 1, cg.unsqueeze(-1).expand(-1, -1, tok.size(-1))), cg)
-            zg = m.enc(torch.gather(tkg, 1, gi.unsqueeze(-1).expand(-1, -1, tkg.size(-1))), gi)
-            pr = m.goal(zc[:, vpos], zg, zc[:, apos:apos + 1], Kp_)[0, :Kp_].float() * 0.05      # commandes normalisées -> gestes bruts (cmd = geste / 0.05)
+            zn, zg, za = goal_encode(m.enc, tok, tkg, tp, Kp_, nv, npf, T, fr)
+            pr = m.goal(zn, zg, za, Kp_)[0, :Kp_].float() * 0.05      # commandes normalisées -> gestes bruts (cmd = geste / 0.05)
         return pr.clamp(-VMAX, VMAX)
     def real_cost(env, cand):
         out = []
