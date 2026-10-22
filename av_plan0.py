@@ -226,6 +226,8 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
+    p.add_argument("--goal_hand", type=int, default=0, help="--goal_img : 1 = l'image-but montre aussi la MAIN à sa place actuelle (ancien) ; 0 = image-but SANS main "
+                   "(décision user ; GIF 2026-10-22 : avec la main dessinée, le bébé « remplissait » la zone-but avec sa main au lieu d'y pousser le T)")
     p.add_argument("--pols", type=str, default="hasard,oracle", help="politiques de repère jouées avant le bébé (vide = le bébé seulement : GIF du bébé à moindre coût)")
     p.add_argument("--gif_frames", type=int, default=160, help="images max par GIF (au-delà : une image sur k)")
     p.add_argument("--gif", type=int, default=0, help="GIF ANIMÉ (demande user) des N premiers épisodes de CHAQUE politique (hasard, oracle, bébé) : "
@@ -522,7 +524,7 @@ def main():
                     else: sub = behind
                 else: phase = 2
         if a.goal_img:                          # BUT = IMAGE : la suite « le monde saute au but et y reste » encodée par l'œil-cible (comme une cible d'entraînement)
-            Xg = env.X[s0:s0 + T].copy(); gf = env.frame(env.g, env.Hp, env.g_ang); Xg[t + 1:] = gf
+            Xg = env.X[s0:s0 + T].copy(); gf = env.frame(env.g, env.Hp, env.g_ang, hand=bool(a.goal_hand)); Xg[t + 1:] = gf   # (sans main par défaut : le but = le monde, pas moi)
             bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
             with torch.no_grad():
                 tkg, _ = to_tok0(bg, st, v, P_, dev); ixg = torch.arange(nv, device=dev)[None]
