@@ -226,6 +226,8 @@ def main():
     p.add_argument("--blocks", type=int, default=0, help="1 = tâches dans le MONDE DE BLOCS (option B : l'objet ne bouge que poussé) ; lecteur entraîné avec blocs")
     p.add_argument("--film", type=int, default=0, help="FILM : une image par geste planifié pour les N premiers épisodes MPC (plan imaginé vs plan exécuté pour de vrai)")
     p.add_argument("--film_dir", type=str, default="/content")
+    p.add_argument("--pols", type=str, default="hasard,oracle", help="politiques de repère jouées avant le bébé (vide = le bébé seulement : GIF du bébé à moindre coût)")
+    p.add_argument("--gif_frames", type=int, default=160, help="images max par GIF (au-delà : une image sur k)")
     p.add_argument("--gif", type=int, default=0, help="GIF ANIMÉ (demande user) des N premiers épisodes de CHAQUE politique (hasard, oracle, bébé) : "
                    "à gauche ce qui se passe, à droite l'image-but (sans la main) ; dans --film_dir, préfixe --gif_tag")
     p.add_argument("--gif_tag", type=str, default="gif")
@@ -658,7 +660,7 @@ def main():
         if a.gif and ep < a.gif:                                         # (texte SANS accents : la police par défaut de PIL ne les a pas)
             save_gif(env, a.plan_c, f"{a.film_dir}/{a.gif_tag}_{a.task}_{'bebe' if policy == 'MPC' else policy}_ep{ep}.gif",
                      f"{a.task} | {'bebe' if policy == 'MPC' else policy} | ep. {ep} | {'REUSSI' if ok else 'rate'}" + (f" | couv. max {cmax:.0%}" if a.task == "pusht" else ""),
-                     cov=a.task == "pusht")
+                     cov=a.task == "pusht", max_frames=a.gif_frames)
         if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
         return d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit)
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
@@ -744,7 +746,7 @@ def main():
              "pusht": "PUSH-T : amener le T sur une position ET une orientation cibles (réussite : " + (f"COUVERTURE du T-but ≥ {a.cov:.0%}, règle du vrai Push-T)" if a.cov > 0 else "< 0.06 et < 20°, ancienne règle laxiste)") + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur (position seulement !)")}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(EL - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes{' (ÉPISODE LONG, fenêtre qui glisse)' if a.slide else ''}, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else (f'réussite (≥ {a.cov:.0%} couv.)' if a.task == 'pusht' and a.cov > 0 else 'réussite (< ' + str(succ) + ')')):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
-    for pol in ("hasard", "oracle"):
+    for pol in [x for x in a.pols.split(",") if x]:
         steps_used.clear(); tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
         if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
