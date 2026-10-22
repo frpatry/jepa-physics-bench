@@ -187,6 +187,10 @@ def main():
     p.add_argument("--ckpt", required=True); p.add_argument("--episodes", type=int, default=60); p.add_argument("--diag", type=int, default=30)
     p.add_argument("--plan_c", type=int, default=3); p.add_argument("--plan_h", type=int, default=6); p.add_argument("--plan_seg", type=int, default=2)
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)");
+    p.add_argument("--propose", type=int, default=0, help="GESTES MANQUANTS (bébé entraîné avec --goal_w) : 1 = la tête propose les gestes vers l'image-but "
+                   "(maintenant + but -> K gestes) et la recherche CEM PART de cette proposition (l'imagination vérifie) ; 2 = la proposition seule, exécutée "
+                   "sans imagination (intuition « système 1 ») ; objet / pusht")
+    p.add_argument("--propose_k", type=int, default=0, help="nb de gestes demandés à la tête (0 = son maximum, --goal_k de l'entraînement)")
     p.add_argument("--chain", type=int, default=0, help="1 = IMAGINER PAS À PAS en planifiant (idée user, sans réentraînement) : l'image t+1 depuis le vrai passé, "
                    "puis t+2 en repartant de t+1 IMAGINÉE (tous les sens, remise à l'échelle des latents de contexte), etc. — au lieu des Hh images d'un coup")
     p.add_argument("--stop_success", type=int, default=0, help="1 = l'épisode S'ARRÊTE dès la réussite (règle du vrai Push-T : réussi s'il atteint le but à un moment) ; "
@@ -541,6 +545,21 @@ def main():
                 return r_
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
+    Kp_ = (a.propose_k or m.goal.kmax) if a.propose else 0
+    if a.propose: assert hasattr(m, "goal"), "--propose : bébé entraîné avec --goal_w (tête GESTES MANQUANTS)"; assert a.task in ("objet", "pusht"), "--propose : objet / pusht"
+    def propose(env):                                                    # GESTES MANQUANTS : maintenant (passé seul) + image-but Kp plus loin -> Kp gestes bruts
+        s0p = max(0, env.t + Kp_ - (T - 1)); tp = env.t - s0p; b1 = env.batch(s0p)
+        Xg = env.X[s0p:s0p + T].copy(); Xg[tp + Kp_] = env.frame(env.g, env.Hp, getattr(env, "g_ang", None))   # le BUT à l'image t+Kp (comme --goal_img)
+        bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
+        tok, _ = to_tok0(b1, st, v, P_, dev); tkg, _ = to_tok0(bg, st, v, P_, dev)
+        cg_np = np.where(fr <= tp)[0]; cg = torch.from_numpy(cg_np).to(dev)[None]
+        vpos = torch.from_numpy(np.searchsorted(cg_np, np.arange(tp * npf, (tp + 1) * npf))).to(dev); apos = int(np.searchsorted(cg_np, ia + tp))
+        gi = torch.arange((tp + Kp_) * npf, (tp + Kp_ + 1) * npf, device=dev)[None]
+        with torch.no_grad():
+            zc = m.enc(torch.gather(tok, 1, cg.unsqueeze(-1).expand(-1, -1, tok.size(-1))), cg)
+            zg = m.enc(torch.gather(tkg, 1, gi.unsqueeze(-1).expand(-1, -1, tkg.size(-1))), gi)
+            pr = m.goal(zc[:, vpos], zg, zc[:, apos:apos + 1], Kp_)[0, :Kp_].float() * 0.05      # commandes normalisées -> gestes bruts (cmd = geste / 0.05)
+        return pr.clamp(-VMAX, VMAX)
     def real_cost(env, cand):
         out = []
         for cc in cand.cpu().numpy():
@@ -561,7 +580,7 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (a.plan_h if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (max(a.plan_h, Kp_) if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         def ok_now():
             if a.task == "pusht": return float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)
@@ -582,11 +601,17 @@ def main():
                 return res
             if policy == "hasard": act = rng.uniform(-VMAX, VMAX, 2)
             elif policy == "oracle": act = oracle_real(env) if a.task == "pusht" else oracle(env)
+            elif a.propose == 2: act = propose(env)[0].cpu().numpy()        # INTUITION seule : le 1er geste proposé, sans imaginer
             else:
                 cost = imag_cost(env, Hh); K = a.plan_seg if a.plan_seg > 0 else Hh; rep = -(-Hh // K)
                 mu_, sd_ = torch.zeros(K, 2, device=dev), torch.full((K, 2), 0.06, device=dev)
-                for _ in range(a.iters):
-                    seg = (mu_ + sd_ * torch.randn(a.pop, K, 2, device=dev)).clamp(-VMAX, VMAX); cand = seg.repeat_interleave(rep, 1)[:, :Hh]
+                if a.propose == 1:                                   # la recherche PART de la proposition (moyenne par segment), plus resserrée
+                    pr_ = propose(env); pr_ = torch.cat([pr_, pr_[-1:].expand(max(0, Hh - len(pr_)), -1)])[:Hh]
+                    mu_ = torch.stack([pr_[i * rep:(i + 1) * rep].mean(0) for i in range(K)]); sd_ = torch.full((K, 2), 0.04, device=dev)
+                for it_ in range(a.iters):
+                    seg = (mu_ + sd_ * torch.randn(a.pop, K, 2, device=dev)).clamp(-VMAX, VMAX)
+                    if a.propose == 1 and it_ == 0: seg[0] = mu_                 # la proposition elle-même est jugée
+                    cand = seg.repeat_interleave(rep, 1)[:, :Hh]
                     el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
                 if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
@@ -701,7 +726,7 @@ def main():
     cas = [int(x) for x in a.cost_alls.split(",")] if a.cost_alls else [a.cost_all]
     for h_, sg, ca in [(h_, sg, ca) for h_ in hs for sg in sgs for ca in cas]:
         if True:
-            a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = f"MPC h={h_}" + (" +ss-buts" if sg else "") + (" +coût-tous-pas" if ca else "")
+            a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = ("INTUITION seule" if a.propose == 2 else f"MPC h={h_}" + (" +ss-buts" if sg else "") + (" +coût-tous-pas" if ca else "") + (" +proposé" if a.propose == 1 else ""))
             recs = [[] for _ in range(a.dump_n)]; films = [[] for _ in range(a.film)]; S = []
             steps_used.clear(); tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)

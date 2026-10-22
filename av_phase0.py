@@ -209,8 +209,25 @@ class DiffHead(nn.Module):
         super().__init__(); s.pos = nn.Parameter(torch.zeros(1, npf, 2 * d)); s.mlp = nn.Sequential(nn.Linear(2 * d, h), nn.GELU(), nn.Linear(h, h), nn.GELU()); s.out = nn.Linear(h, 2)
     def forward(s, z0, z1): return s.out(s.mlp(torch.cat([z1 - z0, z1], -1) + s.pos).mean(1))
 
+class GoalHead(nn.Module):
+    """GESTES MANQUANTS (idée user 2026-10-22, « à la JEPA : voici le but, remplis les gestes ») : MAINTENANT (vue de l'image t0 + bras senti à t0,
+    encodés depuis le SEUL passé — l'œil voit toutes les images d'une séquence : encoder la séquence entière laisserait fuir la suite) + une IMAGE-BUT
+    K images plus tard (encodée seule) -> les K gestes qui y mènent. Appris sur son propre jeu : chaque séquence vécue = un exemple « comment aller
+    de A à B » (réétiquetage après coup : HER / GCSL ; jeu libre : Lynch 2019). Sert au planificateur à PROPOSER des gestes que l'imagination vérifie."""
+    def __init__(s, d, npf, kmax, h=192, nl=3):
+        super().__init__()
+        s.kmax = kmax; s.inp = nn.Linear(d, h); s.pos = nn.Parameter(torch.randn(1, 2 * npf + 1, h) * 0.02)
+        s.q = nn.Parameter(torch.randn(1, kmax, h) * 0.02); s.kemb = nn.Embedding(kmax + 1, h)
+        s.tr = nn.TransformerEncoder(nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.0, activation="gelu"), nl); s.out = nn.Linear(h, 2)
+    def forward(s, z_now, z_goal, z_arm, K):
+        """z_now, z_goal (B, npf, d), z_arm (B, 1, d), K = nb de gestes jusqu'au but -> (B, kmax, 2) commandes (normalisées comme cmd) ; seules les K premières comptent."""
+        B = len(z_now); x = s.inp(torch.cat([z_now, z_goal, z_arm], 1).to(s.inp.weight.dtype)) + s.pos
+        kk = K if torch.is_tensor(K) else torch.full((B,), int(K), dtype=torch.long, device=x.device)
+        q = s.q.expand(B, -1, -1) + s.kemb(kk)[:, None]
+        return s.out(s.tr(torch.cat([x, q], 1))[:, -s.kmax:])
+
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0):
         super().__init__()
         s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs, reg_frame=reg_frame)
         assert not (regs and (levels or split or resid)), "cases résumé : prédicteur unique non résiduel, sans pyramide"
@@ -219,6 +236,7 @@ class Baby0(nn.Module):
         assert not (split and resid), "corps/monde : pas de prédicteur résiduel"
         if resid: nn.init.zeros_(s.pred.head.weight); nn.init.zeros_(s.pred.head.bias)   # départ = « rien ne change »
         s.inv = DiffHead(d, npf) if inv_head == "diff" else InvHead(d, npf)
+        if goal_k: s.goal = GoalHead(d, npf, goal_k)                  # GESTES MANQUANTS vers une image-but (--goal_w)
         if std_tgt: s.register_buffer("tstd", torch.ones(4, d))       # écart-type courant des latents CIBLES par sens et par dimension
         if levels:                                                     # PYRAMIDE À 2 ÉTAGES : l'imagination reçoit l'étage bas (fin) + le haut (résumé)
             assert not split, "pyramide : prédicteur unique seulement"
@@ -235,7 +253,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0)), int(cfg.get("goal_k", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -476,6 +494,11 @@ def main():
                    "(--roll_k pas, comparés à la vraie suite à chaque pas ; gradient à travers la chaîne). Test planif 2026-10-21 : 1 geste à la fois 18 % "
                    "(objet->cible) mais 6 gestes enchaînés sans entraînement 5 % -> ses erreurs s'empilent ; ici il apprend à repartir de sa propre imagination")
     p.add_argument("--roll_k", type=int, default=3)
+    p.add_argument("--goal_w", type=float, default=0.0, help="GESTES MANQUANTS (idée user) : poids de la devinette « voici maintenant (vue + bras) et une image-BUT "
+                   "K images plus loin : quels gestes y mènent ? » (K tiré dans 1..--goal_k ; appris sur son propre jeu, sans étiquette). Constat Push-T 500 gestes "
+                   "(D17l 180k) : oracle 95 %%, bébé 5 %% = hasard -> le planificateur cherche au hasard avec une imagination de la poussée fausse")
+    p.add_argument("--goal_k", type=int, default=8)
+    p.add_argument("--goal_obj", type=float, default=0.0, help="> 0 : fenêtre des gestes manquants tirée surtout là où il SENT des contacts (comme --roll_obj)")
     p.add_argument("--roll_obj", type=float, default=0.0, help="DÉROULE CENTRÉ OBJET : fenêtre tirée là où il SENT des contacts + poids (1 + w) sur les cases de vue "
                    "qui changent plus que la moyenne après un contact senti (ce que son geste a mis en mouvement). D17k : le déroule seul aide le corps, pas l'objet")
     p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
@@ -520,29 +543,35 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal), a.goal_k if a.goal_w > 0 else 0).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0)
     state = dict(it=0, hist=[], exams=[])
+    fresh_opt = False
     if os.path.exists(a.ckpt):
         ck = torch.load(a.ckpt, map_location=dev, weights_only=False)
         assert int(ck["cfg"].get("T", 16)) == T, f"reprise : le ckpt est à T={ck['cfg'].get('T', 16)} images, relancer avec --T {ck['cfg'].get('T', 16)}"
         fresh = a.split and not any(k.startswith("pred.b_") for k in ck["m"])   # œil d'un bébé à prédicteur unique -> corps/monde NEUFS
         if fresh: m.load_state_dict({k: w for k, w in ck["m"].items() if not k.startswith("pred.")}, strict=False); print("œil repris, prédicteur CORPS / MONDE neuf", flush=True)
-        else: m.load_state_dict(ck["m"])
+        else:
+            res_ = m.load_state_dict(ck["m"], strict=False)            # une tête GESTES MANQUANTS neuve peut manquer au ckpt (rien d'autre)
+            bad_ = [k for k in res_.missing_keys if not k.startswith("goal.")] + list(res_.unexpected_keys)
+            assert not bad_, f"reprise : clés incompatibles {bad_[:5]}"
+            new_goal = any(k.startswith("goal.") for k in res_.missing_keys)
+            if new_goal: fresh_opt = True; print("tête GESTES MANQUANTS neuve (le reste repris ; optimiseur neuf)", flush=True)
         tgt.load_state_dict(ck["tgt"]); state = ck["state"]
-        if "opt" in ck and not fresh: opt.load_state_dict(ck["opt"])       # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
+        if "opt" in ck and not fresh and not fresh_opt: opt.load_state_dict(ck["opt"])       # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
         if fresh and a.start_it: state["it"] = a.start_it                # œil d'un bébé plus âgé, prédicteur neuf : on rejoue 0d–0e
         if "norm" in ck: st = ck["norm"]                                  # garder la normalisation des sens avec laquelle il a appris
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
-    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []; roll_obj_hist = []
+    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []; roll_obj_hist = []; goal_hist = []
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
@@ -680,10 +709,29 @@ def main():
                     e_k = (d_ * w_r).sum() / w_r.sum(); ro_l = ro_l + e_k / K_; ro_e.append(float(e_k))
                     if k_ < K_:                                      # l'IMAGINÉ devient du passé (remis à l'échelle des latents de contexte, même règle que av_plan0 --chain)
                         cx = torch.cat([cx, (o_ * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fi], 1)
+            gl = torch.zeros((), device=dev)
+            if a.goal_w > 0:                                         # GESTES MANQUANTS : maintenant (passé seul) + image-but K plus loin -> les K gestes
+                Kg = int(rng.integers(1, a.goal_k + 1)); t0s_g = np.arange(2, T - Kg)
+                if a.goal_obj > 0:                                   # surtout là où il SENT des contacts (ce qu'il pousse)
+                    ncg = np.array([float((contact[:, s_ + 1:s_ + Kg + 1].sum(1) > 0).sum()) for s_ in t0s_g]) * a.goal_obj + 0.5
+                    t0g = int(rng.choice(t0s_g, p=ncg / ncg.sum()))
+                else: t0g = int(rng.choice(t0s_g))
+                cg_np = np.where(fr_np <= t0g)[0]; cg = torch.from_numpy(cg_np).to(dev).expand(B, -1)
+                zgc = m.enc(_gather(tok, cg), cg)                    # le SEUL passé (tous les sens) jusqu'à t0
+                vpos = torch.from_numpy(np.searchsorted(cg_np, np.arange(t0g * npf, (t0g + 1) * npf))).to(dev)   # vue de l'image t0
+                apos = int(np.searchsorted(cg_np, nv + 2 * T + t0g))                                              # bras senti à t0
+                gi = torch.arange((t0g + Kg) * npf, (t0g + Kg + 1) * npf, device=dev).expand(B, -1)
+                zgg = m.enc(_gather(tok, gi), gi)                    # l'image-BUT, encodée seule
+                pg = m.goal(zgc[:, vpos], zgg, zgc[:, apos:apos + 1], Kg)[:, :Kg].float(); yg = cmd[:, t0g + 1:t0g + Kg + 1].float()
+                gl = F.smooth_l1_loss(pg, yg)
+                with torch.no_grad():                                # R² (0 = deviner la moyenne du lot) : tous, 1er geste, séquences où il pousse (contact senti)
+                    r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean((0, 1), keepdim=True)) ** 2).sum().clamp_min(1e-8))
+                    hc = contact[:, t0g + 1:t0g + Kg + 1].amax(1) > 0
+                    goal_hist.append((r2(pg, yg), r2(pg[:, :1], yg[:, :1]), r2(pg[hc], yg[hc]) if int(hc.sum()) > 4 else float("nan"), Kg))
         sr = torch.zeros((), device=dev)
         if a.sig_w > 0 and not a.freeze_eye:
             with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l
+        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl
         if ro_e:
             roll_hist.append(ro_e)
             if len(roll_hist) > 1000: del roll_hist[:-500]
@@ -691,7 +739,9 @@ def main():
             roll_obj_hist.append(ro_o)
             if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
         opt.zero_grad(); loss.backward()
-        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.'))], 1.0); opt.step()
+        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith('goal.')], 1.0)
+        if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)   # la tête GESTES MANQUANTS à part (le JEPA dominerait l'écrêtage)
+        opt.step()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         if not a.freeze_eye:
             with torch.no_grad():
@@ -705,6 +755,10 @@ def main():
             rh_ = np.array(roll_hist[-500:]); print("      DÉROULE (erreur par pas, en repartant de son imagination) : " + " | ".join(f"pas {k + 1} {x:.4f}" for k, x in enumerate(rh_.mean(0))), flush=True)
             if roll_obj_hist:
                 ro_ = np.array(roll_obj_hist[-500:]); print("      DÉROULE OBJET (cases qui bougent après un contact senti) : " + " | ".join(f"pas {k + 1} {x:.4f}" for k, x in enumerate(ro_.mean(0))), flush=True)
+        if it % 500 == 0 and goal_hist:
+            gh_ = np.array(goal_hist[-500:], dtype=np.float64); del goal_hist[:-500]
+            print(f"      GESTES MANQUANTS (vers une image-but 1..{a.goal_k} images plus loin ; R² 0 = deviner la moyenne) : tous {gh_[:, 0].mean():+.2f} "
+                  f"| 1er geste {gh_[:, 1].mean():+.2f} | quand il POUSSE (contact senti) {np.nanmean(gh_[:, 2]):+.2f} | K≤2 {gh_[gh_[:, 3] <= 2, 0].mean():+.2f} K≥6 {gh_[gh_[:, 3] >= 6, 0].mean():+.2f}", flush=True)
         if it % 500 == 0 and cur_stats:
             cs_ = np.array(cur_stats[-500:]); print(f"      CURIOSITÉ : séquences avec contact — essayées {cs_[:, 0].mean():.0%}, ÉTUDIÉES {cs_[:, 1].mean():.0%}", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
