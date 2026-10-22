@@ -189,6 +189,8 @@ def main():
     p.add_argument("--plan_steps", type=int, default=12, help="gestes par épisode (12 = comme à T=16)");
     p.add_argument("--chain", type=int, default=0, help="1 = IMAGINER PAS À PAS en planifiant (idée user, sans réentraînement) : l'image t+1 depuis le vrai passé, "
                    "puis t+2 en repartant de t+1 IMAGINÉE (tous les sens, remise à l'échelle des latents de contexte), etc. — au lieu des Hh images d'un coup")
+    p.add_argument("--stop_success", type=int, default=0, help="1 = l'épisode S'ARRÊTE dès la réussite (règle du vrai Push-T : réussi s'il atteint le but à un moment) ; "
+                   "0 = jugé à la fin seulement (ancien) ; journal « gestes jusqu'à la réussite »")
     p.add_argument("--slide", type=int, default=0, help="1 = ÉPISODES LONGS (idée user : un bébé plus jeune a besoin de plus de gestes) : --plan_steps peut dépasser T ; "
                    "à chaque geste le bébé voit ses T dernières images (fenêtre qui glisse) et imagine --plan_h images plus loin, puis replanifie"); p.add_argument("--pop", type=int, default=64); p.add_argument("--iters", type=int, default=4)
     p.add_argument("--n_read", type=int, default=6000); p.add_argument("--read_steps", type=int, default=4000)
@@ -561,7 +563,11 @@ def main():
     def run(ep, policy, rec=None, stats=None, film=None):
         env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (a.plan_h if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
+        def ok_now():
+            if a.task == "pusht": return float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)
+            return env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         while env.t < min(EL - 1, a.plan_c + a.plan_steps):         # même nombre de gestes quelle que soit T
+            if a.stop_success and ok_now(): break                    # réussi : l'épisode s'arrête (règle du vrai Push-T)
             Hh = a.plan_h if a.slide else min(a.plan_h, T - 1 - env.t)
             if policy == "diag":
                 from scipy.stats import spearmanr
@@ -605,9 +611,10 @@ def main():
                                          phase=cost.phase, sub=None if cost.sub is None else cost.sub.cpu().numpy(), g=ref,
                                          qi=qty(im[-1], ref), qr=qty(re[-1], env.P if a.task in ("bouger", "direction") else ref)))
             env.step(np.asarray(act, np.float32))
-        ok = env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
-        if a.task == "pusht": ok = float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)   # PUSH-T : position ET orientation
+        ok = ok_now()                                                    # PUSH-T : position ET orientation
+        if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
         return d0, env.dist(), float(ok)
+    steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
     EL = a.plan_c + a.plan_steps + 1 if a.slide else T                  # durée d'un épisode (fenêtre qui glisse si > T)
     succ = 0.04 if a.task.startswith("main") else 0.06
     near = 3.0 / H                                                       # critère « PRÈS » (bébé de 4–6 mois : arrive près puis corrige) : à moins de 3 px
@@ -686,8 +693,9 @@ def main():
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(EL - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes{' (ÉPISODE LONG, fenêtre qui glisse)' if a.slide else ''}, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
     for pol in ("hasard", "oracle"):
-        tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
+        steps_used.clear(); tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
+        if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
     hs = [int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]
     sgs = [int(x) for x in a.subgoals.split(",")] if a.subgoals else [a.subgoal]
     cas = [int(x) for x in a.cost_alls.split(",")] if a.cost_alls else [a.cost_all]
@@ -695,8 +703,9 @@ def main():
         if True:
             a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = f"MPC h={h_}" + (" +ss-buts" if sg else "") + (" +coût-tous-pas" if ca else "")
             recs = [[] for _ in range(a.dump_n)]; films = [[] for _ in range(a.film)]; S = []
-            tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
+            steps_used.clear(); tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
+            if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
             S = np.array(S, dtype=np.float64)                             # (h, err objet, err main, copie objet, copie main, l'objet bouge, phase)
             print(f"      DÉRIVE de l'imagination (plan entier exécuté pour de vrai, px) : h | objet qui BOUGE imaginé / copie (n) "
                   f"| objet IMMOBILE imaginé / copie | main imaginée / copie")
