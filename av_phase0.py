@@ -498,6 +498,8 @@ def main():
                    "K images plus loin : quels gestes y mènent ? » (K tiré dans 1..--goal_k ; appris sur son propre jeu, sans étiquette). Constat Push-T 500 gestes "
                    "(D17l 180k) : oracle 95 %%, bébé 5 %% = hasard -> le planificateur cherche au hasard avec une imagination de la poussée fausse")
     p.add_argument("--goal_k", type=int, default=8)
+    p.add_argument("--goal_lr", type=float, default=1.0, help="taux d'apprentissage de la tête GESTES MANQUANTS = goal_lr × --lr, SANS le --lr_peak de la relance "
+                   "(une tête NEUVE à 0.15 × lr n'apprenait rien : R² ≈ 0 après 1000 pas, D17m 1er essai)")
     p.add_argument("--goal_obj", type=float, default=0.0, help="> 0 : fenêtre des gestes manquants tirée surtout là où il SENT des contacts (comme --roll_obj)")
     p.add_argument("--roll_obj", type=float, default=0.0, help="DÉROULE CENTRÉ OBJET : fenêtre tirée là où il SENT des contacts + poids (1 + w) sur les cases de vue "
                    "qui changent plus que la moyenne après un contact senti (ce que son geste a mis en mouvement). D17k : le déroule seul aide le corps, pas l'objet")
@@ -548,7 +550,9 @@ def main():
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
-    opt = torch.optim.AdamW([q for q in m.parameters() if q.requires_grad], a.lr, weight_decay=0.05)
+    gparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("goal.")]       # tête GESTES MANQUANTS : son propre taux
+    opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith("goal.")]}]
+                            + ([{"params": gparams, "goal": True}] if gparams else []), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
                resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0)
     state = dict(it=0, hist=[], exams=[])
@@ -584,7 +588,13 @@ def main():
         if a.lr_restart and it > a.lr_restart:                       # nouveau cycle (prolongation au-delà de la fin prévue)
             u = (it - a.lr_restart) / max(1, a.total - a.lr_restart)
             lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
-        for g in opt.param_groups: g["lr"] = a.lr * lr_f
+        for g in opt.param_groups:
+            g["lr"] = a.lr * lr_f
+            if g.get("goal"):                                        # tête GESTES MANQUANTS : même forme de cycle, sans le --lr_peak de la relance
+                if a.lr_restart and it > a.lr_restart:
+                    u_ = (it - a.lr_restart) / max(1, a.total - a.lr_restart)
+                    g["lr"] = a.lr * a.goal_lr * min(1.0, (it - a.lr_restart) / 500) * (0.05 + 0.95 * (1 + math.cos(math.pi * u_)) / 2)
+                else: g["lr"] = a.lr * a.goal_lr * lr_f
         bt_ = S.next()
         if a.curious > 1:                                            # CURIOSITÉ : il essaie plus de choses qu'il n'en étudie, et étudie surtout ce qui
             cands = [bt_] + [S.next() for _ in range(a.curious - 1)]  # le SURPREND encore (erreur d'imagination actuelle) — tirage ∝ surprise
