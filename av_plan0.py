@@ -784,14 +784,22 @@ def main():
 
 def save_gif(env, t0, path, label, scale=4, max_frames=160, cov=False):
     """GIF animé d'un épisode : à gauche les images vécues (t0 .. env.t), à droite le BUT (objet seul) ; texte = politique, résultat, geste
-    (+ couverture du T-but à chaque image si cov)."""
+    (+ couverture du T-but à chaque image si cov) ; le but est aussi dessiné EN POINTILLÉS VERTS sur l'image vécue."""
     from PIL import Image, ImageDraw
     up = lambda x: Image.fromarray((np.clip(x, 0, 1) * 255).astype(np.uint8)).resize((x.shape[1] * scale, x.shape[0] * scale), Image.NEAREST)
     goal = up(env.frame(env.g, env.Hp, getattr(env, "g_ang", None), hand=False)); W, Hh_ = goal.size
+    dash = None                                                          # le BUT EN POINTILLÉS sur l'image vécue (demande user) : contour de l'objet à sa place voulue
+    if env.task in ("pusht", "objet", "bol"):
+        X, Y = np.meshgrid((np.arange(W) + 0.5) / W, (np.arange(Hh_) + 0.5) / Hh_)
+        sd_ = shape_sdf(env.kind, env.sz, env.g_ang, env.g[0], env.g[1], X, Y); px_ = 1.0 / W
+        edge = np.abs(sd_) < 1.2 * px_                                    # contour épais de ~2–3 px (image agrandie)
+        dash = edge & ((np.arange(W)[None] // 6 + np.arange(Hh_)[:, None] // 6) % 2 == 0)   # damier de 6 px : pointillés dans toutes les directions
     ts = list(range(t0, env.t + 1)); k = max(1, -(-len(ts) // max_frames)); ts = ts[::k] + ([env.t] if ts[::k][-1] != env.t else [])
     frames = []
     for t in ts:
-        im = Image.new("RGB", (2 * W + 6, Hh_ + 30), (20, 20, 20)); im.paste(up(env.X[t]), (0, 30)); im.paste(goal, (W + 6, 30))
+        im = Image.new("RGB", (2 * W + 6, Hh_ + 30), (20, 20, 20)); fr_ = up(env.X[t])
+        if dash is not None: a_ = np.array(fr_); a_[dash] = (80, 255, 120); fr_ = Image.fromarray(a_)
+        im.paste(fr_, (0, 30)); im.paste(goal, (W + 6, 30))
         d = ImageDraw.Draw(im); d.text((3, 2), label, fill=(255, 255, 255)); d.text((3, 15), f"geste {t - t0}" + (f" | couv. {env.coverage(env.POS[t], env.ANG[t]):.0%}" if cov else "") + "   |   but ->", fill=(200, 200, 200))
         frames.append(im)
     frames += [frames[-1]] * 8                                           # pause sur la fin
