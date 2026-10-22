@@ -20,7 +20,7 @@ import numpy as np, torch, torch.nn.functional as F
 from av_jepa import PAL, SPF, SR, band_matrix, render_audio, hum_signal
 from av_world0 import gen_world0, cont_sound, SHOULDER
 from av_world5 import shape_alpha
-from av_shape import contact as shape_contact
+from av_shape import contact as shape_contact, shape_sdf
 from av_dev_long import _PosReader
 from av_phase0 import Baby0, baby_from_cfg, to_tok0, to_np, to_torch, layout, VIEW, T, H, goal_encode
 
@@ -87,6 +87,7 @@ class Push0:
         if task == "pusht": s.g_ang = float(s.ang + rng.choice([-1.0, 1.0]) * rng.uniform(math.pi / 6, math.pi / 2))
         L = s.L = L or T                                                # durée de l'épisode (> T : ÉPISODE LONG, le bébé voit une fenêtre de T images qui glisse)
         s.t = 0; s.X = np.zeros((L, H, H, 3), np.float32); s.POS = np.zeros((L, 2), np.float32); s.HAND = np.zeros((L, 2), np.float32)
+        s.ANG = np.zeros(L, np.float32)
         s.CMD = np.zeros((L, 2), np.float32); s.TOUCH = np.zeros((L, 8), np.float32); s.PROP = np.zeros((L, 4), np.float32)
         s.vact = np.zeros((L, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
         s.PROP[0] = np.concatenate([s.Hp, s.vact[0]]) + s.rng.normal(0, 0.005, 4); s.record(0)
@@ -101,6 +102,15 @@ class Push0:
         return float(np.linalg.norm((s.Hp if s.task.startswith("main") else s.P) - s.g))
     def ang_err(s):
         return abs((s.ang - s.g_ang + math.pi) % (2 * math.pi) - math.pi)
+    def coverage(s, P=None, ang=None):
+        """PUSH-T : part de la SURFACE DU T-BUT couverte par le T (règle du vrai Push-T : réussi si ≥ 95 %), géométrie exacte
+        (av_shape.shape_sdf = le dessin) sur une grille fine (pas 0.002) autour du but. Repères (T de 0.14) : 95 % ≈ 0.005 de
+        décalage (0.3 px) OU 2.5° ; l'ancienne règle « < 0.06 et < 20° » acceptait ~25 % de couverture."""
+        if not hasattr(s, "_gc"):
+            r = 1.45 * s.sz; X, Y = np.meshgrid(np.arange(s.g[0] - r, s.g[0] + r, 0.002), np.arange(s.g[1] - r, s.g[1] + r, 0.002))
+            G = shape_sdf(s.kind, s.sz, s.g_ang, s.g[0], s.g[1], X, Y) > 0; s._gc = (X[G], Y[G])
+        P, ang = (s.P, s.ang) if P is None else (P, ang); X, Y = s._gc
+        return float(np.mean(shape_sdf(s.kind, s.sz, ang, P[0], P[1], X, Y) > 0))
     def frame(s, P, Hp, ang=None, hand=True):
         """image du monde avec l'objet en P et la main en Hp (le BOL, s'il y en a un, est un anneau gris fixe autour de la cible) ; hand=False : sans la main."""
         img = np.zeros((H, H, 3), np.float32)
@@ -112,7 +122,7 @@ class Push0:
         hx = np.clip((s.Rh * 0.85 - np.maximum(abs(s.xx - Hp[0]), abs(s.yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
         return img * (1 - hx) + hx
     def record(s, t, render=True):
-        s.POS[t], s.HAND[t] = s.P, s.Hp
+        s.POS[t], s.HAND[t], s.ANG[t] = s.P, s.Hp, s.ang
         if render: s.X[t] = s.frame(s.P, s.Hp)
     def step(s, cmd, render=True):
         t = s.t = s.t + 1; rc, m = s.rc, s.m; s.CMD[t] = np.clip(cmd, -VMAX, VMAX)
@@ -194,6 +204,8 @@ def main():
     p.add_argument("--propose_k", type=int, default=0, help="nb de gestes demandés à la tête (0 = son maximum, --goal_k de l'entraînement)")
     p.add_argument("--chain", type=int, default=0, help="1 = IMAGINER PAS À PAS en planifiant (idée user, sans réentraînement) : l'image t+1 depuis le vrai passé, "
                    "puis t+2 en repartant de t+1 IMAGINÉE (tous les sens, remise à l'échelle des latents de contexte), etc. — au lieu des Hh images d'un coup")
+    p.add_argument("--cov", type=float, default=0.95, help="PUSH-T : réussite = COUVERTURE du T-but ≥ cov (règle du vrai Push-T, demande user) ; "
+                   "0 = ancienne règle laxiste (< 0.06 et < 20°, ~25 %% de couverture suffisait). Journal : couverture finale / MAX (mesure de Diffusion Policy)")
     p.add_argument("--stop_success", type=int, default=0, help="1 = l'épisode S'ARRÊTE dès la réussite (règle du vrai Push-T : réussi s'il atteint le but à un moment) ; "
                    "0 = jugé à la fin seulement (ancien) ; journal « gestes jusqu'à la réussite »")
     p.add_argument("--slide", type=int, default=0, help="1 = ÉPISODES LONGS (idée user : un bébé plus jeune a besoin de plus de gestes) : --plan_steps peut dépasser T ; "
@@ -204,7 +216,8 @@ def main():
     p.add_argument("--obj_diag", type=int, default=0, help="1 = diag de l'objet dans l'imagination (2b) puis arrêt")
     p.add_argument("--obj_diag_fig", type=str, default="/content/obj_diag.png")
     p.add_argument("--plan_hs", type=str, default="", help="balayage d'horizons pour le MPC, ex. 1,2,6 (même lecteur, un seul chargement)")
-    p.add_argument("--subgoal", type=int, default=0, help="1 = SOUS-BUTS (objet : se placer derrière puis pousser ; bouger : aller à l'objet puis pousser)")
+    p.add_argument("--subgoal", type=int, default=0, help="1 = SOUS-BUTS CODÉS À LA MAIN (objet / Push-T : se placer derrière puis pousser ; bouger : aller à l'objet puis pousser) — "
+                   "AIDE EXTÉRIEURE (le point « derrière » est calculé par nous, pas par le bébé) : ne compte PAS comme une réussite du bébé (remarque user)")
     p.add_argument("--subgoals", type=str, default="", help="balayage, ex. 0,1")
     p.add_argument("--behind", type=float, default=0.21, help="sous-but « derrière » : distance au centre de l'objet perçu (> rayon objet + main ≈ 0.2, sinon inatteignable)"); p.add_argument("--sg_tol", type=float, default=0.06)
     p.add_argument("--reach", type=float, default=0.2, help="bouger : sous-but « aller à l'objet » tant que main–objet perçus > reach")
@@ -582,10 +595,13 @@ def main():
     def run(ep, policy, rec=None, stats=None, film=None):
         env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (max(a.plan_h, Kp_) if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
+        lax_now = lambda: float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)   # PUSH-T ancienne règle (laxiste)
         def ok_now():
-            if a.task == "pusht": return float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)
+            if a.task == "pusht": return env.coverage() >= a.cov if a.cov > 0 else lax_now()
             return env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
+        cmax, lax_hit = 0.0, False                                       # PUSH-T : couverture MAX atteinte, ancienne règle atteinte à un moment
         while env.t < min(EL - 1, a.plan_c + a.plan_steps):         # même nombre de gestes quelle que soit T
+            if a.task == "pusht": cmax, lax_hit = max(cmax, env.coverage()), lax_hit or lax_now()
             if a.stop_success and ok_now(): break                    # réussi : l'épisode s'arrête (règle du vrai Push-T)
             Hh = a.plan_h if a.slide else min(a.plan_h, T - 1 - env.t)
             if policy == "diag":
@@ -636,13 +652,21 @@ def main():
                                          phase=cost.phase, sub=None if cost.sub is None else cost.sub.cpu().numpy(), g=ref,
                                          qi=qty(im[-1], ref), qr=qty(re[-1], env.P if a.task in ("bouger", "direction") else ref)))
             env.step(np.asarray(act, np.float32))
-        ok = ok_now()                                                    # PUSH-T : position ET orientation
-        if a.gif and ep < a.gif:
+        ok = ok_now()                                                    # PUSH-T : couverture (ou ancienne règle si --cov 0)
+        cv = env.coverage() if a.task == "pusht" else np.nan
+        if a.task == "pusht": cmax, lax_hit = max(cmax, cv), lax_hit or lax_now()
+        if a.gif and ep < a.gif:                                         # (texte SANS accents : la police par défaut de PIL ne les a pas)
             save_gif(env, a.plan_c, f"{a.film_dir}/{a.gif_tag}_{a.task}_{'bebe' if policy == 'MPC' else policy}_ep{ep}.gif",
-                     f"{a.task} | {'bébé' if policy == 'MPC' else policy} | ép. {ep} | {'RÉUSSI' if ok else 'raté'}")
+                     f"{a.task} | {'bebe' if policy == 'MPC' else policy} | ep. {ep} | {'REUSSI' if ok else 'rate'}" + (f" | couv. max {cmax:.0%}" if a.task == "pusht" else ""),
+                     cov=a.task == "pusht")
         if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
-        return d0, env.dist(), float(ok)
+        return d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit)
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
+    def cov_line(res):                                                  # PUSH-T : couverture (finale, MAX = mesure de Diffusion Policy), seuils, ancienne règle
+        if a.task != "pusht": return
+        cf, cm = res[:, 3], res[:, 4]
+        print(f"   {'':>10s}   couverture du T-but : finale {cf.mean():.0%} | MAX atteinte {cm.mean():.0%} (médiane {np.median(cm):.0%}) | MAX ≥ 50 % : {np.mean(cm >= 0.5):.0%}, "
+              f"≥ 80 % : {np.mean(cm >= 0.8):.0%}, ≥ 95 % : {np.mean(cm >= 0.95):.0%} | ancienne règle (< 0.06 et < 20°) atteinte : {np.mean(res[:, 5]):.0%}", flush=True)
     EL = a.plan_c + a.plan_steps + 1 if a.slide else T                  # durée d'un épisode (fenêtre qui glisse si > T)
     succ = 0.04 if a.task.startswith("main") else 0.06
     near = 3.0 / H                                                       # critère « PRÈS » (bébé de 4–6 mois : arrive près puis corrige) : à moins de 3 px
@@ -717,23 +741,25 @@ def main():
     titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
              "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22",
              "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "bol": "pousser le BLOC dans le BOL (cible à 0.12–0.22, réussite < 0.06)" + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur supervisé"), "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)",
-             "pusht": "PUSH-T : amener le T sur une position ET une orientation cibles (réussite : < 0.06 et < 20°)" + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur (position seulement !)")}[a.task]
+             "pusht": "PUSH-T : amener le T sur une position ET une orientation cibles (réussite : " + (f"COUVERTURE du T-but ≥ {a.cov:.0%}, règle du vrai Push-T)" if a.cov > 0 else "< 0.06 et < 20°, ancienne règle laxiste)") + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur (position seulement !)")}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(EL - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes{' (ÉPISODE LONG, fenêtre qui glisse)' if a.slide else ''}, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
-    print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else 'réussite (< ' + str(succ) + ')'):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
+    print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else (f'réussite (≥ {a.cov:.0%} couv.)' if a.task == 'pusht' and a.cov > 0 else 'réussite (< ' + str(succ) + ')')):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
     for pol in ("hasard", "oracle"):
         steps_used.clear(); tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
         if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
+        cov_line(res)
     hs = [int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]
     sgs = [int(x) for x in a.subgoals.split(",")] if a.subgoals else [a.subgoal]
     cas = [int(x) for x in a.cost_alls.split(",")] if a.cost_alls else [a.cost_all]
     for h_, sg, ca in [(h_, sg, ca) for h_ in hs for sg in sgs for ca in cas]:
         if True:
-            a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = ("INTUITION seule" if a.propose == 2 else f"MPC h={h_}" + (" +ss-buts" if sg else "") + (" +coût-tous-pas" if ca else "") + (" +proposé" if a.propose == 1 else ""))
+            a.plan_h, a.subgoal, a.cost_all = h_, sg, ca; nm = ("INTUITION seule" if a.propose == 2 else f"MPC h={h_}" + (" +ss-buts CODÉS" if sg else "") + (" +coût-tous-pas" if ca else "") + (" +proposé" if a.propose == 1 else ""))
             recs = [[] for _ in range(a.dump_n)]; films = [[] for _ in range(a.film)]; S = []
             steps_used.clear(); tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
             if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
+            cov_line(res)
             S = np.array(S, dtype=np.float64)                             # (h, err objet, err main, copie objet, copie main, l'objet bouge, phase)
             if S.ndim < 2 or not len(S): continue                         # --propose 2 : rien d'imaginé, pas de dérive à mesurer
             print(f"      DÉRIVE de l'imagination (plan entier exécuté pour de vrai, px) : h | objet qui BOUGE imaginé / copie (n) "
@@ -754,8 +780,9 @@ def main():
                 print(f"      films -> {out}_ep*.png", flush=True)
     print(f"total {time.time() - t0:.0f}s")
 
-def save_gif(env, t0, path, label, scale=4, max_frames=160):
-    """GIF animé d'un épisode : à gauche les images vécues (t0 .. env.t), à droite le BUT (objet seul) ; texte = politique, résultat, geste."""
+def save_gif(env, t0, path, label, scale=4, max_frames=160, cov=False):
+    """GIF animé d'un épisode : à gauche les images vécues (t0 .. env.t), à droite le BUT (objet seul) ; texte = politique, résultat, geste
+    (+ couverture du T-but à chaque image si cov)."""
     from PIL import Image, ImageDraw
     up = lambda x: Image.fromarray((np.clip(x, 0, 1) * 255).astype(np.uint8)).resize((x.shape[1] * scale, x.shape[0] * scale), Image.NEAREST)
     goal = up(env.frame(env.g, env.Hp, getattr(env, "g_ang", None), hand=False)); W, Hh_ = goal.size
@@ -763,7 +790,7 @@ def save_gif(env, t0, path, label, scale=4, max_frames=160):
     frames = []
     for t in ts:
         im = Image.new("RGB", (2 * W + 6, Hh_ + 30), (20, 20, 20)); im.paste(up(env.X[t]), (0, 30)); im.paste(goal, (W + 6, 30))
-        d = ImageDraw.Draw(im); d.text((3, 2), label, fill=(255, 255, 255)); d.text((3, 15), f"geste {t - t0}   |   but ->", fill=(200, 200, 200))
+        d = ImageDraw.Draw(im); d.text((3, 2), label, fill=(255, 255, 255)); d.text((3, 15), f"geste {t - t0}" + (f" | couv. {env.coverage(env.POS[t], env.ANG[t]):.0%}" if cov else "") + "   |   but ->", fill=(200, 200, 200))
         frames.append(im)
     frames += [frames[-1]] * 8                                           # pause sur la fin
     frames[0].save(path, save_all=True, append_images=frames[1:], duration=80, loop=0)
