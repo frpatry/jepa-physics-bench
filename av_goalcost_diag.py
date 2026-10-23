@@ -33,7 +33,7 @@ def main():
     m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"], strict=False); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     LN = lambda u: F.layer_norm(u.float(), (d,))
     names = ["1 départ", "2 T parti, vide", "3 T parti, MAIN au but", "4 T resté, MAIN au but", "5 T AU BUT", "6 T BLANC au but", "7 T autre couleur au but", "8 DISQUE au but"]
-    C = []; rng = np.random.default_rng(0)
+    C, CS = [], []; rng = np.random.default_rng(0)
     for ep in range(a.n):
         env = Push0(ep, task="pusht", shape_phys=True, L=T); r_ = np.random.default_rng(30_000 + ep)
         for _ in range(a.plan_c): env.step(np.clip(r_.normal(0, 0.03, 2), -VMAX, VMAX))
@@ -45,11 +45,14 @@ def main():
         far = lambda pts, lo: cand[np.argmax(np.min([np.linalg.norm(cand - q, axis=1) for q in pts], 0) * (np.all((cand > lo) & (cand < 1 - lo), 1)))]
         Pfar = far([env.P, env.g], env.rc + 0.02)                                  # loin de l'ancienne place et du but
         Hfar = env.place(far([env.P, env.g, Pfar], 0.08))                          # main dans un coin libre (dans la portée du bras)
+        hands = []                                                                 # « ÇA, C'EST MOI » : les cases où est la main (dans la scène)
+        hcase = lambda wh, nh: torch.from_numpy(np.abs(wh - nh).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1) > 0.05).to(dev)
         def scene(P, ang, Hp, col=None, kind=None):
             e = copy.copy(env)
             if col is not None: e.col = np.asarray(col, np.float32)
             if kind is not None: e.kind = kind
-            return e.frame(P, Hp, ang, hand=True)
+            wh = e.frame(P, Hp, ang, hand=True); hands.append(hcase(wh, e.frame(P, Hp, ang, hand=False))); return wh
+        hands.append(hcase(cur, env.frame(env.P, env.Hp, env.ang, hand=False))); h_now = hands[0]
         sc = [cur, scene(Pfar, env.ang, Hfar), scene(Pfar, env.ang, env.g), scene(env.P, env.ang, env.g), scene(env.g, env.g_ang, Hfar),
               scene(env.g, env.g_ang, Hfar, col=(1.0, 1.0, 1.0)), scene(env.g, env.g_ang, Hfar, col=np.clip(rng.uniform(0.15, 0.95, 3), 0, 1)),
               scene(env.g, env.g_ang, Hfar, kind=0)]
@@ -60,8 +63,11 @@ def main():
         with torch.no_grad():
             tok, _ = to_tok0(bb, st, v, P_, dev); ix = torch.arange(nv, device=dev).expand(len(seqs), -1)
             z = LN(tgt(tok[:, :nv], ix)).view(len(seqs), T, npf, d)[:, t + 1]       # latents à t+1
-        C.append(((z[1:] - z[:1]) ** 2).sum(-1)[:, gmask].mean(-1).cpu().numpy())
-    C = np.array(C); n = len(C)
+        dz = ((z[1:] - z[:1]) ** 2).sum(-1)
+        C.append(dz[:, gmask].mean(-1).cpu().numpy())
+        CS.append(np.array([float(dz[i][gmask & ~h_now & ~hands[i]].mean()) if bool((gmask & ~h_now & ~hands[i]).any()) else np.nan
+                            for i in range(len(sc))]))    # sans les cases de SA MAIN (maintenant et dans la scène) : il les reconnaît par son bras
+    C = np.array(C); n = len(C); CS = np.array(CS)
     print(f"{n} situations Push-T, bébé {ck['state']['it']} | score image-but (plus BAS = plus proche du but pour lui ; imagination supposée parfaite) | {time.time() - t_:.0f}s")
     print(f"   {'scène':>26s} | {'score moyen':>11s} | {'relatif au départ':>17s} | {'meilleur que le départ':>22s}")
     for i, nm in enumerate(names):
@@ -74,6 +80,11 @@ def main():
     print(f"      T BLANC au but vs T de sa couleur au but      : {vs(5, 4)}   (écart moyen {np.mean(C[:, 5] - C[:, 4]):+.1f}) <- la couleur compte-t-elle ?")
     print(f"      DISQUE au but vs T au but                     : {vs(7, 4)}   (écart moyen {np.mean(C[:, 7] - C[:, 4]):+.1f}) <- la forme compte-t-elle ?")
     print(f"      T BLANC au but vs main au but (T parti)       : {vs(5, 2)}")
+    print(f"   « ÇA, C'EST MOI » — même score SANS les cases de sa main (maintenant + dans la scène) :")
+    for i, nm in enumerate(names):
+        print(f"   {nm:>26s} | {np.nanmean(CS[:, i]):11.1f} | {np.nanmean(CS[:, i] / CS[:, 0]):17.2f} | {np.nanmean(CS[:, i] < CS[:, 0]):22.0%}")
+    vs2 = lambda i, j: f"{np.nanmean(CS[:, i] < CS[:, j]):.0%}"
+    print(f"      main au but (T parti) vs T AU BUT : {vs2(2, 4)} | T AU BUT vs départ : {vs2(4, 0)} | T BLANC vs T coloré : {vs2(5, 4)} | DISQUE vs T : {vs2(7, 4)}")
 
 
 if __name__ == "__main__":
