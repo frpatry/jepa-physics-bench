@@ -541,8 +541,13 @@ def main():
     p.add_argument("--replay", type=float, default=0.3, help="part du lot tirée des étapes déjà vécues")
     p.add_argument("--sep", type=int, default=1); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--exam_every", type=int, default=5000); p.add_argument("--ckpt_every", type=int, default=2500)
-    p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--amp", type=str, default="auto", choices=["auto", "bf16", "fp16", "fp32"], help="précision : auto = bf16 si GPU A100+ sinon fp16 (Kaggle T4/P100)"); p.add_argument("--n_probe", type=int, default=300); p.add_argument("--ckpt", type=str, default="/content/phase0.pt"); p.add_argument("--seed", type=int, default=0)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
+    cap_ = torch.cuda.get_device_capability()[0] if dev == "cuda" else 0            # PRÉCISION : bf16 sur A100+ (Colab) ; fp16 + GradScaler sur T4/P100 (Kaggle)
+    amp_ = a.amp if a.amp != "auto" else ("bf16" if cap_ >= 8 else "fp16")
+    ADT = {"bf16": torch.bfloat16, "fp16": torch.float16}.get(amp_, torch.float32); AMP_ON = dev == "cuda" and amp_ != "fp32"
+    scaler = torch.amp.GradScaler("cuda", enabled=AMP_ON and amp_ == "fp16")
+    print(f"précision de calcul : {amp_} (GPU capacité {cap_})", flush=True)
     assert not (a.ctx_w > 0 and (a.split or a.resid)), "perte de contexte : prédicteur unique non résiduel seulement (pour l'instant)"
     assert not (a.levels and (a.split or a.resid or a.act_w > 0 or (a.ctx_w > 0 and a.ctx_on == "pred"))), "pyramide : avec --ctx_on enc/enc_low, sans split/resid/act_w"
     assert not (a.ctx_on == "enc_low" and not a.levels), "--ctx_on enc_low : avec --levels seulement"
@@ -617,7 +622,7 @@ def main():
         if a.curious > 1:                                            # CURIOSITÉ : il essaie plus de choses qu'il n'en étudie, et étudie surtout ce qui
             cands = [bt_] + [S.next() for _ in range(a.curious - 1)]  # le SURPREND encore (erreur d'imagination actuelle) — tirage ∝ surprise
             bt_ = {k: torch.cat([c_[k] for c_ in cands]) for k in bt_}
-            with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
+            with torch.no_grad(), torch.autocast("cuda", dtype=ADT, enabled=AMP_ON):
                 errs_ = []
                 for i0 in range(0, len(bt_["X"]), a.bs):
                     tk_, cm_ = to_tok0({k: x[i0:i0 + a.bs] for k, x in bt_.items()}, st, v, a.P, dev); Bc, Nc, _ = tk_.shape
@@ -633,7 +638,7 @@ def main():
         tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
         pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
         contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
-        with torch.autocast("cuda", dtype=torch.bfloat16, enabled=dev == "cuda"):
+        with torch.autocast("cuda", dtype=ADT, enabled=AMP_ON):
             with torch.no_grad():
                 if a.levels:
                     z_top, z_low = tgt(tok, full, levels=True); z = F.layer_norm(z_top.float(), (a.d,)); z_low = F.layer_norm(z_low.float(), (a.d,))
@@ -764,10 +769,10 @@ def main():
         if ro_o:
             roll_obj_hist.append(ro_o)
             if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
-        opt.zero_grad(); loss.backward()
+        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)          # (fp16 : gradients remis à l'échelle AVANT l'écrêtage ; sinon sans effet)
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith('goal.')], 1.0)
         if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)   # la tête GESTES MANQUANTS à part (le JEPA dominerait l'écrêtage)
-        opt.step()
+        scaler.step(opt); scaler.update()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         if not a.freeze_eye:
             with torch.no_grad():
