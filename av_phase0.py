@@ -448,7 +448,7 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--total", type=int, default=60000); p.add_argument("--budgets", type=str, default="6000,8000,8000,12000",
                    help="pas des étapes 0a,0b,0c,0d ; 0e jusqu'à --total")
-    p.add_argument("--bs", type=int, default=64); p.add_argument("--P", type=int, default=4); p.add_argument("--d", type=int, default=192)
+    p.add_argument("--bs", type=int, default=64); p.add_argument("--accum", type=int, default=1, help="ACCUMULATION de gradient : le lot de --bs est traité en N morceaux (même recette, moins de mémoire : 4 sur GPU 16 Go)"); p.add_argument("--P", type=int, default=4); p.add_argument("--d", type=int, default=192)
     p.add_argument("--nl", type=int, default=6); p.add_argument("--nh", type=int, default=6); p.add_argument("--pred_layers", type=int, default=3)
     p.add_argument("--lr", type=float, default=2e-4); p.add_argument("--ema", type=float, default=0.996); p.add_argument("--n_masks", type=int, default=3)
     p.add_argument("--sig_w", type=float, default=0.005); p.add_argument("--inv_w", type=float, default=0.1, help="poids de la CONTINGENCE (deviner son geste)")
@@ -635,141 +635,145 @@ def main():
             had_c = (bt_["TOUCH"].abs().sum((1, 2)) > 0).float()
             cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
             bt_ = {k: x[pick] for k, x in bt_.items()}
-        tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-        pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
-        contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
-        with torch.autocast("cuda", dtype=ADT, enabled=AMP_ON):
-            with torch.no_grad():
-                if a.levels:
-                    z_top, z_low = tgt(tok, full, levels=True); z = F.layer_norm(z_top.float(), (a.d,)); z_low = F.layer_norm(z_low.float(), (a.d,))
-                else: z = F.layer_norm(tgt(tok, full).float(), (a.d,))
-                if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
-                    for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
-            wmot = None
-            if a.motion_w > 0:                                          # poids par case : changement du latent cible d'une image à l'autre
-                zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1); ch_ = torch.cat([ch_[:, :1], ch_], 1)
-                wv_ = (ch_ / ch_.mean((1, 2), keepdim=True).clamp_min(1e-8)).pow(a.motion_w).clamp(max=5.0).reshape(B, nv)
-                wmot = torch.cat([wv_, torch.ones(B, N - nv, device=dev)], 1)
-            jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev); ll = torch.zeros((), device=dev)
-            cw = a.ctx_w * min(1.0, max(0.0, (it - a.ctx_from) / max(1, a.ctx_ramp)))     # poids courant de la perte de contexte
-            if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
-                braw = tok[:, nv + 2 * T:, :4].float(); bk = dict(body_real=braw)
-                rl = F.mse_loss(m.pred.read(z[:, md_t == 3].detach().float()), braw)
-            for c_, g_ in pairs:
-                cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
-                if a.levels:                                            # PYRAMIDE : l'œil rend le haut ET l'étage bas
-                    zc, zl_c = m.enc(_gather(tok, cidx), cidx, levels=True)
-                    ctx_in = m.fuse(torch.cat([F.layer_norm(zc, (a.d,)), F.layer_norm(zl_c, (a.d,))], -1))
-                elif a.regs: zc, rg_ = m.enc(_gather(tok, cidx), cidx, regs=True); ctx_in = torch.cat([zc, rg_], 1)   # cases-endroits + CASES RÉSUMÉ
-                else: zc = m.enc(_gather(tok, cidx), cidx); ctx_in = zc
-                summ.append(zc.float().mean(1))
-                if cw > 0 and a.ctx_on in ("enc", "enc_low"):          # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
-                    if a.ctx_on == "enc_low": dc = F.layer_norm(zl_c.float(), (a.d,)) - _gather(z_low, cidx)   # ZOOM : seul l'étage FIN devient local
-                    else: dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
-                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs)
+        bt_all = bt_; opt.zero_grad()                                         # ACCUMULATION (--accum k) : le lot est traité en k morceaux (GPU 16 Go : Kaggle/T4)
+        for mb_ in range(a.accum):
+            bt_ = {k: x[mb_::a.accum] for k, x in bt_all.items()} if a.accum > 1 else bt_all
+            tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
+            pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
+            contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
+            with torch.autocast("cuda", dtype=ADT, enabled=AMP_ON):
+                with torch.no_grad():
                     if a.levels:
+                        z_top, z_low = tgt(tok, full, levels=True); z = F.layer_norm(z_top.float(), (a.d,)); z_low = F.layer_norm(z_low.float(), (a.d,))
+                    else: z = F.layer_norm(tgt(tok, full).float(), (a.d,))
+                    if a.std_tgt:                                       # écart-type courant PAR SENS et PAR DIMENSION des cibles
+                        for k_ in range(4): m.tstd[k_].mul_(0.99).add_(0.01 * z[:, md_t == k_].reshape(-1, a.d).std(0))
+                wmot = None
+                if a.motion_w > 0:                                          # poids par case : changement du latent cible d'une image à l'autre
+                    zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1); ch_ = torch.cat([ch_[:, :1], ch_], 1)
+                    wv_ = (ch_ / ch_.mean((1, 2), keepdim=True).clamp_min(1e-8)).pow(a.motion_w).clamp(max=5.0).reshape(B, nv)
+                    wmot = torch.cat([wv_, torch.ones(B, N - nv, device=dev)], 1)
+                jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev); ll = torch.zeros((), device=dev)
+                cw = a.ctx_w * min(1.0, max(0.0, (it - a.ctx_from) / max(1, a.ctx_ramp)))     # poids courant de la perte de contexte
+                if a.split:                                                 # le bras réellement SENTI -> état du corps du monde ; lecture des 4 nombres
+                    braw = tok[:, nv + 2 * T:, :4].float(); bk = dict(body_real=braw)
+                    rl = F.mse_loss(m.pred.read(z[:, md_t == 3].detach().float()), braw)
+                for c_, g_ in pairs:
+                    cidx, tidx = _idx(torch.from_numpy(c_).to(dev)), _idx(torch.from_numpy(g_).to(dev))
+                    if a.levels:                                            # PYRAMIDE : l'œil rend le haut ET l'étage bas
+                        zc, zl_c = m.enc(_gather(tok, cidx), cidx, levels=True)
+                        ctx_in = m.fuse(torch.cat([F.layer_norm(zc, (a.d,)), F.layer_norm(zl_c, (a.d,))], -1))
+                    elif a.regs: zc, rg_ = m.enc(_gather(tok, cidx), cidx, regs=True); ctx_in = torch.cat([zc, rg_], 1)   # cases-endroits + CASES RÉSUMÉ
+                    else: zc = m.enc(_gather(tok, cidx), cidx); ctx_in = zc
+                    summ.append(zc.float().mean(1))
+                    if cw > 0 and a.ctx_on in ("enc", "enc_low"):          # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
+                        if a.ctx_on == "enc_low": dc = F.layer_norm(zl_c.float(), (a.d,)) - _gather(z_low, cidx)   # ZOOM : seul l'étage FIN devient local
+                        else: dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
+                        cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs)
+                        if a.levels:
+                            o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
+                            ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
+                        else: dif = m.pred(ctx_in, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
+                    elif cw > 0:                                            # INTERVENTION 1 : les cases visibles décrivent leur endroit
+                        out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
+                        cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
+                    elif a.levels:
                         o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
                         ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
                     else: dif = m.pred(ctx_in, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
-                elif cw > 0:                                            # INTERVENTION 1 : les cases visibles décrivent leur endroit
-                    out_, oc_ = m.pred(zc, tidx, cmd, cidx, ret_ctx=True); dc = oc_.float() - _gather(z, cidx)
-                    cl = cl + (dc ** 2 if a.loss == "mse" else dc.abs()).mean() / len(pairs); dif = out_.float() - _gather(z, tidx)
-                elif a.levels:
-                    o_, ol_ = m.pred(ctx_in, tidx, cmd, cidx, ret_low=True); dif = o_.float() - _gather(z, tidx); dl_ = ol_.float() - _gather(z_low, tidx)
-                    ll = ll + (dl_ ** 2 if a.loss == "mse" else dl_.abs()).mean() / len(pairs)
-                else: dif = m.pred(ctx_in, tidx, cmd, cidx, **bk).float() - _gather(z, tidx)
-                dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
-                if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
-                    ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
-                w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
-                if wmot is not None: w_ = w_ * torch.gather(wmot, 1, tidx)               # ce qui BOUGE compte plus
-                if a.surprise_w > 0:                                # ATTENTION À LA SURPRISE (ce qui est mal prédit compte plus ; moyenne 1)
-                    e_ = dif.mean(-1).detach(); w_ = w_ * (e_ / e_.mean().clamp_min(1e-8)).pow(a.surprise_w).clamp(max=5.0)
-                jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
-            jl = jl / len(pairs); il = torch.zeros((), device=dev)
-            if a.inv_w > 0:                                          # CONTINGENCE : vision SEULE (le bras serait un raccourci)
-                ts = torch.from_numpy(rng.choice(np.arange(1, T), a.inv_k, replace=False)).to(dev)
-                zv = m.enc(tok[:, :nv], full[:, :nv]).view(B, T, npf, -1)
-                il = F.smooth_l1_loss(m.inv(zv[:, ts - 1].flatten(0, 1), zv[:, ts].flatten(0, 1)).float(), cmd[:, ts].flatten(0, 1))
-            al, gap = torch.zeros((), device=dev), torch.zeros((), device=dev)
-            if a.act_w > 0:                                          # CONTRASTE D'ACTION (« compare avec un autre geste »)
-                t0_ = int(rng.integers(3, T - 2)); cm_ = torch.from_numpy(fr_np <= t0_).to(dev)
-                if a.act_focus: tidx_ = torch.where(~cm_ & (md_t == 0))[0].expand(B, -1)                  # CIBLÉ : la VUE future
-                else: tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)                          # futur, sans l'ouïe
-                cidx_ = torch.where(cm_)[0].expand(B, -1)
-                zc_ = m.context(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
-                cmd_l = cmd.clone(); cmd_l[:, t0_ + 1:] = cmd.roll(1, 0)[:, t0_ + 1:]                    # mêmes souvenirs, AUTRES gestes futurs
-                wf_ = None
-                if a.act_focus:                                      # poids par case : (il SENT un contact à cette image ou juste avant) × (la case CHANGE)
-                    zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1)
-                    ch_ = torch.cat([torch.zeros_like(ch_[:, :1]), ch_], 1)                                   # (B, T, npf) changement depuis l'image d'avant
-                    felt = contact.clone(); felt[:, 1:] = torch.maximum(felt[:, 1:], contact[:, :-1])         # contact senti à t ou t-1
-                    ft_ = fr_t[tidx_[0]]; pc_ = tidx_[0] % npf
-                    chg = ch_[:, ft_, pc_]; chg = (chg > chg.mean(1, keepdim=True)).float()                   # cases qui changent plus que la moyenne
-                    wf_ = torch.gather(felt, 1, ft_.expand(B, -1)) * chg                                      # (B, cibles)
-                def err_(c):
-                    d_ = m.pred(zc_, tidx_, c, cidx_).float() - zt_
-                    d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(2)
-                    return d_.mean(1) if wf_ is None else (d_ * wf_).sum(1) / wf_.sum(1).clamp_min(1.0)
-                e_t, e_l = err_(cmd), err_(cmd_l)
-                ok_ = torch.ones(B, device=dev) if wf_ is None else (wf_.sum(1) > 0).float()               # séquences où il a senti un contact (sinon rien à comparer)
-                al = (F.relu(e_t - e_l + a.act_margin * e_t.detach()) * ok_).sum() / ok_.sum().clamp_min(1.0)
-                gap = (((e_l - e_t) / e_t.clamp_min(1e-6)) * ok_).sum().detach() / ok_.sum().clamp_min(1.0)
-            ro_l = torch.zeros((), device=dev); ro_e = []; ro_o = []
-            if a.roll_w > 0:                                         # DÉROULE (idée user « un geste à la fois ») : imaginer l'image suivante, puis REPARTIR
-                K_ = a.roll_k; t0s = np.arange(3, T - 1 - K_)           # de ce qu'il vient d'imaginer (tous les sens) pour la suivante, etc.
-                if a.roll_obj > 0:                                   # OBJET : fenêtre tirée là où il SENT des contacts (toucher, pas de position privilégiée)
-                    nc_ = np.array([float((contact[:, s_:s_ + K_].sum(1) > 0).sum()) for s_ in t0s]) + 0.5
-                    t0r = int(rng.choice(t0s, p=nc_ / nc_.sum()))
-                else: t0r = int(rng.choice(t0s))
-                cid = torch.from_numpy(np.where(fr_np <= t0r)[0]).to(dev).expand(B, -1)   # vrai passé jusqu'à t0r
-                cx = m.context(_gather(tok, cid), cid); cs_, cm_ = cx.float().std(-1).mean().detach(), cx.float().mean(-1).mean().detach()
-                if a.roll_obj > 0:
-                    zv_r = z[:, :nv].view(B, T, npf, -1); chr_ = (zv_r[:, 1:] - zv_r[:, :-1]).abs().mean(-1)
-                    chr_ = torch.cat([torch.zeros_like(chr_[:, :1]), chr_], 1)                       # (B, T, npf) changement depuis l'image d'avant
-                for k_ in range(1, K_ + 1):
-                    fi = torch.from_numpy(np.where(fr_np == t0r + k_)[0]).to(dev).expand(B, -1)    # TOUS les jetons de l'image t0r+k
-                    o_ = m.pred(cx, fi, cmd, cid).float(); d_ = o_ - _gather(z, fi)
-                    d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(-1)
-                    w_r = torch.gather(wmot, 1, fi) if wmot is not None else torch.ones_like(d_)
-                    if a.roll_obj > 0:                               # cases de VUE qui changent plus que la moyenne de l'image, une fois qu'il a SENTI un
-                        isv = md_t[fi[0]] == 0; pc_ = fi[0][isv] % npf   # contact (t0r..t0r+k) : ce que son geste a mis en mouvement (objet poussé, + sa main)
-                        ch_k = chr_[:, t0r + k_][:, pc_]; ch_k = (ch_k > ch_k.mean(1, keepdim=True)).float()
-                        felt_k = contact[:, t0r:t0r + k_ + 1].amax(1, keepdim=True)
-                        wo_ = torch.zeros_like(d_); wo_[:, isv] = felt_k * ch_k
-                        w_r = w_r * (1 + a.roll_obj * wo_)
-                        ro_o.append(float((d_ * wo_).sum() / wo_.sum().clamp_min(1.0)))
-                    e_k = (d_ * w_r).sum() / w_r.sum(); ro_l = ro_l + e_k / K_; ro_e.append(float(e_k))
-                    if k_ < K_:                                      # l'IMAGINÉ devient du passé (remis à l'échelle des latents de contexte, même règle que av_plan0 --chain)
-                        cx = torch.cat([cx, (o_ * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fi], 1)
-            gl = torch.zeros((), device=dev)
-            if a.goal_w > 0:                                         # GESTES MANQUANTS : maintenant (passé seul) + image-but K plus loin -> les K gestes
-                Kg = int(rng.integers(1, a.goal_k + 1)); t0s_g = np.arange(2, T - Kg)
-                if a.goal_obj > 0:                                   # surtout là où il SENT des contacts (ce qu'il pousse)
-                    ncg = np.array([float((contact[:, s_ + 1:s_ + Kg + 1].sum(1) > 0).sum()) for s_ in t0s_g]) * a.goal_obj + 0.5
-                    t0g = int(rng.choice(t0s_g, p=ncg / ncg.sum()))
-                else: t0g = int(rng.choice(t0s_g))
-                tok_g = tok
-                if a.goal_nohand:                                    # but « objet seulement » : l'image t0+K SANS sa main (le vrai but de Push-T)
-                    bg_ = dict(bt_); bg_["X"] = bt_["XNH"]; tok_g, _ = to_tok0(bg_, st, v, a.P, dev)
-                zn_, zg_, za_ = goal_encode(m.enc, tok, tok_g, t0g, Kg, nv, npf, T, fr_np)   # maintenant + but vus ENSEMBLE (rien entre les deux)
-                pg = m.goal(zn_, zg_, za_, Kg)[:, :Kg].float(); yg = cmd[:, t0g + 1:t0g + Kg + 1].float()
-                gl = F.smooth_l1_loss(pg, yg)
-                with torch.no_grad():                                # R² (0 = deviner la moyenne du lot) : tous, 1er geste, séquences où il pousse (contact senti)
-                    r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean((0, 1), keepdim=True)) ** 2).sum().clamp_min(1e-8))
-                    hc = contact[:, t0g + 1:t0g + Kg + 1].amax(1) > 0
-                    goal_hist.append((r2(pg, yg), r2(pg[:, :1], yg[:, :1]), r2(pg[hc], yg[hc]) if int(hc.sum()) > 4 else float("nan"), Kg))
-        sr = torch.zeros((), device=dev)
-        if a.sig_w > 0 and not a.freeze_eye:
-            with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-        loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl
-        if ro_e:
-            roll_hist.append(ro_e)
-            if len(roll_hist) > 1000: del roll_hist[:-500]
-        if ro_o:
-            roll_obj_hist.append(ro_o)
-            if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
-        opt.zero_grad(); scaler.scale(loss).backward(); scaler.unscale_(opt)          # (fp16 : gradients remis à l'échelle AVANT l'écrêtage ; sinon sans effet)
+                    dif = dif ** 2 if a.loss == "mse" else dif.abs()        # mse : gradient ∝ erreur -> les cases qui CHANGENT dominent (L1 : vote « rien ne change »)
+                    if a.std_tgt:                                       # RELATIF : poids moyen 1 par sens (run 2a : 1/std absolu -> EFFONDREMENT)
+                        ts_ = m.tstd.clamp_min(0.05); dif = dif * (ts_.mean(1, keepdim=True) / ts_)[md_t[tidx]]
+                    w_ = 1 + a.contact_w * torch.gather(contact, 1, fr_t[tidx])              # les instants de CONTACT comptent plus
+                    if wmot is not None: w_ = w_ * torch.gather(wmot, 1, tidx)               # ce qui BOUGE compte plus
+                    if a.surprise_w > 0:                                # ATTENTION À LA SURPRISE (ce qui est mal prédit compte plus ; moyenne 1)
+                        e_ = dif.mean(-1).detach(); w_ = w_ * (e_ / e_.mean().clamp_min(1e-8)).pow(a.surprise_w).clamp(max=5.0)
+                    jl = jl + (dif.mean(-1) * w_).sum() / w_.sum()
+                jl = jl / len(pairs); il = torch.zeros((), device=dev)
+                if a.inv_w > 0:                                          # CONTINGENCE : vision SEULE (le bras serait un raccourci)
+                    ts = torch.from_numpy(rng.choice(np.arange(1, T), a.inv_k, replace=False)).to(dev)
+                    zv = m.enc(tok[:, :nv], full[:, :nv]).view(B, T, npf, -1)
+                    il = F.smooth_l1_loss(m.inv(zv[:, ts - 1].flatten(0, 1), zv[:, ts].flatten(0, 1)).float(), cmd[:, ts].flatten(0, 1))
+                al, gap = torch.zeros((), device=dev), torch.zeros((), device=dev)
+                if a.act_w > 0:                                          # CONTRASTE D'ACTION (« compare avec un autre geste »)
+                    t0_ = int(rng.integers(3, T - 2)); cm_ = torch.from_numpy(fr_np <= t0_).to(dev)
+                    if a.act_focus: tidx_ = torch.where(~cm_ & (md_t == 0))[0].expand(B, -1)                  # CIBLÉ : la VUE future
+                    else: tidx_ = torch.where(~cm_ & (md_t != 1))[0].expand(B, -1)                          # futur, sans l'ouïe
+                    cidx_ = torch.where(cm_)[0].expand(B, -1)
+                    zc_ = m.context(_gather(tok, cidx_), cidx_); zt_ = _gather(z, tidx_)
+                    cmd_l = cmd.clone(); cmd_l[:, t0_ + 1:] = cmd.roll(1, 0)[:, t0_ + 1:]                    # mêmes souvenirs, AUTRES gestes futurs
+                    wf_ = None
+                    if a.act_focus:                                      # poids par case : (il SENT un contact à cette image ou juste avant) × (la case CHANGE)
+                        zv_ = z[:, :nv].view(B, T, npf, -1); ch_ = (zv_[:, 1:] - zv_[:, :-1]).abs().mean(-1)
+                        ch_ = torch.cat([torch.zeros_like(ch_[:, :1]), ch_], 1)                                   # (B, T, npf) changement depuis l'image d'avant
+                        felt = contact.clone(); felt[:, 1:] = torch.maximum(felt[:, 1:], contact[:, :-1])         # contact senti à t ou t-1
+                        ft_ = fr_t[tidx_[0]]; pc_ = tidx_[0] % npf
+                        chg = ch_[:, ft_, pc_]; chg = (chg > chg.mean(1, keepdim=True)).float()                   # cases qui changent plus que la moyenne
+                        wf_ = torch.gather(felt, 1, ft_.expand(B, -1)) * chg                                      # (B, cibles)
+                    def err_(c):
+                        d_ = m.pred(zc_, tidx_, c, cidx_).float() - zt_
+                        d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(2)
+                        return d_.mean(1) if wf_ is None else (d_ * wf_).sum(1) / wf_.sum(1).clamp_min(1.0)
+                    e_t, e_l = err_(cmd), err_(cmd_l)
+                    ok_ = torch.ones(B, device=dev) if wf_ is None else (wf_.sum(1) > 0).float()               # séquences où il a senti un contact (sinon rien à comparer)
+                    al = (F.relu(e_t - e_l + a.act_margin * e_t.detach()) * ok_).sum() / ok_.sum().clamp_min(1.0)
+                    gap = (((e_l - e_t) / e_t.clamp_min(1e-6)) * ok_).sum().detach() / ok_.sum().clamp_min(1.0)
+                ro_l = torch.zeros((), device=dev); ro_e = []; ro_o = []
+                if a.roll_w > 0:                                         # DÉROULE (idée user « un geste à la fois ») : imaginer l'image suivante, puis REPARTIR
+                    K_ = a.roll_k; t0s = np.arange(3, T - 1 - K_)           # de ce qu'il vient d'imaginer (tous les sens) pour la suivante, etc.
+                    if a.roll_obj > 0:                                   # OBJET : fenêtre tirée là où il SENT des contacts (toucher, pas de position privilégiée)
+                        nc_ = np.array([float((contact[:, s_:s_ + K_].sum(1) > 0).sum()) for s_ in t0s]) + 0.5
+                        t0r = int(rng.choice(t0s, p=nc_ / nc_.sum()))
+                    else: t0r = int(rng.choice(t0s))
+                    cid = torch.from_numpy(np.where(fr_np <= t0r)[0]).to(dev).expand(B, -1)   # vrai passé jusqu'à t0r
+                    cx = m.context(_gather(tok, cid), cid); cs_, cm_ = cx.float().std(-1).mean().detach(), cx.float().mean(-1).mean().detach()
+                    if a.roll_obj > 0:
+                        zv_r = z[:, :nv].view(B, T, npf, -1); chr_ = (zv_r[:, 1:] - zv_r[:, :-1]).abs().mean(-1)
+                        chr_ = torch.cat([torch.zeros_like(chr_[:, :1]), chr_], 1)                       # (B, T, npf) changement depuis l'image d'avant
+                    for k_ in range(1, K_ + 1):
+                        fi = torch.from_numpy(np.where(fr_np == t0r + k_)[0]).to(dev).expand(B, -1)    # TOUS les jetons de l'image t0r+k
+                        o_ = m.pred(cx, fi, cmd, cid).float(); d_ = o_ - _gather(z, fi)
+                        d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(-1)
+                        w_r = torch.gather(wmot, 1, fi) if wmot is not None else torch.ones_like(d_)
+                        if a.roll_obj > 0:                               # cases de VUE qui changent plus que la moyenne de l'image, une fois qu'il a SENTI un
+                            isv = md_t[fi[0]] == 0; pc_ = fi[0][isv] % npf   # contact (t0r..t0r+k) : ce que son geste a mis en mouvement (objet poussé, + sa main)
+                            ch_k = chr_[:, t0r + k_][:, pc_]; ch_k = (ch_k > ch_k.mean(1, keepdim=True)).float()
+                            felt_k = contact[:, t0r:t0r + k_ + 1].amax(1, keepdim=True)
+                            wo_ = torch.zeros_like(d_); wo_[:, isv] = felt_k * ch_k
+                            w_r = w_r * (1 + a.roll_obj * wo_)
+                            ro_o.append(float((d_ * wo_).sum() / wo_.sum().clamp_min(1.0)))
+                        e_k = (d_ * w_r).sum() / w_r.sum(); ro_l = ro_l + e_k / K_; ro_e.append(float(e_k))
+                        if k_ < K_:                                      # l'IMAGINÉ devient du passé (remis à l'échelle des latents de contexte, même règle que av_plan0 --chain)
+                            cx = torch.cat([cx, (o_ * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fi], 1)
+                gl = torch.zeros((), device=dev)
+                if a.goal_w > 0:                                         # GESTES MANQUANTS : maintenant (passé seul) + image-but K plus loin -> les K gestes
+                    Kg = int(rng.integers(1, a.goal_k + 1)); t0s_g = np.arange(2, T - Kg)
+                    if a.goal_obj > 0:                                   # surtout là où il SENT des contacts (ce qu'il pousse)
+                        ncg = np.array([float((contact[:, s_ + 1:s_ + Kg + 1].sum(1) > 0).sum()) for s_ in t0s_g]) * a.goal_obj + 0.5
+                        t0g = int(rng.choice(t0s_g, p=ncg / ncg.sum()))
+                    else: t0g = int(rng.choice(t0s_g))
+                    tok_g = tok
+                    if a.goal_nohand:                                    # but « objet seulement » : l'image t0+K SANS sa main (le vrai but de Push-T)
+                        bg_ = dict(bt_); bg_["X"] = bt_["XNH"]; tok_g, _ = to_tok0(bg_, st, v, a.P, dev)
+                    zn_, zg_, za_ = goal_encode(m.enc, tok, tok_g, t0g, Kg, nv, npf, T, fr_np)   # maintenant + but vus ENSEMBLE (rien entre les deux)
+                    pg = m.goal(zn_, zg_, za_, Kg)[:, :Kg].float(); yg = cmd[:, t0g + 1:t0g + Kg + 1].float()
+                    gl = F.smooth_l1_loss(pg, yg)
+                    with torch.no_grad():                                # R² (0 = deviner la moyenne du lot) : tous, 1er geste, séquences où il pousse (contact senti)
+                        r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean((0, 1), keepdim=True)) ** 2).sum().clamp_min(1e-8))
+                        hc = contact[:, t0g + 1:t0g + Kg + 1].amax(1) > 0
+                        goal_hist.append((r2(pg, yg), r2(pg[:, :1], yg[:, :1]), r2(pg[hc], yg[hc]) if int(hc.sum()) > 4 else float("nan"), Kg))
+            sr = torch.zeros((), device=dev)
+            if a.sig_w > 0 and not a.freeze_eye:
+                with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
+            loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl
+            if ro_e:
+                roll_hist.append(ro_e)
+                if len(roll_hist) > 1000: del roll_hist[:-500]
+            if ro_o:
+                roll_obj_hist.append(ro_o)
+                if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
+            scaler.scale(loss / a.accum).backward()
+        scaler.unscale_(opt)                                                  # (fp16 : gradients remis à l'échelle AVANT l'écrêtage ; sinon sans effet)
         torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith('goal.')], 1.0)
         if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)   # la tête GESTES MANQUANTS à part (le JEPA dominerait l'écrêtage)
         scaler.step(opt); scaler.update()
