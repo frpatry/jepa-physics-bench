@@ -241,6 +241,10 @@ def main():
                    "(comme avant) ; imag = latents IMAGINÉS (babillage, vraies positions) — l'imagination peut « écrire » autrement que l'œil ; la perception du présent garde le lecteur du réel")
     p.add_argument("--goal_img", type=int, default=0, help="1 = le BUT est une IMAGE (le monde voulu : objet dans le bol), comparée dans les latents du bébé "
                    "LÀ OÙ LA SCÈNE DOIT CHANGER (cases dont les pixels diffèrent entre maintenant et le but) ; aucun lecteur supervisé dans le coût")
+    p.add_argument("--judge", type=int, default=0, help="JUGE APPRIS SUR SON JEU (av_judge.py, plan du 2026-11-10) à la place de l'écart des latents du --goal_img : "
+                   "une petite tête dit COMBIEN DE GESTES séparent la scène imaginée de l'image-but (apprise sur le jeu libre, bébé gelé, sans démonstration) ; "
+                   "1 = apprise sur de vraies scènes ; 2 = moitié vraies scènes, moitié scènes IMAGINÉES (leçon ARC : les juges meurent en imagination)")
+    p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
     p.add_argument("--hand_sense", type=str, default="vue", choices=["vue", "bras"], help="AUDIT DES SENS : où le bébé sait où est SA MAIN — vue = lue dans l'image "
                    "(imaginée) ; bras = lue dans le BRAS (proprioception, imaginée par le prédicteur) : planification et calibration utilisent alors la main du bras")
     p.add_argument("--senses", type=int, default=0, help="1 = AUDIT DES SENS (section 2s) : la main lue dans le BRAS imaginé et le CONTACT lu dans le TOUCHER imaginé, "
@@ -249,6 +253,7 @@ def main():
                    "candidats CEM, gestes extrêmes, plans choisis par le planificateur), main lue par le lecteur dans l'imagination vs dans les vraies images "
                    "vs vraie position, et un lecteur NEUF entraîné sur l'imagination (l'info est-elle là ?) ; puis arrêt")
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time()
+    if a.judge: a.goal_img = 1                                           # le juge compare la scène imaginée à l'IMAGE-but
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]
     wk_ = cfg.get("wkw", {}); print(f"monde des tâches = monde vécu : frottement {wk_.get('damp', 0.0)}, rémanence {wk_.get('echo', 0.0)}", flush=True)
     global T; T = int(cfg.get("T", 16)); import av_phase0; av_phase0.T = T                 # longueur des séquences de l'instantané
@@ -491,6 +496,11 @@ def main():
         print(f"LECTEUR DE L'IMAGINATION (étage {a.read_level}, {ntr} séq. d'entraînement, futur {h}..{h + nf - 1}) : main {ei[:, 1].mean():.2f} px, objet {ei[:, 0].mean():.2f} px "
               f"| lecteur du RÉEL sur la même imagination : main {er[:, 1].mean():.2f} px, objet {er[:, 0].mean():.2f} px ({time.time() - tq:.0f}s)", flush=True)
         read = lambda z: ri_(z.float()) * sd + mu                        # l'imagination est lue par SON lecteur ; la perception garde read_now
+    judge = None
+    if a.judge:                                 # ---------- JUGE APPRIS sur son jeu libre (aux horizons que le planificateur utilisera)
+        from av_judge import build_judge
+        judge = build_judge(m, teachN, imagine, cfg, st, dev, dR, max(([int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]) + ([a.plan_h] if a.diag > 0 else [])), mode=a.judge,
+                            plan_c=a.plan_c, n=a.judge_n, steps=a.judge_steps, seeds=a.judge_seeds, log=lambda s_: print(s_, flush=True))
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
@@ -541,6 +551,7 @@ def main():
                 if hh < Hh: cx = torch.cat([cx, (o.float() * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fidx[hh - 1][None].expand(K, -1)], 1)
             return out
         def gcost(zi, hh):                      # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
+            if judge is not None: return judge(zi, zg_all[t + hh][None].expand(len(zi), -1, -1))   # JUGE APPRIS : gestes qui séparent la scène imaginée du but
             return ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
@@ -742,10 +753,11 @@ def main():
         for fam in ("CEM", "bébé", "tous"):
             x = np.array([r[fam] for r in R], dtype=np.float64)
             print(f"   {fam:>7s} | {np.nanmean(x[:, 0]):+10.2f} | {x[:, 1].mean():13.3f} | {x[:, 2].mean():13.3f} | {x[:, 3].mean():14.3f} | {x[:, 4].mean():22.0%}", flush=True)
+    if a.episodes <= 0: print(f"total {time.time() - t0:.0f}s"); return   # diag seulement
     titre = {"main": "amener SA MAIN sur un point (pièce vide, 0.15–0.35)", "main_loin": "amener SA MAIN sur un point LOINTAIN (0.35–0.6)",
              "toucher": "TOUCHER un objet immobile (départ à 0.25–0.45)", "objet": "pousser l'objet sur une cible à 0.12–0.22",
              "bouger": "FAIRE BOUGER l'objet (≥ 0.05)", "bol": "pousser le BLOC dans le BOL (cible à 0.12–0.22, réussite < 0.06)" + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur supervisé"), "direction": "le POUSSER dans une direction donnée (≥ 0.05 vers gauche/droite/haut/bas)",
-             "pusht": "PUSH-T : amener le T sur une position ET une orientation cibles (réussite : " + (f"COUVERTURE du T-but ≥ {a.cov:.0%}, règle du vrai Push-T)" if a.cov > 0 else "< 0.06 et < 20°, ancienne règle laxiste)") + (" — BUT DONNÉ EN IMAGE" if a.goal_img else " — but lu par le lecteur (position seulement !)")}[a.task]
+             "pusht": "PUSH-T : amener le T sur une position ET une orientation cibles (réussite : " + (f"COUVERTURE du T-but ≥ {a.cov:.0%}, règle du vrai Push-T)" if a.cov > 0 else "< 0.06 et < 20°, ancienne règle laxiste)") + (" — BUT DONNÉ EN IMAGE" + (", jugé par le JUGE APPRIS sur son jeu" if a.judge else "") if a.goal_img else " — but lu par le lecteur (position seulement !)")}[a.task]
     print(f"4 PLANIFICATION : {titre} ({a.episodes} épisodes, {min(EL - 1, a.plan_c + a.plan_steps) - a.plan_c} gestes{' (ÉPISODE LONG, fenêtre qui glisse)' if a.slide else ''}, CEM {a.pop}×{a.iters}, horizon {a.plan_h}, segments {a.plan_seg})")
     print(f"   {'politique':>10s} | {'distance finale':>15s} | {('contact atteint' if a.task == 'toucher' else 'objet déplacé' if a.task in ('bouger', 'direction') else (f'réussite (≥ {a.cov:.0%} couv.)' if a.task == 'pusht' and a.cov > 0 else 'réussite (< ' + str(succ) + ')')):>17s} | {'progrès moyen':>13s} | {'près (< 3 px)':>13s}")
     for pol in [x for x in a.pols.split(",") if x]:

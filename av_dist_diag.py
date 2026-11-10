@@ -20,33 +20,7 @@ from av_phase0 import baby_from_cfg, to_tok0, to_torch, to_np, H, KEYS
 from av_world0 import gen_world0, VIEW
 import av_plan0
 from av_plan0 import Push0, VMAX
-
-
-class DistHead(nn.Module):
-    """(scène maintenant, image-but) (B, npf, din) -> gestes qui les séparent (B,) ; par case [but − maintenant, but, maintenant] comme GoalHead v2."""
-    def __init__(s, din, npf, norm=True, h=192, nl=3):
-        super().__init__()
-        s.norm = norm; s.inp = nn.Linear(3 * din, h); s.pos = nn.Parameter(torch.randn(1, npf + 1, h) * 0.02); s.q = nn.Parameter(torch.randn(1, 1, h) * 0.02)
-        s.tr = nn.TransformerEncoder(nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.0, activation="gelu"), nl); s.out = nn.Linear(h, 1)
-    def forward(s, z_now, z_goal):
-        n_ = (lambda z: F.layer_norm(z.float(), (z.size(-1),))) if s.norm else (lambda z: z.float()); zn, zg = n_(z_now), n_(z_goal)
-        x = torch.cat([s.q.expand(len(zn), -1, -1), s.inp(torch.cat([zg - zn, zg, zn], -1))], 1) + s.pos
-        return s.out(s.tr(x)[:, 0]).squeeze(-1)
-
-
-def sep_labels(xnh, TS, thr):
-    """xnh (T, H, H, 3) uint8, images SANS sa main -> (nt, nt) : gestes entre l'instant TS[i] et le premier instant (en allant vers TS[j]) où le monde est celui de TS[j]."""
-    x = xnh.reshape(len(xnh), -1).astype(np.int16); same = np.abs(x[:, None] - x[None, TS]).max(-1) <= thr
-    L = np.zeros((len(TS), len(TS)), np.float32)
-    for i, a_ in enumerate(TS):
-        for j, b_ in enumerate(TS):
-            sg = 1 if b_ >= a_ else -1; L[i, j] = next(k for k in range(abs(b_ - a_) + 1) if same[a_ + sg * k, j])
-    return L
-
-
-def auc(score, pos):
-    r = np.empty(len(score)); r[np.argsort(score)] = np.arange(1, len(score) + 1); n1 = int(pos.sum()); n0 = len(pos) - n1
-    return float((r[pos].sum() - n1 * (n1 + 1) / 2) / max(n1 * n0, 1))
+from av_judge import DistHead, sep_labels, auc
 
 
 def main():
