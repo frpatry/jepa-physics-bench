@@ -16,7 +16,7 @@ import argparse, time
 import numpy as np, torch, torch.nn as nn, torch.nn.functional as F
 from av_world0 import gen_world0
 import av_phase0
-from av_phase0 import baby_from_cfg, to_tok0, to_torch, layout, VIEW, H, GoalHead, goal_encode
+from av_phase0 import baby_from_cfg, to_tok0, to_torch, to_np, layout, VIEW, H, GoalHead, goal_encode
 
 
 class GoalHeadV1(nn.Module):                                              # la tête du 1er essai D17m (sans normalisation ni différence)
@@ -41,7 +41,7 @@ def main():
     tgt = baby_from_cfg(cfg, dev).enc; tgt.load_state_dict(ck["tgt"]); tgt.eval()
     P_ = cfg["P"]; npf = (H // P_) ** 2; nv = T * npf; d = cfg["d"]; md, fr = layout(nv, npf); v = VIEW["0e"]
     wkw = {**cfg.get("wkw", {}), "p_out": a.p_out, "nohand": True}; wkw.pop("circ", None)
-    w = gen_world0(a.n, "0e", T, H, seed=4242, **wkw)
+    w = to_np([gen_world0(a.n, "0e", T, H, seed=4242, **wkw)])           # (octets 0–255 : to_tok0 divise par 255 — sans to_np, les images arrivaient presque NOIRES)
     Ks = (1, 2, 4, 8); t0 = a.t0; assert t0 + max(Ks) < T
     print(f"{a.n} séquences (main hors champ {a.p_out:.0%}), t0 = {t0}, K = {Ks} | {time.time() - t_:.0f}s", flush=True)
     LN = lambda z: F.layer_norm(z.float(), (d,))
