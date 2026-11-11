@@ -245,6 +245,9 @@ def main():
                    "une petite tête dit COMBIEN DE GESTES séparent la scène imaginée de l'image-but (apprise sur le jeu libre, bébé gelé, sans démonstration) ; "
                    "1 = apprise sur de vraies scènes ; 2 = moitié vraies scènes, moitié scènes IMAGINÉES (leçon ARC : les juges meurent en imagination)")
     p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
+    p.add_argument("--move_diag", type=int, default=0, help="1 = TEST DU SENS DU MOUVEMENT seulement (av_move_diag.py, étape 4 du plan du 2026-11-10) : bébé gelé, une petite tête dit dans "
+                   "quelles cases le monde sans sa main aura changé après h gestes — lue sur le vrai futur (plafond), sur l'imaginé avec SES gestes et avec ceux d'un AUTRE ; puis s'arrête")
+    p.add_argument("--move_h", type=int, default=6, help="horizon maximal du test --move_diag"); p.add_argument("--move_seeds", type=int, default=2)
     p.add_argument("--hand_sense", type=str, default="vue", choices=["vue", "bras"], help="AUDIT DES SENS : où le bébé sait où est SA MAIN — vue = lue dans l'image "
                    "(imaginée) ; bras = lue dans le BRAS (proprioception, imaginée par le prédicteur) : planification et calibration utilisent alors la main du bras")
     p.add_argument("--senses", type=int, default=0, help="1 = AUDIT DES SENS (section 2s) : la main lue dans le BRAS imaginé et le CONTACT lu dans le TOUCHER imaginé, "
@@ -273,6 +276,9 @@ def main():
         top_, low_ = m.pred(*ar, ret_low=True, **kw)
         return low_ if a.read_level == "low" else torch.cat([top_.float(), low_.float()], -1)
     dR = 2 * d if a.read_level == "both" else d
+    if a.move_diag:                             # ---------- TEST DU SENS DU MOUVEMENT (rien d'autre : ni lecteur, ni épisodes)
+        from av_move_diag import move_diag
+        move_diag(m, teachN, imagine, cfg, st, dev, dR, a.move_h, plan_c=a.plan_c, n=a.judge_n, steps=a.judge_steps, seeds=a.move_seeds, log=lambda s_: print(s_, flush=True)); return
 
     @torch.no_grad()
     def vis_lat(b, bs=50):                      # latents CIBLES normalisés (= ce que le prédicteur imite) : (n, T, npf, d)
