@@ -72,7 +72,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False, nohand=False):
+               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False, nohand=False, nobj=None, same_col=0.0, touch=0.0, masks=False):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -108,7 +108,11 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     La physique est inchangée (seulement les sensations). Sans ça, un contact = 1–2 images de signal sur 16.
     damp (0..1) : FROTTEMENT D'UN JOUET SUR UNE TABLE (question user : « nos objets glissent-ils trop ? » — mesuré : 1 px pendant le
     contact puis 10–20 px de glissade seule, une patinoire) — la vitesse des objets est multipliée par (1 − damp) à chaque image :
-    l'objet avance quand on le pousse et s'arrête peu après qu'on le lâche (principe de contact, 2–3 mois, avant l'élan)."""
+    l'objet avance quand on le pousse et s'arrête peu après qu'on le lâche (principe de contact, 2–3 mois, avant l'élan).
+    EXAMEN « OBJETS » (av_obj_diag.py ; défauts = monde inchangé, même suite de tirages) : nobj (lo, hi) remplace le nombre d'objets de
+    l'étape ; same_col : proba que tous les objets aient la MÊME couleur ; touch > 0 : tous les objets AU REPOS au départ et, avec proba
+    touch, chaque objet k ≥ 1 posé CONTRE un objet précédent (se touchent / se chevauchent) ; masks : MASK (n,T,K+1,H,H) uint8 = part
+    VISIBLE de chaque pixel couverte par l'objet k (K = sa main), SAMECOL (n,), TOUCHP (n,) — examens seulement, jamais vus par le bébé."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -118,6 +122,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     POS = np.full((n, T, K, 2), np.nan, np.float32); ANG = np.full((n, T, K), np.nan, np.float32)
     SHAPE = -np.ones((n, K), np.int64); NOBJ = np.zeros(n, np.int64); IMP = np.zeros((n, T), bool); TSRC = np.zeros((n, T), np.int8)
     MOB = np.full((n, T, 2), np.nan, np.float32); LINK = np.zeros((n, T), bool); MTYPE = -np.ones(n, np.int64); VIS = np.zeros((n, T, K), bool)
+    MASK = np.zeros((n, T, K + 1, H, H), np.uint8) if masks else None; SAMECOL = np.zeros(n, bool); TOUCHP = np.zeros(n, bool)
     PAR = np.full((n, T, 2), np.nan, np.float32); PCONT = np.zeros((n, T), bool); CIRC = np.zeros((n, T), np.int8)   # 1 = réaction circulaire déclenchée, 2 = rejoue sans contact
     win = np.hanning(SPF // a_sub).astype(np.float32); W = band_matrix(SPF // a_sub); tt_all = np.arange(T * SPF) / SR
     for i in range(n):
@@ -131,21 +136,28 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if nd > Lr: h = SHOULDER + d * Lr / nd
             return h.astype(np.float32)
 
-        N = int(rng.integers(cf["nobj"][0], cf["nobj"][1] + 1)); NOBJ[i] = N
+        nb_ = cf["nobj"] if nobj is None else nobj; N = int(rng.integers(nb_[0], nb_[1] + 1)); NOBJ[i] = N
         kind = rng.integers(0, 4, N); SHAPE[i, :N] = kind
         s = np.where(kind == 3, rng.uniform(0.12, 0.16, N), rng.uniform(0.08, 0.14, N)); rc = np.where(kind == 3, 0.95, 0.9) * s
         cols = np.clip(PAL[rng.choice(len(PAL), N, replace=False)] * rng.uniform(0.7, 1.0, (N, 1)) + rng.normal(0, 0.08, (N, 3)), 0.1, 0.95).astype(np.float32)
+        if same_col > 0 and N > 1 and rng.random() < same_col: cols[:] = cols[0]; SAMECOL[i] = True   # examen : MÊME couleur
         m = np.exp(rng.uniform(np.log(1 / 3), np.log(3), N)); mat = rng.integers(0, 3, N)
-        P = np.zeros((N, 2), np.float32)
+        P = np.zeros((N, 2), np.float32); tch = touch > 0 and N > 1 and rng.random() < touch; TOUCHP[i] = tch
         for k in range(N):                                           # 0d : objets À PORTÉE ; 0e : n'importe où (parfois hors de portée)
             for _ in range(200):
-                P[k] = rng.uniform(rc[k], 1 - rc[k], 2)
-                ok = all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k))
+                if tch and k > 0:                                    # examen : CONTRE un objet déjà posé (j), loin des autres
+                    j_ = int(rng.integers(k)); a_ = rng.uniform(0, 2 * math.pi)
+                    P[k] = P[j_] + rng.uniform(0.85, 1.0) * (rc[k] + rc[j_]) * np.array([math.cos(a_), math.sin(a_)], np.float32)
+                    ok = bool(np.all((P[k] >= rc[k]) & (P[k] <= 1 - rc[k]))) and all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k) if j != j_)
+                else:
+                    P[k] = rng.uniform(rc[k], 1 - rc[k], 2)
+                    ok = all(np.linalg.norm(P[k] - P[j]) > rc[k] + rc[j] + 0.03 for j in range(k))
                 if ok and (stage != "0d" or np.linalg.norm(P[k] - SHOULDER) < Lr - rc[k] - 0.03): break
         p_mov = 1 - cf["rest"] if calm <= 0 else (1 - calm) * (1 - cf["rest"]) + calm * 0.03   # monde LISIBLE : objets AU REPOS par défaut
         par = N > 0 and p_parent > 0 and rng.random() < p_parent              # un parent viendra montrer comment on pousse
         p_mov = (p_mov if p_auto is None else p_auto) * (0.0 if par else 1.0)  # avec le parent : objets au repos, SEULE sa main les fera bouger
         moving = rng.random(N) < p_mov
+        if touch > 0: moving[:] = False                              # examen : objets au repos (ils ne bougent que poussés)
         th = rng.uniform(0, 2 * math.pi, N); sp = rng.uniform(smin, smax, N) * moving
         V = np.stack([sp * np.cos(th), sp * np.sin(th)], -1).astype(np.float32)
         ang = rng.uniform(0, 2 * math.pi, N); om = rng.normal(0, 0.15, N) * moving
@@ -295,18 +307,22 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     mv = 0.75 * mv - 0.12 * off + drive; off = np.clip(off + mv, -0.15, 0.15); mspd[t] = float(np.linalg.norm(mv))
             PROP[i, t] = np.concatenate([Hp, vact[t] + vib]) + rng.normal(0, 0.005, 4)
             vib = -echo * vib if float(np.abs(vib).max()) * echo > 0.002 else np.zeros(2, np.float32)   # oscillation amortie
-            img = np.zeros((H, H, 3), np.float32)
+            img = np.zeros((H, H, 3), np.float32); mk = np.zeros((K + 1, H, H), np.float32) if masks else None   # mk : part VISIBLE (examen)
             for k in range(N):
                 al = shape_alpha(kind[k], s[k], ang[k], P[k, 0], P[k, 1], xx, yy, H)[..., None]
                 img = img * (1 - al) + cols[k] * al
+                if masks: mk[:k] *= 1 - al[..., 0]; mk[k] = al[..., 0]
             if cf["mobile"]:
                 MOB[i, t] = M0 + off; al = shape_alpha(mkind, mob_size, 3.0 * off[0], *MOB[i, t], xx, yy, H)[..., None]
                 img = img * (1 - al) + mcol * al
+                if masks: mk[:K] *= 1 - al[..., 0]
             if par:                                                  # la main du parent (derrière la sienne, plus proche des yeux)
                 PAR[i, t] = Pp; ph = np.clip((Rp * 0.85 - np.maximum(abs(xx - Pp[0]), abs(yy - Pp[1]))) * H + 0.5, 0, 1)[..., None]
                 img = img * (1 - ph) + pcol * ph
+                if masks: mk[:K] *= 1 - ph[..., 0]
             hx = np.clip((Rh * 0.85 - np.maximum(abs(xx - Hp[0]), abs(yy - Hp[1]))) * H + 0.5, 0, 1)[..., None]
             X[i, t] = img * (1 - hx) + hx; HAND[i, t] = Hp
+            if masks: mk[:K] *= 1 - hx[..., 0]; mk[K] = hx[..., 0]; MASK[i, t] = np.round(mk * 255)
             if nohand: XNH[i, t] = img
             INVIEW[i, t] = bool(np.all((Hp > 0) & (Hp < 1)))
             POS[i, t, :N] = P; ANG[i, t, :N] = ang; VIS[i, t, :N] = np.all((P > -s[:, None]) & (P < 1 + s[:, None]), axis=-1)
@@ -315,7 +331,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
         if cf["mobile"]: extra = extra + cont_sound(2 * hum * mspd / 0.03, MOB[i, :, 0], T, rng, "tinte", mf0)
         A[i] = render_audio(ev, mat, m, T, a_sub, rng, W, win, tt_all, 1, IMP[i], extra)
     return dict(X=X, A=A, TOUCH=TOUCH, PROP=PROP, CMD=CMD, HAND=HAND, RH=RH, INVIEW=INVIEW, POS=POS, ANG=ANG, SHAPE=SHAPE,
-                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT, CIRC=CIRC, **({"XNH": XNH} if nohand else {}))
+                NOBJ=NOBJ, IMP=IMP, TSRC=TSRC, MOB=MOB, LINK=LINK, MTYPE=MTYPE, VIS=VIS, PAR=PAR, PCONT=PCONT, CIRC=CIRC, **({"XNH": XNH} if nohand else {}),
+                **({"MASK": MASK, "SAMECOL": SAMECOL, "TOUCHP": TOUCHP} if masks else {}))
 
 def baby_view(X, stage):
     """ce que le bébé VOIT à cette étape (numpy, pour les figures) : flou gaussien UNIFORME + gris + contraste réduit."""
