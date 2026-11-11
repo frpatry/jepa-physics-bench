@@ -72,7 +72,7 @@ def fric_sound(pos, mat, m, T, level):
 
 def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, mobile_delay=0, smin=0.02, smax=0.08,
                force_mtype=None, force_tcut=None, p_obj=0.45, mob_size=0.10, calm=0.0, p_out=0.0, table=0.4, p_auto=None, kick=0.0, p_parent=0.0, blocks=0.0,
-               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False, nohand=False, nobj=None, same_col=0.0, touch=0.0, masks=False):
+               blind=False, circ=0.0, pause=True, echo=0.0, damp=0.0, shape_phys=False, nohand=False, nobj=None, same_col=0.0, touch=0.0, masks=False, obj_scale=1.0):
     """-> sens : X (n,T,H,H,3), A (n,T,a_sub*2,NB), TOUCH (n,T,8), PROP (n,T,4) ; volonté : CMD (n,T,2) ;
     examens : HAND (n,T,2), RH (n,), INVIEW (n,T), POS (n,T,3,2) [NaN absent], ANG, SHAPE, NOBJ, IMP, TSRC (n,T) [0 rien,
     1 toucher ACTIF, 2 PASSIF], MOB (n,T,2), LINK (n,T) [mobile relié au geste], MTYPE (n,) [0 relié, 1 autonome,
@@ -112,7 +112,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     EXAMEN « OBJETS » (av_obj_diag.py ; défauts = monde inchangé, même suite de tirages) : nobj (lo, hi) remplace le nombre d'objets de
     l'étape ; same_col : proba que tous les objets aient la MÊME couleur ; touch > 0 : tous les objets AU REPOS au départ et, avec proba
     touch, chaque objet k ≥ 1 posé CONTRE un objet précédent (se touchent / se chevauchent) ; masks : MASK (n,T,K+1,H,H) uint8 = part
-    VISIBLE de chaque pixel couverte par l'objet k (K = sa main), SAMECOL (n,), TOUCHP (n,) — examens seulement, jamais vus par le bébé."""
+    VISIBLE de chaque pixel couverte par l'objet k (K = sa main), SAMECOL (n,), TOUCHP (n,) — examens seulement, jamais vus par le bébé.
+    obj_scale : TAILLE des objets × obj_scale (défaut 1 = monde inchangé) — test du 11 nov. (av_obj_diag) : un objet ≈ 1.6 case de 4 px,
+    l'œil ne peut pas tracer la frontière entre deux objets collés ; des jouets plus gros (vus de près, comme un bébé les voit) = RÉSOLUTION."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -138,7 +140,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
 
         nb_ = cf["nobj"] if nobj is None else nobj; N = int(rng.integers(nb_[0], nb_[1] + 1)); NOBJ[i] = N
         kind = rng.integers(0, 4, N); SHAPE[i, :N] = kind
-        s = np.where(kind == 3, rng.uniform(0.12, 0.16, N), rng.uniform(0.08, 0.14, N)); rc = np.where(kind == 3, 0.95, 0.9) * s
+        s = obj_scale * np.where(kind == 3, rng.uniform(0.12, 0.16, N), rng.uniform(0.08, 0.14, N)); rc = np.where(kind == 3, 0.95, 0.9) * s
         cols = np.clip(PAL[rng.choice(len(PAL), N, replace=False)] * rng.uniform(0.7, 1.0, (N, 1)) + rng.normal(0, 0.08, (N, 3)), 0.1, 0.95).astype(np.float32)
         if same_col > 0 and N > 1 and rng.random() < same_col: cols[:] = cols[0]; SAMECOL[i] = True   # examen : MÊME couleur
         m = np.exp(rng.uniform(np.log(1 / 3), np.log(3), N)); mat = rng.integers(0, 3, N)
