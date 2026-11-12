@@ -250,8 +250,10 @@ class MoveHead(nn.Module):
         return F.linear(F.gelu(F.linear(x, w(s.a.weight), w(s.a.bias))), w(s.b.weight), w(s.b.bias)).squeeze(-1)
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0, mv=0):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0, mv=0, co=0):
         super().__init__(); s.mv = bool(mv); s.nv = nv
+        if co:                                                         # MOUVEMENT COMMUN (--comove_w) : projection où deux cases du MÊME objet se ressemblent
+            s.co_proj = nn.Linear(d, 64); s.co_s = nn.Parameter(torch.tensor(math.log(5.0))); s.co_b = nn.Parameter(torch.zeros(()))
         s.levels = levels; s.enc = Enc4(din, d, nv, T, nl, nh, sep, lv=levels, nreg=regs, reg_frame=reg_frame)
         assert not (regs and (levels or split or resid)), "cases résumé : prédicteur unique non résiduel, sans pyramide"
         s.pred = SplitPred(d, nv, npf, T, pl, nh) if split else PredAC(d, nv + 3 * T, T, pl, nh, resid, nv, npf, causal)
@@ -283,7 +285,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0)), int(cfg.get("goal_k", 0)), int(cfg.get("mv", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0)), int(cfg.get("goal_k", 0)), int(cfg.get("mv", 0)), int(cfg.get("co", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -301,6 +303,22 @@ def move_map(X, thr, P):
     B, T_ = X.shape[:2]; nP = X.size(2) // P; dX = (X[:, 1:] - X[:, :-1]).abs().amax(-1)
     mv = (dX.reshape(B, T_ - 1, nP, P, nP, P).amax((3, 5)) > thr).float().reshape(B, T_ - 1, nP * nP)
     return torch.cat([torch.zeros_like(mv[:, :1]), mv], 1)
+
+def flow_cells(X, P, R=4, thr=0.5):
+    """MOUVEMENT COMMUN (--comove_w) : déplacement de chaque case de t à t+1 par APPARIEMENT DE BLOCS sur ses pixels (aucune étiquette, valable sur vraie vidéo).
+    X (B, T, H, H, 3) dans [0, 1] -> par transition t -> t+1 (B, T-1, cases) : fl (déplacement en px, 2), mov (la case bouge, déplacement SÛR : pas d'ambiguïté
+    d'ouverture), still (case TEXTURÉE immobile : un décalage la changerait, donc sûre de ne pas bouger), chg (la case a changé)."""
+    B, T_, H_ = X.shape[:3]; nP = H_ // P; BT = B * (T_ - 1)
+    a_ = X[:, :-1].permute(0, 1, 4, 2, 3).reshape(BT, 3, H_, H_); b_ = F.pad(X[:, 1:].permute(0, 1, 4, 2, 3).reshape(BT, 3, H_, H_), (R,) * 4, mode="replicate")
+    ds = [(dy, dx) for dy in range(-R, R + 1) for dx in range(-R, R + 1)]; D = torch.tensor(ds, device=X.device, dtype=torch.float32)
+    cost = torch.stack([F.avg_pool2d((a_ - b_[:, :, R + dy:R + dy + H_, R + dx:R + dx + H_]).abs().sum(1, keepdim=True), P)[:, 0] * (P * P) for dy, dx in ds], -1)
+    cost = cost.reshape(B, T_ - 1, nP * nP, len(ds)); i0 = ds.index((0, 0)); c0 = cost[..., i0]
+    best, bi = cost.min(-1); cheb = (D[:, None] - D[None]).abs().amax(-1)
+    cfar = cost.masked_fill(cheb[bi] <= 1, float("inf")).min(-1).values         # meilleur coût LOIN du meilleur déplacement : sinon ambigu
+    cnz = cost.masked_fill(torch.arange(len(ds), device=X.device) == i0, float("inf")).min(-1).values
+    chg = c0 > thr; mov = chg & (bi != i0) & (best < 0.5 * c0) & (cfar > 2 * best + thr)
+    still = (c0 < 0.1 * thr) & (cnz > thr)
+    return D[bi], mov, still, chg
 
 def to_tok0(b, st, v, P, dev):
     """lot -> tokens (B, nv + 3T, W) [vue | ouïe | toucher | bras] et commandes (B, T, 2) — normalisés."""
@@ -551,6 +569,11 @@ def main():
                    "déplace, 0.77 vs 0.91 sur le vrai futur). Carte par case = la case a changé depuis l'image d'avant (ses pixels, aucune étiquette). "
                    "(1) ENTRÉE : l'imagination l'entend sur le passé vu ; (2) CIBLE : une tête qui le lit dans les VRAIS latents doit aussi le lire, gelée, "
                    "dans les latents IMAGINÉS (le gradient va à l'imagination) ; (3) RÉENTENDU : dans le déroulé, la carte imaginée repart avec l'image imaginée. Poids de (2)+(3)")
+    p.add_argument("--comove_w", type=float, default=0.0, help="MOUVEMENT COMMUN (étape 5, 2026-11-12 ; Kellman & Spelke 1983, EISEN 2022) : av_obj_diag D17q = l'objet est "
+                   "dans ses latents mais la COULEUR reste l'axe principal (sonde apprise sur couleurs différentes -> même couleur collés 0.60). Le déplacement de chaque case "
+                   "(appariement de blocs sur ses pixels, aucune étiquette) dit quelles cases BOUGENT ENSEMBLE ; ses latents de la DERNIÈRE image vue (il ne voit pas la suite) "
+                   "doivent le prédire pour les cases qui étaient immobiles (DÉBUT du mouvement : sa vitesse passée ne l'aide pas) -> l'identité de l'objet, pas sa couleur. Poids")
+    p.add_argument("--comove_samecol", type=float, default=0.0, help="proba qu'une scène de jeu ait tous ses objets de la MÊME couleur (la couleur ne suffit plus)")
     p.add_argument("--move_thr", type=float, default=0.15, help="seuil de changement d'un pixel (image dans [0, 1]) pour dire que la case bouge")
     p.add_argument("--move_pos", type=float, default=4.0, help="poids des cases qui BOUGENT (rares) dans la perte du sens du mouvement")
     p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
@@ -602,17 +625,19 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal), a.goal_k if a.goal_w > 0 else 0, int(a.move_w > 0)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal), a.goal_k if a.goal_w > 0 else 0, int(a.move_w > 0), int(a.comove_w > 0)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
         for p_ in m.enc.parameters(): p_.requires_grad_(False)
     gparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("goal.")]       # tête GESTES MANQUANTS : son propre taux
     mparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("mv_")]         # SENS DU MOUVEMENT (neuf) : même taux que la tête neuve
-    opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith(("goal.", "mv_"))]}]
-                            + ([{"params": gparams, "goal": True}] if gparams else []) + ([{"params": mparams, "goal": True}] if mparams else []), a.lr, weight_decay=0.05)
+    cparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("co_")]         # MOUVEMENT COMMUN (neuf) : groupe à part, ajouté en dernier
+    opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith(("goal.", "mv_", "co_"))]}]
+                            + ([{"params": gparams, "goal": True}] if gparams else []) + ([{"params": mparams, "goal": True}] if mparams else [])
+                            + ([{"params": cparams, "goal": True}] if cparams else []), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
-               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0, goal_nohand=a.goal_nohand, mv=int(a.move_w > 0), mv_thr=a.move_thr, mv_pos=a.move_pos)
+               resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0, goal_nohand=a.goal_nohand, mv=int(a.move_w > 0), mv_thr=a.move_thr, mv_pos=a.move_pos, co=int(a.comove_w > 0))
     state = dict(it=0, hist=[], exams=[])
     fresh_opt = False
     if os.path.exists(a.ckpt):
@@ -622,11 +647,12 @@ def main():
         if fresh: m.load_state_dict({k: w for k, w in ck["m"].items() if not k.startswith("pred.")}, strict=False); print("œil repris, prédicteur CORPS / MONDE neuf", flush=True)
         else:
             res_ = m.load_state_dict(ck["m"], strict=False)            # une tête GESTES MANQUANTS neuve peut manquer au ckpt (rien d'autre)
-            bad_ = [k for k in res_.missing_keys if not k.startswith(("goal.", "mv_"))] + list(res_.unexpected_keys)
+            bad_ = [k for k in res_.missing_keys if not k.startswith(("goal.", "mv_", "co_"))] + list(res_.unexpected_keys)
             assert not bad_, f"reprise : clés incompatibles {bad_[:5]}"
             new_goal = any(k.startswith("goal.") for k in res_.missing_keys)
             if new_goal: fresh_opt = True; print("tête GESTES MANQUANTS neuve (le reste repris ; optimiseur neuf)", flush=True)
             if any(k.startswith("mv_") for k in res_.missing_keys): print("SENS DU MOUVEMENT neuf (le reste repris, optimiseur gardé)", flush=True)
+            if any(k.startswith("co_") for k in res_.missing_keys): print("MOUVEMENT COMMUN neuf (le reste repris, optimiseur gardé)", flush=True)
         tgt.load_state_dict(ck["tgt"]); state = ck["state"]
         if "opt" in ck and not fresh and not fresh_opt:                   # un INSTANTANÉ n'a pas l'optimiseur (reprise depuis une étape)
             so = ck["opt"]; n_ = sum(len(g["params"]) for g in so["param_groups"])
@@ -638,13 +664,31 @@ def main():
         print(f"REPRISE au pas {state['it']} (étape {stage_of(state['it'])[0]})", flush=True)
     else:
         m.eval(); state["exams"].append(("init", exam(m, tgt, probes, st, VIEW["0a"], a, dev, nv, npf, "init (aléatoire)"))); m.train()
-    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []; roll_obj_hist = []; goal_hist = []; mv_hist = []
+    S = Stream(state["it"], a.bs, a.workers, a.replay, wkw=wkw); md_np, fr_np = layout(nv, npf); ma = None; cur_stats = []; roll_hist = []; roll_obj_hist = []; goal_hist = []; mv_hist = []; co_hist = []
+    if a.comove_samecol > 0: S.wkw["same_col"] = a.comove_samecol             # JEU seulement : retiré du monde des examens et des instantanés (cfg_s)
+    cfg_s = lambda: {**cfg, "comove_samecol": a.comove_samecol, "wkw": {k: x for k, x in cfg["wkw"].items() if k != "same_col"}}
     pw_ = torch.tensor(a.move_pos, device=dev); lpos_ = math.log(a.move_pos)
     def mv_bce(lg, y, w):                                             # « ça bouge ici » : BCE par case (celles qui bougent × --move_pos ; w = poids par case, 0 = ignorée)
         l_ = F.binary_cross_entropy_with_logits(lg.float(), y, pos_weight=pw_, reduction="none"); return (l_ * w).sum() / w.sum().clamp_min(1.0)
     def mv_sep(lg, y, w):                                             # proba (recalée) dite sur les cases qui bougent / sur les immobiles
         p_ = torch.sigmoid(lg.detach().float() - lpos_); wc, wu = w * y, w * (1 - y)
         return torch.stack([(p_ * wc).sum() / wc.sum().clamp_min(1e-6), (p_ * wu).sum() / wu.sum().clamp_min(1e-6)])
+    def comove_loss(zc, cidx, FL):
+        """MOUVEMENT COMMUN : latents EN LIGNE (gradient vers l'œil) de la dernière image vue t0 de chaque ligne (t0 ≤ T-2, la suite n'est pas vue)
+        -> pour chaque paire de cases de t0 : bougent-elles ENSEMBLE de t0 à t0+1 ? Seules les cases IMMOBILES de t0-1 à t0 comptent (début du mouvement).
+        positif : deux cases qui bougent du même déplacement (±1 px) ; négatif : déplacements différents, ou l'une bouge et l'autre (texturée) reste immobile."""
+        fl, mov, still, chg = FL; B_, d_ = zc.size(0), zc.size(-1)
+        zf = zc.new_zeros(B_, nv + 3 * T, d_).scatter(1, cidx.unsqueeze(-1).expand(-1, -1, d_), zc)[:, :nv].view(B_, T, npf, d_)
+        pv = torch.zeros(B_, nv + 3 * T, device=dev).scatter(1, cidx, 1.0)[:, :nv].view(B_, T, npf) > 0
+        t0 = (pv.any(-1) * torch.arange(T, device=dev)).amax(1); ok = t0 <= T - 2; t0c = t0.clamp(max=T - 2); b_ = torch.arange(B_, device=dev)
+        pres = pv[b_, t0c] & ok[:, None]; prev = torch.where((t0c > 0)[:, None], chg[b_, (t0c - 1).clamp_min(0)], torch.zeros_like(pres))
+        keep = pres & ~prev; mi, si = mov[b_, t0c] & keep, still[b_, t0c] & keep; f_ = fl[b_, t0c]
+        u = F.normalize(m.co_proj(F.layer_norm(zf[b_, t0c].float(), (d_,))), dim=-1); lg = m.co_s.exp() * torch.einsum("bid,bjd->bij", u, u) + m.co_b
+        same = (f_.unsqueeze(2) - f_.unsqueeze(1)).abs().amax(-1) <= 1; mm = mi.unsqueeze(2) & mi.unsqueeze(1)
+        pos = mm & same & ~torch.eye(npf, dtype=torch.bool, device=dev); neg = (mm & ~same) | (mi.unsqueeze(2) & si.unsqueeze(1)) | (si.unsqueeze(2) & mi.unsqueeze(1))
+        l_ = F.binary_cross_entropy_with_logits(lg, pos.float(), reduction="none"); np_, nn_ = pos.sum().clamp_min(1), neg.sum().clamp_min(1)
+        p_ = torch.sigmoid(lg.detach())
+        return 0.5 * ((l_ * pos).sum() / np_ + (l_ * neg).sum() / nn_), [float((p_ * pos).sum() / np_), float((p_ * neg).sum() / nn_), float(pos.sum()) / B_, float(neg.sum()) / B_]
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
@@ -700,6 +744,7 @@ def main():
                     wv_ = (ch_ / ch_.mean((1, 2), keepdim=True).clamp_min(1e-8)).pow(a.motion_w).clamp(max=5.0).reshape(B, nv)
                     wmot = torch.cat([wv_, torch.ones(B, N - nv, device=dev)], 1)
                 jl = 0.0; summ = []; bk = {}; rl = torch.zeros((), device=dev); cl = torch.zeros((), device=dev); ll = torch.zeros((), device=dev)
+                co_l = torch.zeros((), device=dev); FL = flow_cells(bt_["X"].to(dev).float() / 255.0, a.P) if a.comove_w > 0 else None
                 ml_r, ml_i, ml_k = (torch.zeros((), device=dev) for _ in range(3)); sep_ = [torch.full((2,), float("nan"), device=dev) for _ in range(3)]
                 if a.move_w > 0:                                         # SENS DU MOUVEMENT, branche RÉELLE : la tête apprend à lire « ça bouge ici » dans les VRAIS latents
                     MV = tok[:, :nv, -1].view(B, T, npf); zv_m = z[:, :nv].view(B, T, npf, -1)
@@ -718,6 +763,8 @@ def main():
                     elif a.regs: zc, rg_ = m.enc(_gather(tok, cidx), cidx, regs=True); ctx_in = torch.cat([zc, rg_], 1)   # cases-endroits + CASES RÉSUMÉ
                     else: tkc_ = _gather(tok, cidx); zc = m.enc(tkc_, cidx); ctx_in = m.hear(zc, tkc_, cidx) if m.mv else zc   # (1) il ENTEND où ça vient de bouger
                     summ.append(zc.float().mean(1))
+                    if a.comove_w > 0:                                  # MOUVEMENT COMMUN : la dernière image vue dit quelles cases vont bouger ENSEMBLE
+                        cl_, cs_ = comove_loss(zc, cidx, FL); co_l = co_l + cl_ / len(pairs); co_hist.append(cs_)
                     if cw > 0 and a.ctx_on in ("enc", "enc_low"):          # INTERVENTION 1 dans l'ŒIL : ses cases visibles décrivent leur endroit
                         if a.ctx_on == "enc_low": dc = F.layer_norm(zl_c.float(), (a.d,)) - _gather(z_low, cidx)   # ZOOM : seul l'étage FIN devient local
                         else: dc = F.layer_norm(zc.float(), (a.d,)) - _gather(z, cidx)
@@ -829,7 +876,7 @@ def main():
             sr = torch.zeros((), device=dev)
             if a.sig_w > 0 and not a.freeze_eye:
                 with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-            loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl + a.move_w * (ml_r + ml_i + ml_k)
+            loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl + a.move_w * (ml_r + ml_i + ml_k) + a.comove_w * co_l
             if a.move_w > 0:
                 mv_hist.append(torch.cat([MV[:, 1:].mean().view(1), *sep_]).tolist())
                 if len(mv_hist) > 1000: del mv_hist[:-500]
@@ -841,15 +888,16 @@ def main():
                 if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
             scaler.scale(loss / a.accum).backward()
         scaler.unscale_(opt)                                                  # (fp16 : gradients remis à l'échelle AVANT l'écrêtage ; sinon sans effet)
-        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith(('goal.', 'mv_head.'))], 1.0)
+        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith(('goal.', 'mv_head.', 'co_'))], 1.0)
         if a.move_w > 0: torch.nn.utils.clip_grad_norm_(m.mv_head.parameters(), 1.0)   # la tête du mouvement à part (elle n'apprend que sur les vrais latents)
-        if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)   # la tête GESTES MANQUANTS à part (le JEPA dominerait l'écrêtage)
+        if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)
+        if a.comove_w > 0: torch.nn.utils.clip_grad_norm_([m.co_proj.weight, m.co_proj.bias, m.co_s, m.co_b], 1.0)   # la tête GESTES MANQUANTS à part (le JEPA dominerait l'écrêtage)
         scaler.step(opt); scaler.update()
         mom = 1 - (1 - a.ema) * (math.cos(math.pi * it / a.total) + 1) / 2
         if not a.freeze_eye:
             with torch.no_grad():
                 for pt, pc in zip(tgt.parameters(), m.enc.parameters()): pt.mul_(mom).add_(pc.detach(), alpha=1 - mom)
-        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item(), cl.item(), ll.item(), ml_r.item(), ml_i.item(), ml_k.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
+        cur = np.array([jl.item(), il.item(), sr.item(), float(z[:, :nv].std(0).mean()), gap.item(), rl.item(), cl.item(), ll.item(), ml_r.item(), ml_i.item(), ml_k.item(), co_l.item()]); ma = cur if ma is None or len(ma) != len(cur) else 0.99 * ma + 0.01 * cur
         if it % 500 == 0:
             state["hist"].append((it, stage, *ma.tolist()))
             print(f"  pas {it:6d} | étape {stage} ({f:.0%})" + (f" | calme {S.wkw.get('calm', 0):.2f}" if a.calm else "") + (f" | hors champ {S.wkw.get('p_out', 0):.2f}" if a.outside else "") + (f" | blocs {S.wkw.get('blocks', 0):.2f}" if a.blocks else "") + f" | vue σ={v['sigma']:.1f} gris {v['gray']:.1f} | JEPA {ma[0]:.4f} | geste deviné {ma[1]:.4f} "
@@ -866,16 +914,20 @@ def main():
             mh_ = np.nanmean(np.array(mv_hist[-500:], dtype=np.float64), 0)
             print(f"      MOUVEMENT « ça bouge ici » ({mh_[0]:.1%} des cases) | perte vrais latents {ma[8]:.3f}, imaginé {ma[9]:.3f}, déroulé {ma[10]:.3f} | proba dite sur les cases "
                   f"qui bougent / immobiles : vrai {mh_[1]:.2f} / {mh_[2]:.2f} | imaginé {mh_[3]:.2f} / {mh_[4]:.2f} | déroulé (dernier pas) {mh_[5]:.2f} / {mh_[6]:.2f}", flush=True)
+        if it % 500 == 0 and co_hist:
+            ch_ = np.array(co_hist[-2000:], dtype=np.float64); del co_hist[:-2000]
+            print(f"      MOUVEMENT COMMUN (dernière image vue -> qui bouge ENSEMBLE ensuite) | perte {ma[11]:.3f} | proba « même objet » dite : bougent ensemble {ch_[:, 0].mean():.2f} "
+                  f"/ pas ensemble {ch_[:, 1].mean():.2f} | paires par séquence : ensemble {ch_[:, 2].mean():.1f}, pas ensemble {ch_[:, 3].mean():.1f}", flush=True)
         if it % 500 == 0 and cur_stats:
             cs_ = np.array(cur_stats[-500:]); print(f"      CURIOSITÉ : séquences avec contact — essayées {cs_[:, 0].mean():.0%}, ÉTUDIÉES {cs_[:, 1].mean():.0%}", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
-            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg, norm=st), a.ckpt.replace(".pt", f"_{stage}_{it // 1000}k.pt"))
+            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg_s(), norm=st), a.ckpt.replace(".pt", f"_{stage}_{it // 1000}k.pt"))
         stop = a.stop_at and it >= a.stop_at
         if it % a.ckpt_every == 0 or it == a.total or stop:
-            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state, cfg=cfg, norm=st), a.ckpt + ".tmp")
+            torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state, cfg=cfg_s(), norm=st), a.ckpt + ".tmp")
             os.replace(a.ckpt + ".tmp", a.ckpt)
         if stop: print(f"ARRÊT demandé au pas {it} (relancer sans --stop_at pour prolonger)", flush=True); break
     print("\n========== EXAMENS AU FIL DU DÉVELOPPEMENT ==========")

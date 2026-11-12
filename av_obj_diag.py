@@ -128,7 +128,7 @@ def main():
     m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
     teachN = lambda x, ix: F.layer_norm(tgt(x, ix).float(), (d,)); imagine = m.pred                       # étage du haut (comme av_plan0 --read_level top)
     nP = H // cfg["P"]; FR = list(range(a.plan_c + a.hmax, T, 2))
-    wkw = {**cfg.get("wkw", {}), "p_out": 0.0, "p_parent": 0.0, "kick": 0.0, "nohand": False}; wkw.pop("circ", None)
+    wkw = {**cfg.get("wkw", {}), "p_out": 0.0, "p_parent": 0.0, "kick": 0.0, "nohand": False}; wkw.pop("circ", None); wkw.pop("same_col", None)
     log(f"OBJETS AU-DELÀ DE LA COULEUR (bébé gelé, pas {ck['state']['it']}) : {a.n} scènes à 2 objets, images {FR}, imaginés h = 1..{a.hmax} | {time.time() - t_:.0f}s")
     D = obj_data(m, teachN, imagine, cfg, st, dev, a.n, a.seed, (2, 2), FR, a.hmax, wkw)
     Pr = make_pairs(D["FC"], D["CT"], D["SC"], nP); ntr = int(0.8 * a.n); tr_s = Pr["S"] < ntr; te = np.where(~tr_s)[0]
