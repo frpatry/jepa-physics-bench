@@ -14,3 +14,4 @@ __pycache__/
 *.npy
 *.npz
 .ipynb_checkpoints/
+arc3/

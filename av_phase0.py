@@ -673,18 +673,24 @@ def main():
     def mv_sep(lg, y, w):                                             # proba (recalée) dite sur les cases qui bougent / sur les immobiles
         p_ = torch.sigmoid(lg.detach().float() - lpos_); wc, wu = w * y, w * (1 - y)
         return torch.stack([(p_ * wc).sum() / wc.sum().clamp_min(1e-6), (p_ * wu).sum() / wu.sum().clamp_min(1e-6)])
-    def comove_loss(zc, cidx, FL):
+    def comove_loss(zc, cidx, FL, k=3):
         """MOUVEMENT COMMUN : latents EN LIGNE (gradient vers l'œil) de la dernière image vue t0 de chaque ligne (t0 ≤ T-2, la suite n'est pas vue)
-        -> pour chaque paire de cases de t0 : bougent-elles ENSEMBLE de t0 à t0+1 ? Seules les cases IMMOBILES de t0-1 à t0 comptent (début du mouvement).
-        positif : deux cases qui bougent du même déplacement (±1 px) ; négatif : déplacements différents, ou l'une bouge et l'autre (texturée) reste immobile."""
-        fl, mov, still, chg = FL; B_, d_ = zc.size(0), zc.size(-1)
+        -> pour chaque paire de cases de t0 : bougent-elles ENSEMBLE dans les k images qui suivent ? Seules les cases IMMOBILES de t0-1 à t0 comptent
+        (DÉBUT du mouvement : sa vitesse passée ne l'aide pas). Chaque case : son PREMIER changement après t0 (instant + déplacement).
+        positif : même instant, même déplacement (±1 px) ; négatif : instant ou déplacement différents, ou l'une bouge et l'autre (texturée) reste immobile tout du long."""
+        fl, mov, still, chg = FL; B_, d_ = zc.size(0), zc.size(-1); T1 = chg.size(1)
+        tw = torch.arange(k, device=dev)
         zf = zc.new_zeros(B_, nv + 3 * T, d_).scatter(1, cidx.unsqueeze(-1).expand(-1, -1, d_), zc)[:, :nv].view(B_, T, npf, d_)
         pv = torch.zeros(B_, nv + 3 * T, device=dev).scatter(1, cidx, 1.0)[:, :nv].view(B_, T, npf) > 0
         t0 = (pv.any(-1) * torch.arange(T, device=dev)).amax(1); ok = t0 <= T - 2; t0c = t0.clamp(max=T - 2); b_ = torch.arange(B_, device=dev)
         pres = pv[b_, t0c] & ok[:, None]; prev = torch.where((t0c > 0)[:, None], chg[b_, (t0c - 1).clamp_min(0)], torch.zeros_like(pres))
-        keep = pres & ~prev; mi, si = mov[b_, t0c] & keep, still[b_, t0c] & keep; f_ = fl[b_, t0c]
+        keep = pres & ~prev; tt = (t0c[:, None] + tw).clamp(max=T1 - 1); inw = (t0c[:, None] + tw) <= T1 - 1     # (B, k) instants de la fenêtre
+        cw_ = chg[b_[:, None], tt] & inw[..., None]; fc = torch.where(cw_.any(1), cw_.float().argmax(1), k)          # 1er changement de chaque case (k = aucun)
+        tf = tt.gather(1, fc.clamp(max=k - 1)); mi = (fc < k) & mov.gather(1, tf.unsqueeze(1)).squeeze(1) & keep                             # il bouge (déplacement sûr) à son 1er changement
+        si = still[b_[:, None], tt].masked_fill(~inw[..., None], True).all(1) & keep & (fc == k)                       # texturé, immobile toute la fenêtre
+        f_ = fl.gather(1, tf[:, None, :, None].expand(-1, 1, -1, 2)).squeeze(1)
         u = F.normalize(m.co_proj(F.layer_norm(zf[b_, t0c].float(), (d_,))), dim=-1); lg = m.co_s.exp() * torch.einsum("bid,bjd->bij", u, u) + m.co_b
-        same = (f_.unsqueeze(2) - f_.unsqueeze(1)).abs().amax(-1) <= 1; mm = mi.unsqueeze(2) & mi.unsqueeze(1)
+        same = ((f_.unsqueeze(2) - f_.unsqueeze(1)).abs().amax(-1) <= 1) & (fc.unsqueeze(2) == fc.unsqueeze(1)); mm = mi.unsqueeze(2) & mi.unsqueeze(1)
         pos = mm & same & ~torch.eye(npf, dtype=torch.bool, device=dev); neg = (mm & ~same) | (mi.unsqueeze(2) & si.unsqueeze(1)) | (si.unsqueeze(2) & mi.unsqueeze(1))
         l_ = F.binary_cross_entropy_with_logits(lg, pos.float(), reduction="none"); np_, nn_ = pos.sum().clamp_min(1), neg.sum().clamp_min(1)
         p_ = torch.sigmoid(lg.detach())
