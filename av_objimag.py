@@ -22,8 +22,8 @@ from av_judge import auc
 
 
 class ObjImag(nn.Module):
-    def __init__(s, d, nP, T, h=192, nl=2, beta=6.0, co=None):
-        super().__init__(); s.nP, s.npf, s.beta = nP, nP * nP, beta
+    def __init__(s, d, nP, T, h=192, nl=2, beta=6.0, co=None, gate=0):
+        super().__init__(); s.nP, s.npf, s.beta, s.gate = nP, nP * nP, beta, gate
         s.inp = nn.Linear(d, h); s.pos = nn.Parameter(torch.randn(1, s.npf, h) * 0.02); s.cond = nn.Sequential(nn.Linear(16, h), nn.GELU(), nn.Linear(h, h)); s.kemb = nn.Embedding(16, h)
         s.tr = nn.TransformerEncoder(nn.TransformerEncoderLayer(h, 4, 2 * h, batch_first=True, dropout=0.0, activation="gelu"), nl)
         s.flow = nn.Linear(h, 2); nn.init.zeros_(s.flow.weight); nn.init.zeros_(s.flow.bias); s.objh = nn.Linear(h, 1)
@@ -48,7 +48,8 @@ class ObjImag(nn.Module):
         """Zt (B, npf, d) vrais latents de la dernière image vue ; cond (B, 16) gestes à venir + main sentie + toucher ; -> latents imaginés de t+k, déplacement, « chose »."""
         hf = s.tr(s.inp(Zt) + s.pos + s.cond(cond).unsqueeze(1) + s.kemb(torch.full((len(Zt),), k, device=Zt.device)).unsqueeze(1))
         r = s.flow(hf); o = torch.sigmoid(s.objh(hf)).squeeze(-1)
-        u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); f = (A @ r) * o.unsqueeze(-1)   # un déplacement PAR GROUPE ; seules les CHOSES bougent, le fond ne peut pas (v2 : a priori faible -> le décalage global revenait)
+        u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); f = A @ r   # un déplacement PAR GROUPE (moyenne sur les cases qui vont ensemble)
+        if s.gate: f = f * o.unsqueeze(-1)   # --gate 1 (v3, échec) : seules les « choses » bougent — contourné : « chose » ≈ 0 partout et déplacement brut énorme
         if zero_flow: f = torch.zeros_like(f)
         C = Zt - s.clock[t]; B_, n_, d_ = C.shape
         C = F.conv2d(C.transpose(1, 2).reshape(B_ * d_, 1, s.nP, s.nP), s.smooth[None, None], padding=1).reshape(B_, d_, n_).transpose(1, 2) * s.gain
@@ -62,8 +63,9 @@ def main():
     p.add_argument("--ckpt", required=True); p.add_argument("--out", type=str, default="/content/objimag.pt"); p.add_argument("--steps", type=int, default=6000)
     p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--kmax", type=int, default=4); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--contact", type=float, default=0.75, help="part du lot prise parmi les séquences où il a senti un contact"); p.add_argument("--n_eval", type=int, default=2000)
-    p.add_argument("--warm", type=int, default=1500, help="pas SANS déplacement au début : l'horloge, le lissage et le gain s'apprennent d'abord (sinon un faux décalage global sert de flou)")
-    p.add_argument("--thing_w", type=float, default=0.02, help="a priori « peu de choses, beaucoup de fond » : petit coût sur la part de cases dites « chose »")
+    p.add_argument("--warm", type=int, default=6000, help="pas SANS déplacement au début : l'horloge, le lissage et le gain s'apprennent d'abord (sinon un faux décalage global sert de flou)")
+    p.add_argument("--gate", type=int, default=0, help="1 = v3 : déplacement × « chose » (échec, gardé pour mémoire)")
+    p.add_argument("--thing_w", type=float, default=0.0, help="a priori « peu de choses, beaucoup de fond » : petit coût sur la part de cases dites « chose »")
     p.add_argument("--still_w", type=float, default=0.005, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
     p.add_argument("--eval_every", type=int, default=2000); p.add_argument("--seed", type=int, default=0); p.add_argument("--dev", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(); dev = a.dev; t_ = time.time(); log = lambda s_: print(s_, flush=True); torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed)
@@ -72,7 +74,7 @@ def main():
     for q in tgt.parameters(): q.requires_grad_(False)
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; v = VIEW["0e"]; ix = torch.arange(nv, device=dev)
     co = {"weight": ck["m"]["co_proj.weight"], "bias": ck["m"]["co_proj.bias"]} if "co_proj.weight" in ck["m"] else None
-    m = ObjImag(d, nP, T, co=co).to(dev); opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.01); sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.steps, pct_start=0.05)
+    m = ObjImag(d, nP, T, co=co, gate=a.gate).to(dev); opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.01); sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.steps, pct_start=0.05)
     wkw = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}; sc = float(wkw.get("obj_scale", 1.0))
     log(f"IMAGINATION PAR OBJET, purement latente (œil GELÉ, pas {ck['state']['it']}) : {sum(q.numel() for q in m.parameters()) / 1e6:.2f} M de paramètres, {a.steps} pas, lots de {a.bs}, horizons 1..{a.kmax}")
 
@@ -131,7 +133,7 @@ def main():
         if it % 250 == 0:
             log(f"  pas {it:5d} | perte {ma[0]:.4f} | sans déplacement (recopier + horloge) {ma[1]:.4f} | recopier {ma[2]:.4f} | déplacement moyen {ma[3]:.2f} px, plus grand de l'image {ma[4]:.2f} px | « chose » moyenne {ma[5]:.2f} | {time.time() - t_:.0f}s")
         if it % a.eval_every == 0 or it == a.steps:
-            exam(f"au pas {it}"); torch.save(dict(m=m.state_dict(), cfg=dict(d=d, nP=nP, T=T), it=it, base=a.ckpt), a.out)
+            exam(f"au pas {it}"); torch.save(dict(m=m.state_dict(), cfg=dict(d=d, nP=nP, T=T, gate=a.gate), it=it, base=a.ckpt), a.out)
     log(f"total {time.time() - t_:.0f}s")
 
 
