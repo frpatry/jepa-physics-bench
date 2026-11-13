@@ -62,7 +62,7 @@ def obj_data(m, teachN, imagine, cfg, st, dev, n, seed, nobj, FR, hmax, wkw, ima
     gat = lambda tok, i_: torch.gather(tok, 1, i_.unsqueeze(-1).expand(-1, -1, tok.size(-1)))
     cells = lambda X: X.reshape(*X.shape[:2], nP, P_, nP, P_, 3).transpose(0, 1, 2, 4, 3, 5, 6).reshape(*X.shape[:2], npf, P_ * P_ * 3)
     FR3 = np.array([[f - 2, f - 1, f] for f in FR]); T0 = sorted({f - h for f in FR for h in range(1, hmax + 1)})
-    R = {k: [] for k in ("ZR", "PX", "PX3", "IMG", "FC", "CT", "SC", "NO")}; R["ZI"] = [[] for _ in range(hmax)]
+    R = {k: [] for k in ("ZR", "U", "PX", "PX3", "IMG", "FC", "CT", "SC", "NO")}; R["ZI"] = [[] for _ in range(hmax)]
     for c0 in range(0, n, chunk):
         w0 = gen_world0(min(chunk, n - c0), "0e", T, H, seed=seed * 1000 + c0 // chunk, nobj=nobj, same_col=0.5, touch=0.5, masks=True, **wkw)
         MK = w0["MASK"][:, FR]; nc = len(MK); K1 = MK.shape[2]
@@ -73,6 +73,12 @@ def obj_data(m, teachN, imagine, cfg, st, dev, n, seed, nobj, FR, hmax, wkw, ima
         for i in range(0, nc, bs):
             b = to_torch(w, slice(i, i + bs)); B = len(b["X"]); tok, cmd = to_tok0(b, st, v, P_, dev)
             zr = teachN(tok[:, :nv], ix.expand(B, -1)).view(B, T, npf, -1)[:, FR]; R["ZR"].append((zr.mean(2) if pool else zr).half().cpu())
+            if hasattr(m, "co_proj") and not pool:                                      # SA PROPRE affinité (--comove_w) : l'œil EN LIGNE sur le passé ≤ f, cases de l'image f, comme à l'entraînement
+                us = []
+                for f in FR:
+                    ci = id_(fr <= f).expand(B, -1); zc = m.enc(gat(tok, ci), ci)[:, f * npf:(f + 1) * npf].float()
+                    us.append(F.normalize(m.co_proj(F.layer_norm(zc, (zc.size(-1),))), dim=-1).half().cpu())
+                R["U"].append(torch.stack(us, 1))
             if not imag: continue
             zi = {}
             for t0 in T0:                                                # même passé vu -> un seul contexte pour tous les (f, h) avec f − h = t0
@@ -122,6 +128,7 @@ def main():
     p.add_argument("--hmax", type=int, default=4, help="imaginés à h = 1..hmax"); p.add_argument("--plan_c", type=int, default=3, help="passé vu minimal (images 0..plan_c)")
     p.add_argument("--train", type=str, default="diff", choices=["diff", "sep"], help="régime TRANSFERT : couleurs différentes (séparés + se touchent) ou séparés seulement")
     p.add_argument("--steps", type=int, default=2000); p.add_argument("--seeds", type=int, default=2)
+    p.add_argument("--own_only", type=int, default=0, help="1 = seulement SA PROPRE affinité (tête co_proj, aucune sonde) — rapide")
     p.add_argument("--count", type=int, default=1, help="1 = BONUS : combien d'objets (1/2/3)"); p.add_argument("--n_count", type=int, default=0, help="scènes du bonus (0 = --n)")
     a = p.parse_args(); dev = a.dev; t_ = time.time(); log = lambda s_: print(s_, flush=True)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]
@@ -130,7 +137,7 @@ def main():
     nP = H // cfg["P"]; FR = list(range(a.plan_c + a.hmax, T, 2))
     wkw = {**cfg.get("wkw", {}), "p_out": 0.0, "p_parent": 0.0, "kick": 0.0, "nohand": False}; wkw.pop("circ", None); wkw.pop("same_col", None)
     log(f"OBJETS AU-DELÀ DE LA COULEUR (bébé gelé, pas {ck['state']['it']}) : {a.n} scènes à 2 objets, images {FR}, imaginés h = 1..{a.hmax} | {time.time() - t_:.0f}s")
-    D = obj_data(m, teachN, imagine, cfg, st, dev, a.n, a.seed, (2, 2), FR, a.hmax, wkw)
+    D = obj_data(m, teachN, imagine, cfg, st, dev, a.n, a.seed, (2, 2), FR, a.hmax, wkw, imag=not a.own_only)
     Pr = make_pairs(D["FC"], D["CT"], D["SC"], nP); ntr = int(0.8 * a.n); tr_s = Pr["S"] < ntr; te = np.where(~tr_s)[0]
     nobjc = ((D["FC"][:, :, :-1] >= 0.5) & (D["FC"][:, :, -1:] < 0.1)).sum(-1)
     log(f"   données : {time.time() - t_:.0f}s | images se touchent {np.mean(D['CT'] == 1):.0%} / séparées {np.mean(D['CT'] == 0):.0%} / entre les deux (écartées) "
@@ -165,7 +172,7 @@ def main():
                 if min(y[s_].sum(), (~y[s_]).sum()) >= 20: r[c, b_] = auc(lg[s_], y[s_])
         return r
 
-    feat_sets = [("vrais latents", D["ZR"])] + [(f"imaginés h={h + 1}", D["ZI"][h]) for h in range(a.hmax)] + \
+    feat_sets = [("vrais latents", D["ZR"])] + [(f"imaginés h={h + 1}", D["ZI"][h]) for h in range(len(D["ZI"]))] + \
                 [("pixels de la case (image f)", torch.from_numpy(D["PX"])), ("pixels de la case (f−2..f)", torch.from_numpy(D["PX3"]))]
     yte, cte, bte = Pr["Y"][te], Pr["C"][te], Pr["B"][te]
     head = f"   {'':>34s} | " + " | ".join(f"{c:^26s}" for c in COND) + "\n" + f"   {'lecture':>34s} | " + " | ".join(" ".join(f"{b_:>8s}" for b_ in BINS) for _ in COND)
@@ -173,7 +180,7 @@ def main():
                                                                          for b_ in range(3)) for c in range(4))
     row = lambda nm, r: f"   {nm:>34s} | " + " | ".join(" ".join(f"{x:8.2f}" if np.isfinite(x) else f"{'—':>8s}" for x in r[c]) for c in range(4))
     for reg, conds in ((f"TRANSFERT (apprise sur couleurs différentes{', séparés seulement' if a.train == 'sep' else ''})", [0] if a.train == "sep" else [0, 1]),
-                       ("MÊME COULEUR (apprise sur la même couleur)", [2, 3])):
+                       ("MÊME COULEUR (apprise sur la même couleur)", [2, 3]))[:0 if a.own_only else 2]:
         lines = []; R_im = []
         for nm, Z in feat_sets:
             Zd = Z.to(dev) if Z.numel() * Z.element_size() < 6e9 else Z; rs = []
@@ -186,10 +193,13 @@ def main():
             torch.cuda.empty_cache() if dev.startswith("cuda") else None
         log(f"\n   AFFINITÉ PAR PAIRES — {reg} : AUC « même objet » (0.50 = hasard), moyenne de {a.seeds} têtes × {a.steps} pas | {time.time() - t_:.0f}s\n"
             + head + "\n" + "\n".join(lines) + "\n" + cnt)
+    if "U" in D:                                                        # aucune sonde : le cosinus de SA tête « bougent ensemble » entre les deux cases
+        log(f"\n   SA PROPRE AFFINITÉ (tête co_proj apprise par le mouvement commun, AUCUNE sonde ajoutée ; passé vu ≤ f) : AUC « même objet » | {time.time() - t_:.0f}s\n"
+            + head + "\n" + row("cosinus co_proj(z_i)·co_proj(z_j)", read(lambda x, y: (x.float() * y.float()).sum(-1), D["U"])) + "\n" + cnt)
     log("   critère : « MÊME, se touchent, voisines » — latents nettement > pixels (≈ 0.5) ⇒ notion d'objet au-delà de la couleur ; sinon il se fie à la couleur")
     del D, feat_sets
 
-    if not a.count: return
+    if not a.count or a.own_only: return
     nc_ = a.n_count or a.n; Dc = obj_data(m, teachN, imagine, cfg, st, dev, nc_, a.seed + 1, (1, 3), FR, a.hmax, wkw, imag=False, pool=True)
     nF = len(FR); N_ = np.repeat(Dc["NO"][:, None], nF, 1); C_ = np.where(N_ == 1, 4, 2 * Dc["SC"][:, None].astype(int) + Dc["CT"]); C_[(N_ > 1) & (Dc["CT"] < 0)] = -1
     S_ = np.repeat(np.arange(nc_)[:, None], nF, 1); ntc = int(0.8 * nc_); Yn = (N_ - 1).reshape(-1); Yc = torch.from_numpy(Yn).long().to(dev)
