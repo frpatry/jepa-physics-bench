@@ -30,6 +30,8 @@ class ObjImag(nn.Module):
         s.proj = nn.Linear(d, 64); s.ps = nn.Parameter(torch.tensor(math.log(5.0)))
         if co is not None: s.proj.load_state_dict(co)                    # part de son sens du groupe (mouvement commun)
         s.clock = nn.Parameter(torch.zeros(T, s.npf, d)); s.fill = nn.Parameter(torch.zeros(s.npf, d))
+        k0 = torch.zeros(3, 3); k0[1, 1] = 1.0; s.smooth = nn.Parameter(k0); s.gain = nn.Parameter(torch.ones(d))   # LISSAGE appris SANS déplacement (essai court : sans lui il décalait
+        #   toute l'image d'une demi-case pour « flouter » ses latents et gagner en erreur — le flou doit être gratuit, pas acheté par un faux déplacement)
         ys, xs = torch.meshgrid(torch.arange(nP), torch.arange(nP), indexing="ij"); s.register_buffer("xy", torch.stack([xs, ys], -1).reshape(s.npf, 2).float())
 
     def splat(s, C, f, w):
@@ -48,7 +50,9 @@ class ObjImag(nn.Module):
         r = s.flow(hf); o = torch.sigmoid(s.objh(hf)).squeeze(-1)
         u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); f = A @ r   # un déplacement PAR GROUPE (moyenne sur les cases qui vont ensemble)
         if zero_flow: f = torch.zeros_like(f)
-        C = Zt - s.clock[t]; num, den = s.splat(C, f, torch.exp(s.beta * o))                                              # contenu dé-daté, transporté ; une chose cache le fond
+        C = Zt - s.clock[t]; B_, n_, d_ = C.shape
+        C = F.conv2d(C.transpose(1, 2).reshape(B_ * d_, 1, s.nP, s.nP), s.smooth[None, None], padding=1).reshape(B_, d_, n_).transpose(1, 2) * s.gain
+        num, den = s.splat(C, f, torch.exp(s.beta * o))                                              # contenu dé-daté, transporté ; une chose cache le fond
         bgw = (1 - o).unsqueeze(-1); fill = (bgw * C).sum(1, keepdim=True) / bgw.sum(1, keepdim=True).clamp_min(1e-3) + s.fill    # case quittée -> du fond
         return (num + 0.05 * fill) / (den.unsqueeze(-1) + 0.05) + s.clock[t + k], f, o
 
@@ -58,6 +62,7 @@ def main():
     p.add_argument("--ckpt", required=True); p.add_argument("--out", type=str, default="/content/objimag.pt"); p.add_argument("--steps", type=int, default=6000)
     p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--kmax", type=int, default=4); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--contact", type=float, default=0.75, help="part du lot prise parmi les séquences où il a senti un contact"); p.add_argument("--n_eval", type=int, default=2000)
+    p.add_argument("--still_w", type=float, default=0.02, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
     p.add_argument("--eval_every", type=int, default=2000); p.add_argument("--seed", type=int, default=0); p.add_argument("--dev", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(); dev = a.dev; t_ = time.time(); log = lambda s_: print(s_, flush=True); torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]
@@ -115,7 +120,7 @@ def main():
         b1, b2 = S.next(), S.next(); b = {k_: torch.cat([b1[k_], b2[k_]]) for k_ in b1}; hc = b["TOUCH"].abs().sum((1, 2)) > 0
         ic, in_ = torch.where(hc)[0], torch.where(~hc)[0]; nc = min(len(ic), int(round(a.contact * a.bs))); pick = torch.cat([ic[torch.randperm(len(ic))[:nc]], in_[torch.randperm(len(in_))[:a.bs - nc]]])
         Z, cmd, prop, tch = latents({k_: x[pick] for k_, x in b.items()}); k = int(rng.integers(1, a.kmax + 1)); t = int(rng.integers(3, T - k))
-        cd = cond_of(cmd, prop, tch, t, k); pr, f, o = m(Z[:, t], cd, t, k); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1)
+        cd = cond_of(cmd, prop, tch, t, k); pr, f, o = m(Z[:, t], cd, t, k); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean()   # + léger a priori « les choses restent en place »
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step(); sch.step()
         with torch.no_grad():
             ls = F.smooth_l1_loss(m(Z[:, t], cd, t, k, zero_flow=True)[0], Z[:, t + k], beta=0.1); lc = F.smooth_l1_loss(Z[:, t], Z[:, t + k], beta=0.1)
