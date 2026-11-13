@@ -244,6 +244,9 @@ def main():
     p.add_argument("--judge", type=int, default=0, help="JUGE APPRIS SUR SON JEU (av_judge.py, plan du 2026-11-10) à la place de l'écart des latents du --goal_img : "
                    "une petite tête dit COMBIEN DE GESTES séparent la scène imaginée de l'image-but (apprise sur le jeu libre, bébé gelé, sans démonstration) ; "
                    "1 = apprise sur de vraies scènes ; 2 = moitié vraies scènes, moitié scènes IMAGINÉES (leçon ARC : les juges meurent en imagination)")
+    p.add_argument("--real_wm", type=int, default=0, help="INSTRUMENT (13 nov. 2026) : 1 = le VRAI MONDE à la place de son imagination — chaque plan candidat est joué "
+                   "dans une copie du monde, son ŒIL regarde la vraie scène obtenue et son juge (ou l'écart à l'image-but) la note ; sépare « le but / le juge est mauvais » "
+                   "de « l'imagination est mauvaise » (avec --goal_img ou --judge)")
     p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
     p.add_argument("--move_diag", type=int, default=0, help="1 = TEST DU SENS DU MOUVEMENT seulement (av_move_diag.py, étape 4 du plan du 2026-11-10) : bébé gelé, une petite tête dit dans "
                    "quelles cases le monde sans sa main aura changé après h gestes — lue sur le vrai futur (plafond), sur l'imaginé avec SES gestes et avec ceux d'un AUTRE ; puis s'arrête")
@@ -561,6 +564,20 @@ def main():
             return ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
+            if a.real_wm and a.goal_img and phase != 1 and not raw:   # --real_wm : le plan est JOUÉ (copies du monde), son œil voit la vraie scène à t+Hh, son juge la note
+                Xk = env.X; env.X = np.zeros(0, np.float32); Xf = []    # (copies légères : les images du passé ne sont pas recopiées)
+                try:
+                    for cc in cand.cpu().numpy():
+                        e2 = copy.deepcopy(env); f_ = []
+                        for ac in cc: e2.step(ac, render=False); f_.append(e2.frame(e2.P, e2.Hp))
+                        Xf.append(f_)
+                finally: env.X = Xk
+                bK = {k: x.expand(K, *x.shape[1:]).clone() for k, x in b1.items()}
+                bK["X"][:, t + 1:t + 1 + Hh] = torch.from_numpy((np.array(Xf) * 255).round().astype(np.uint8))
+                vr = torch.from_numpy(np.where((fr <= t + Hh) & (md == 0))[0]).to(dev)[None].expand(K, -1)
+                with torch.no_grad():
+                    tkr, _ = to_tok0(bK, st, v, P_, dev)
+                    return gcost(teachN(torch.gather(tkr, 1, vr.unsqueeze(-1).expand(-1, -1, tkr.size(-1))), vr)[:, -npf:], Hh)
             with torch.no_grad():
                 if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
                     r_ = read(imagine(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
