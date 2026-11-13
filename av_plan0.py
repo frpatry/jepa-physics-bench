@@ -45,12 +45,12 @@ class LocalReader(torch.nn.Module):
 
 class Push0:
     """un épisode de la tâche dans la PHYSIQUE du monde 0e (copie de gen_world0, 1 objet au repos, main R 0.07, bras limité)."""
-    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False, damp=0.0, echo=0.0, L=None, shape_phys=False):
+    def __init__(s, ep, a_sub=2, hum=0.15, dmin=0.12, dmax=0.22, fric=0.004, task="objet", blocks=False, damp=0.0, echo=0.0, L=None, shape_phys=False, obj_scale=1.0):
         s.task, s.blocks, s.bowl, s.shape_phys = task, blocks, task == "bol", shape_phys or task == "pusht"
         s.damp, s.echo, s.vib = damp, echo, np.zeros(2, np.float32)   # MÊME monde que le vécu (remarque user : pas de patinoire si le bébé a appris sur une table)                            # « main » : amener SA MAIN sur un point, pièce VIDE (idée user)
         rng = np.random.default_rng(10_000 + ep); s.rng = np.random.default_rng(20_000 + ep); s.a_sub, s.hum = a_sub, hum
         s.Rh, s.Lr = 0.07, 0.9; s.kind = 3 if task == "pusht" else int(rng.integers(0, 4))   # PUSH-T : toujours un T
-        s.sz = rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
+        s.sz = obj_scale * (rng.uniform(0.12, 0.16) if s.kind == 3 else rng.uniform(0.08, 0.14)); s.rc = (0.95 if s.kind == 3 else 0.9) * s.sz
         s.col = np.clip(PAL[rng.integers(len(PAL))] * rng.uniform(0.7, 1.0) + rng.normal(0, 0.08, 3), 0.1, 0.95).astype(np.float32)
         s.m = float(np.exp(rng.uniform(np.log(1 / 3), np.log(3)))); s.mat = int(rng.integers(0, 3)); s.fric = fric   # frottement « s'arrête vite » (vécu en babillant) : sinon l'objet glisse comme sur la glace
         if blocks: s.m = float(np.exp(np.log(s.m) * np.log(1.25) / np.log(3)))   # BLOC : masse ~constante (mêmes tirages aléatoires)
@@ -247,6 +247,8 @@ def main():
     p.add_argument("--real_wm", type=int, default=0, help="INSTRUMENT (13 nov. 2026) : 1 = le VRAI MONDE à la place de son imagination — chaque plan candidat est joué "
                    "dans une copie du monde, son ŒIL regarde la vraie scène obtenue et son juge (ou l'écart à l'image-but) la note ; sépare « le but / le juge est mauvais » "
                    "de « l'imagination est mauvaise » (avec --goal_img ou --judge)")
+    p.add_argument("--task_scale", type=float, default=1.0, help="taille des objets de la TÂCHE × task_scale (0 = celle du monde vécu, --obj_scale de l'entraînement) ; "
+                   "constat du 13 nov. 2026 : les tâches gardaient des objets de taille 1 alors que D17q/D17r ont joué avec des objets × 1.8")
     p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
     p.add_argument("--move_diag", type=int, default=0, help="1 = TEST DU SENS DU MOUVEMENT seulement (av_move_diag.py, étape 4 du plan du 2026-11-10) : bébé gelé, une petite tête dit dans "
                    "quelles cases le monde sans sa main aura changé après h gestes — lue sur le vrai futur (plafond), sur l'imaginé avec SES gestes et avec ceux d'un AUTRE ; puis s'arrête")
@@ -631,7 +633,7 @@ def main():
         if a.task in ("bouger", "direction"): return float(np.linalg.norm(p4[:2] - ref))
         return float(np.linalg.norm(p4[2:] - ref))
     def run(ep, policy, rec=None, stats=None, film=None):
-        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (max(a.plan_h, Kp_) if a.slide else 0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
+        env = Push0(ep, task=a.task, blocks=bool(a.blocks), damp=wk_.get("damp", 0.0), echo=wk_.get("echo", 0.0), shape_phys=bool(wk_.get("shape_phys", False)), L=EL + (max(a.plan_h, Kp_) if a.slide else 0), obj_scale=a.task_scale or wk_.get("obj_scale", 1.0)); rng = np.random.default_rng(30_000 + ep); d0 = env.dist()
         for _ in range(a.plan_c): env.step(np.clip(rng.normal(0, 0.03, 2), -VMAX, VMAX))
         lax_now = lambda: float(np.linalg.norm(env.P - env.g)) < 0.06 and env.ang_err() < math.radians(20)   # PUSH-T ancienne règle (laxiste)
         def ok_now():
