@@ -80,9 +80,9 @@ def main():
         mpos = (dv * Mb).sum(0) / Mb.sum(0).clamp_min(1)                                                              # changement MOYEN par case (sur les scènes), cases de fond
         raw = float((dv.abs().mean(-1) * BG).sum() / BG.sum()); res = float(((dv - mpos[None]).abs().mean(-1) * BG).sum() / BG.sum())
         dn = F.normalize(dv, dim=-1); i1 = torch.randperm(a.n, generator=torch.Generator().manual_seed(1)); cs_ = (dn * dn[i1]).sum(-1); bb = BG & BG[i1]
-        dvo = dv[CORE]; mo = dvo.mean(0, keepdim=True)
+        dvo = dv[CORE]; mo = mpos[None].expand(a.n, -1, -1)[CORE]                                                    # l'horloge de CETTE case (apprise sur les scènes où elle est du fond)
         log(f"   {nm}, images 7→8 — FOND : changement {raw:.3f}, une fois retiré le changement MOYEN de cette case sur toutes les scènes {res:.3f} ; "
-            f"cosinus du changement entre deux scènes différentes (même case) {float(cs_[bb].mean()):+.2f} | CŒUR D'OBJET : {float(dvo.abs().mean()):.3f} → {float((dvo - mo).abs().mean()):.3f} sans le changement moyen")
+            f"cosinus du changement entre deux scènes différentes (même case) {float(cs_[bb].mean()):+.2f} | CŒUR D'OBJET : {float(dvo.abs().mean()):.3f} → {float((dvo - mo).abs().mean()):.3f} une fois retirée l'horloge de sa case (mesurée sur le fond)")
     log("   lecture : A déjà haut ⇒ le TEMPS seul fait bouger ses latents (son œil date chaque image) ; B ≫ A ⇒ la main ailleurs se répand dans toutes les cases ; C ≈ A ⇒ c'est la VUE de la main")
     log(f"total {time.time() - t_:.0f}s")
 
