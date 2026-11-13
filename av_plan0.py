@@ -86,7 +86,7 @@ class Push0:
         s.g_ang = s.ang                                                 # PUSH-T : orientation voulue = tournée de 30–90° (à gauche ou à droite)
         if task == "pusht": s.g_ang = float(s.ang + rng.choice([-1.0, 1.0]) * rng.uniform(math.pi / 6, math.pi / 2))
         L = s.L = L or T                                                # durée de l'épisode (> T : ÉPISODE LONG, le bébé voit une fenêtre de T images qui glisse)
-        s.t = 0; s.X = np.zeros((L, H, H, 3), np.float32); s.POS = np.zeros((L, 2), np.float32); s.HAND = np.zeros((L, 2), np.float32)
+        s.t = 0; s.X = np.zeros((L, H, H, 3), np.float32); s.XN = np.zeros((L, H, H, 3), np.float32); s.POS = np.zeros((L, 2), np.float32); s.HAND = np.zeros((L, 2), np.float32)
         s.ANG = np.zeros(L, np.float32)
         s.CMD = np.zeros((L, 2), np.float32); s.TOUCH = np.zeros((L, 8), np.float32); s.PROP = np.zeros((L, 4), np.float32)
         s.vact = np.zeros((L, 2), np.float32); s.ev = []; s.yy, s.xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
@@ -123,7 +123,7 @@ class Push0:
         return img * (1 - hx) + hx
     def record(s, t, render=True):
         s.POS[t], s.HAND[t], s.ANG[t] = s.P, s.Hp, s.ang
-        if render: s.X[t] = s.frame(s.P, s.Hp)
+        if render: s.X[t] = s.frame(s.P, s.Hp); s.XN[t] = s.frame(s.P, s.Hp, hand=False)   # XN : la même image SANS sa main (--see_hand 0)
     def step(s, cmd, render=True):
         t = s.t = s.t + 1; rc, m = s.rc, s.m; s.CMD[t] = np.clip(cmd, -VMAX, VMAX)
         H0 = s.Hp.copy(); s.Hp = s.place(s.Hp + s.CMD[t])
@@ -160,7 +160,7 @@ class Push0:
             s.TOUCH[t, 1::2] = np.maximum(s.TOUCH[t, 1::2], np.where(s.echo * tr_[1::2] > 0.05, s.echo * tr_[1::2], 0))
         s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t] + s.vib]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
         s.vib = (-s.echo * s.vib if float(np.abs(s.vib).max()) * s.echo > 0.002 else np.zeros(2)).astype(np.float32)
-    def batch(s, s0=0):
+    def batch(s, s0=0, nohand=False):
         """vécu jusqu'à t -> lot (1, T, ...) des images s0 .. s0+T-1 (FENÊTRE ; s0 = 0 = comme avant) ; le futur est rempli « immobile » (hors contexte)."""
         W = slice(s0, s0 + T); t = s.t - s0
         Pp, Hh = s.POS[W].copy(), s.HAND[W].copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[s.t], s.HAND[s.t]; vact = s.vact[W].copy(); vact[t + 1:] = 0
@@ -169,7 +169,7 @@ class Push0:
         ev = [(e[0] - s0,) + tuple(e[1:]) for e in s.ev if 0 <= e[0] - s0 < T]                  # chocs dans la fenêtre (temps décalés)
         Ls = SPF // s.a_sub; A = render_audio(ev, np.array([s.mat]), np.array([s.m]), T, s.a_sub, s.rng, band_matrix(Ls),
                                                np.hanning(Ls).astype(np.float32), np.arange(T * SPF) / SR, 1, np.zeros(T, bool), extra)
-        w = dict(X=s.X[W][None], A=A[None], TOUCH=s.TOUCH[W][None], PROP=s.PROP[W][None], CMD=s.CMD[W][None])
+        w = dict(X=(s.XN if nohand else s.X)[W][None], A=A[None], TOUCH=s.TOUCH[W][None], PROP=s.PROP[W][None], CMD=s.CMD[W][None])
         return to_torch(to_np([w]))
 
 def oracle(env):
@@ -249,6 +249,10 @@ def main():
                    "de « l'imagination est mauvaise » (avec --goal_img ou --judge)")
     p.add_argument("--task_scale", type=float, default=1.0, help="taille des objets de la TÂCHE × task_scale (0 = celle du monde vécu, --obj_scale de l'entraînement) ; "
                    "constat du 13 nov. 2026 : les tâches gardaient des objets de taille 1 alors que D17q/D17r ont joué avec des objets × 1.8")
+    p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
+                   "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
+    p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
+                   "(position connue par le bras : main sentie + gestes du plan)")
     p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
     p.add_argument("--move_diag", type=int, default=0, help="1 = TEST DU SENS DU MOUVEMENT seulement (av_move_diag.py, étape 4 du plan du 2026-11-10) : bébé gelé, une petite tête dit dans "
                    "quelles cases le monde sans sa main aura changé après h gestes — lue sur le vrai futur (plafond), sur l'imaginé avec SES gestes et avec ceux d'un AUTRE ; puis s'arrête")
@@ -515,7 +519,7 @@ def main():
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
-        t = env.t - s0; b1 = env.batch(s0); tok, cmd0 = to_tok0(b1, st, v, P_, dev)
+        t = env.t - s0; b1 = env.batch(s0, nohand=not a.see_hand); tok, cmd0 = to_tok0(b1, st, v, P_, dev); EX = env.X if a.see_hand else env.XN   # ce qu'il VOIT
         ci = torch.from_numpy(np.where(fr <= t)[0]).to(dev)[None]
         tis = torch.stack([torch.from_numpy(np.where((fr == t + hh) & (md == 0))[0]) for hh in range(1, Hh + 1)]).to(dev); ti = tis[-1:]
         vi = torch.from_numpy(np.where((fr <= t) & (md == 0))[0]).to(dev)[None]
@@ -545,12 +549,12 @@ def main():
                     else: sub = behind
                 else: phase = 2
         if a.goal_img:                          # BUT = IMAGE : la suite « le monde saute au but et y reste » encodée par l'œil-cible (comme une cible d'entraînement)
-            Xg = env.X[s0:s0 + T].copy(); gf = env.frame(env.g, env.Hp, env.g_ang, hand=bool(a.goal_hand)); Xg[t + 1:] = gf   # (sans main par défaut : le but = le monde, pas moi)
+            Xg = EX[s0:s0 + T].copy(); gf = env.frame(env.g, env.Hp, env.g_ang, hand=bool(a.goal_hand)); Xg[t + 1:] = gf   # (sans main par défaut : le but = le monde, pas moi)
             bg = dict(b1); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
             with torch.no_grad():
                 tkg, _ = to_tok0(bg, st, v, P_, dev); ixg = torch.arange(nv, device=dev)[None]
                 zg_all = teachN(tkg[:, :nv], ixg).view(T, npf, dR)
-            dpx = np.abs(gf - env.X[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
+            dpx = np.abs(gf - (env.XN if a.mask_hand else EX)[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
             gmask = torch.from_numpy(dpx > 0.15).to(dev)
             if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
         fidx = [torch.from_numpy(np.where(fr == t + hh)[0]).to(dev) for hh in range(1, Hh + 1)]   # TOUS les jetons de l'image t+hh (vue d'abord)
@@ -561,9 +565,15 @@ def main():
                 o = imagine(cx, fidx[hh - 1][None].expand(K, -1), cmd, cid); out.append(o[:, :npf])
                 if hh < Hh: cx = torch.cat([cx, (o.float() * cs_ + cm_).to(cx.dtype)], 1); cid = torch.cat([cid, fidx[hh - 1][None].expand(K, -1)], 1)
             return out
-        def gcost(zi, hh):                      # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
+        cxy = (torch.stack(torch.meshgrid(torch.arange(nP), torch.arange(nP), indexing="ij"), -1).reshape(npf, 2).flip(-1).float().to(dev) + 0.5) / nP   # centres des cases (x, y)
+        def gcost(zi, hh, cand=None):           # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
             if judge is not None: return judge(zi, zg_all[t + hh][None].expand(len(zi), -1, -1))   # JUGE APPRIS : gestes qui séparent la scène imaginée du but
-            return ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)[:, gmask].mean(-1)
+            e_ = ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)
+            if a.mask_hand and cand is not None:  # --mask_hand : les cases où sera SA MAIN (bras : main sentie + gestes du plan) ne comptent pas
+                hp = (torch.from_numpy(env.Hp).to(dev)[None] + cand[:, :hh].sum(1)).clamp(env.Rh, 1 - env.Rh)
+                keep = gmask[None] & ~((cxy[None] - hp[:, None]).abs().amax(-1) < 0.5 / nP + 0.85 * env.Rh)
+                return (e_ * keep).sum(-1) / keep.sum(-1).clamp_min(1)
+            return e_[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             if a.real_wm and a.goal_img and phase != 1 and not raw:   # --real_wm : le plan est JOUÉ (copies du monde), son œil voit la vraie scène à t+Hh, son juge la note
@@ -588,7 +598,7 @@ def main():
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
-                with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh)
+                with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh, cand)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
             elif a.task == "bouger": c_ = -(r_[..., :2] - gt).norm(dim=-1)                     # imaginer l'objet DÉPLACÉ
             elif a.task == "direction": c_ = -((r_[..., :2] - gt) @ torch.from_numpy(env.u).to(dev))   # …dans la direction demandée
