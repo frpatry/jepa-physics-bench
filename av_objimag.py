@@ -48,7 +48,7 @@ class ObjImag(nn.Module):
         """Zt (B, npf, d) vrais latents de la dernière image vue ; cond (B, 16) gestes à venir + main sentie + toucher ; -> latents imaginés de t+k, déplacement, « chose »."""
         hf = s.tr(s.inp(Zt) + s.pos + s.cond(cond).unsqueeze(1) + s.kemb(torch.full((len(Zt),), k, device=Zt.device)).unsqueeze(1))
         r = s.flow(hf); o = torch.sigmoid(s.objh(hf)).squeeze(-1)
-        u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); f = A @ r   # un déplacement PAR GROUPE (moyenne sur les cases qui vont ensemble)
+        u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); f = (A @ r) * o.unsqueeze(-1)   # un déplacement PAR GROUPE ; seules les CHOSES bougent, le fond ne peut pas (v2 : a priori faible -> le décalage global revenait)
         if zero_flow: f = torch.zeros_like(f)
         C = Zt - s.clock[t]; B_, n_, d_ = C.shape
         C = F.conv2d(C.transpose(1, 2).reshape(B_ * d_, 1, s.nP, s.nP), s.smooth[None, None], padding=1).reshape(B_, d_, n_).transpose(1, 2) * s.gain
@@ -63,7 +63,8 @@ def main():
     p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--kmax", type=int, default=4); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--contact", type=float, default=0.75, help="part du lot prise parmi les séquences où il a senti un contact"); p.add_argument("--n_eval", type=int, default=2000)
     p.add_argument("--warm", type=int, default=1500, help="pas SANS déplacement au début : l'horloge, le lissage et le gain s'apprennent d'abord (sinon un faux décalage global sert de flou)")
-    p.add_argument("--still_w", type=float, default=0.05, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
+    p.add_argument("--thing_w", type=float, default=0.02, help="a priori « peu de choses, beaucoup de fond » : petit coût sur la part de cases dites « chose »")
+    p.add_argument("--still_w", type=float, default=0.005, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
     p.add_argument("--eval_every", type=int, default=2000); p.add_argument("--seed", type=int, default=0); p.add_argument("--dev", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(); dev = a.dev; t_ = time.time(); log = lambda s_: print(s_, flush=True); torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]
@@ -121,7 +122,7 @@ def main():
         b1, b2 = S.next(), S.next(); b = {k_: torch.cat([b1[k_], b2[k_]]) for k_ in b1}; hc = b["TOUCH"].abs().sum((1, 2)) > 0
         ic, in_ = torch.where(hc)[0], torch.where(~hc)[0]; nc = min(len(ic), int(round(a.contact * a.bs))); pick = torch.cat([ic[torch.randperm(len(ic))[:nc]], in_[torch.randperm(len(in_))[:a.bs - nc]]])
         Z, cmd, prop, tch = latents({k_: x[pick] for k_, x in b.items()}); k = int(rng.integers(1, a.kmax + 1)); t = int(rng.integers(3, T - k))
-        cd = cond_of(cmd, prop, tch, t, k); pr, f, o = m(Z[:, t], cd, t, k, zero_flow=it <= a.warm); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean()   # + léger a priori « les choses restent en place »
+        cd = cond_of(cmd, prop, tch, t, k); pr, f, o = m(Z[:, t], cd, t, k, zero_flow=it <= a.warm); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean() + a.thing_w * o.mean()   # + légers a priori : les choses restent en place ; il y a peu de choses, beaucoup de fond
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step(); sch.step()
         with torch.no_grad():
             ls = F.smooth_l1_loss(m(Z[:, t], cd, t, k, zero_flow=True)[0], Z[:, t + k], beta=0.1); lc = F.smooth_l1_loss(Z[:, t], Z[:, t + k], beta=0.1)
