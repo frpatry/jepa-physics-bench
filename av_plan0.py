@@ -252,7 +252,7 @@ def main():
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
-                   "(position connue par le bras : main sentie + gestes du plan)")
+                   "(position connue par le bras : main sentie + gestes du plan) ; 2 = sous sa main le monde est supposé INCHANGÉ (1 laissait « cacher l'erreur avec sa main »)")
     p.add_argument("--judge_n", type=int, default=3000, help="séquences de jeu libre du juge"); p.add_argument("--judge_steps", type=int, default=3000); p.add_argument("--judge_seeds", type=int, default=3)
     p.add_argument("--move_diag", type=int, default=0, help="1 = TEST DU SENS DU MOUVEMENT seulement (av_move_diag.py, étape 4 du plan du 2026-11-10) : bébé gelé, une petite tête dit dans "
                    "quelles cases le monde sans sa main aura changé après h gestes — lue sur le vrai futur (plafond), sur l'imaginé avec SES gestes et avec ceux d'un AUTRE ; puis s'arrête")
@@ -572,6 +572,9 @@ def main():
             if a.mask_hand and cand is not None:  # --mask_hand : les cases où sera SA MAIN (bras : main sentie + gestes du plan) ne comptent pas
                 hp = (torch.from_numpy(env.Hp).to(dev)[None] + cand[:, :hh].sum(1)).clamp(env.Rh, 1 - env.Rh)
                 keep = gmask[None] & ~((cxy[None] - hp[:, None]).abs().amax(-1) < 0.5 / nP + 0.85 * env.Rh)
+                if a.mask_hand == 2:              # 2 : SOUS sa main le monde est supposé INCHANGÉ (écart de la scène actuelle) — sinon cacher une case avec sa main efface son erreur
+                    e0 = ((zt[0].float() - zg_all[t + hh]) ** 2).sum(-1)[None]; hid = gmask[None] & ~keep
+                    return ((e_ * keep).sum(-1) + (e0 * hid).sum(-1)) / gmask.sum().clamp_min(1)
                 return (e_ * keep).sum(-1) / keep.sum(-1).clamp_min(1)
             return e_[:, gmask].mean(-1)
         def cost(cand, raw=False):              # cand (K, Hh, 2) gestes bruts -> distance objet–cible IMAGINÉE à t+Hh
