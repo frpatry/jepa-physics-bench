@@ -586,6 +586,8 @@ def main():
     p.add_argument("--hand_hidden", type=float, default=0.0, help="IDÉE USER (2026-11-13) : part des séquences de jeu où sa main N'EST PAS dans l'image (il la SENT : bras, toucher) — "
                    "il pousse des objets tantôt en se voyant, tantôt seulement en se sentant ; demande les images sans main du monde (--goal_w avec --goal_nohand 1)")
     p.add_argument("--scale1_share", type=float, default=0.0, help="part des lots de jeu avec des objets de taille 1 (le reste : --obj_scale) — la tâche Push-T garde un T de taille 1")
+    p.add_argument("--push_share", type=float, default=0.0, help="ESSAI : part de chaque lot prise parmi les séquences où il a senti un contact (avec --curious > 1 : "
+                   "le tri se fait dans le lot élargi) — peut-il APPRENDRE à déplacer l'objet en imagination quand il ne voit presque que des poussées ?")
     p.add_argument("--comove_w", type=float, default=0.0, help="MOUVEMENT COMMUN (étape 5, 2026-11-12 ; Kellman & Spelke 1983, EISEN 2022) : av_obj_diag D17q = l'objet est "
                    "dans ses latents mais la COULEUR reste l'axe principal (sonde apprise sur couleurs différentes -> même couleur collés 0.60). Le déplacement de chaque case "
                    "(appariement de blocs sur ses pixels, aucune étiquette) dit quelles cases BOUGENT ENSEMBLE ; ses latents de la DERNIÈRE image vue (il ne voit pas la suite) "
@@ -753,8 +755,15 @@ def main():
                     pr_ = m.pred(m.context(_gather(tk_, ci_), ci_), ti_, cm_, ci_).float()
                     errs_.append((pr_ - _gather(z_, ti_)).abs().mean((1, 2)))
                 e_ = torch.cat(errs_).clamp_min(1e-6)
-            pick = torch.multinomial(e_ / e_.sum(), a.bs, replacement=False).cpu()
             had_c = (bt_["TOUCH"].abs().sum((1, 2)) > 0).float()
+            if a.push_share > 0:                                     # ESSAI (13 nov. 2026) : part du lot tirée parmi les séquences où il a SENTI un contact (toujours ∝ surprise)
+                hc_ = had_c.to(e_.device); ic_, in_ = torch.where(hc_ > 0)[0], torch.where(hc_ == 0)[0]; npu = min(len(ic_), int(round(a.push_share * a.bs))); pk_ = []
+                if npu: pk_.append(ic_[torch.multinomial(e_[ic_], npu, replacement=False)])
+                if a.bs - npu > 0:
+                    po_ = in_ if len(in_) >= a.bs - npu else torch.tensor([i_ for i_ in range(len(e_)) if not npu or i_ not in set(pk_[0].tolist())], device=e_.device)
+                    pk_.append(po_[torch.multinomial(e_[po_], a.bs - npu, replacement=False)])
+                pick = torch.cat(pk_).cpu()
+            else: pick = torch.multinomial(e_ / e_.sum(), a.bs, replacement=False).cpu()
             cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
             bt_ = {k: x[pick] for k, x in bt_.items()}
         if a.hand_hidden > 0:                                          # MAIN CACHÉE : dans une part des séquences il ne se voit pas (il se sent)
