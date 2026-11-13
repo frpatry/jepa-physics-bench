@@ -64,6 +64,7 @@ def main():
     p.add_argument("--bs", type=int, default=64); p.add_argument("--lr", type=float, default=3e-4); p.add_argument("--kmax", type=int, default=4); p.add_argument("--workers", type=int, default=6)
     p.add_argument("--contact", type=float, default=0.75, help="part du lot prise parmi les séquences où il a senti un contact"); p.add_argument("--n_eval", type=int, default=2000)
     p.add_argument("--warm", type=int, default=6000, help="pas SANS déplacement au début : l'horloge, le lissage et le gain s'apprennent d'abord (sinon un faux décalage global sert de flou)")
+    p.add_argument("--long_pow", type=float, default=0.0, help="tirage des horizons ∝ k^long_pow (0 = uniforme ; 1 = les longs plus souvent)")
     p.add_argument("--gate", type=int, default=0, help="1 = v3 : déplacement × « chose » (échec, gardé pour mémoire)")
     p.add_argument("--thing_w", type=float, default=0.0, help="a priori « peu de choses, beaucoup de fond » : petit coût sur la part de cases dites « chose »")
     p.add_argument("--still_w", type=float, default=0.005, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
@@ -95,8 +96,8 @@ def main():
 
     @torch.no_grad()
     def exam(tag):
-        m.eval(); t = 7; log(f"\n=== EXAMEN {tag} (image {t} -> {t}+k ; déplacements en px ; instruments = positions du monde) | {time.time() - t_:.0f}s")
-        for k in (1, 2, 4):
+        m.eval(); log(f"\n=== EXAMEN {tag} (image t -> t+k ; déplacements en px ; instruments = positions du monde) | {time.time() - t_:.0f}s")
+        for t, k in [(7, k_) for k_ in (1, 2, 4, 8) if k_ <= a.kmax] + ([(3, 12)] if a.kmax >= 12 else []):
             R = {x: [] for x in ("dt", "di", "ht", "hi", "ec", "es", "em", "oo", "ob", "oh", "tc")}
             for b, FO, FH, POS, HND, TCH in EV:
                 for i in range(0, len(FO), 125):
@@ -109,9 +110,9 @@ def main():
                     for nm, q in (("ec", Z[:, t]), ("es", ps_), ("em", pr)): R[nm].append(avg((q - Z[:, t + k]).abs().mean(-1).cpu(), ev))
                     R["oo"].append(avg(o, core)); R["ob"].append(avg(o, bg)); R["oh"].append(avg(o, hc)); R["tc"].append(TCH[sl, t + 1:t + k + 1].any(1) & (core.sum(1) > 0) & (ev.sum(1) > 0))
             R = {x: torch.cat(y) for x, y in R.items()}; dn = R["dt"].norm(dim=-1); okc = R["oo"] > -1
-            log(f"   k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
+            log(f"   t={t} k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
                 f"main : vrai {float(R['ht'].norm(dim=-1).mean()):.2f} px, imaginé {float(R['hi'].norm(dim=-1).mean()):.2f}, cos {float(F.cosine_similarity(R['hi'], R['ht'], dim=-1)[R['ht'].norm(dim=-1) > 0.5].mean()):+.2f}")
-            for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de > 4 px", dn >= 4)):
+            for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de 4–8 px", (dn >= 4) & (dn < 8)), ("déplacé de > 8 px", dn >= 8)):
                 if int(s_.sum()) < 10: log(f"      {nm:>32s} | n={int(s_.sum()):4d} | trop peu"); continue
                 cs = float(F.cosine_similarity(R["di"][s_], R["dt"][s_], dim=-1).mean()) if float(dn[s_].mean()) > 0.4 else float("nan")
                 log(f"      {nm:>32s} | n={int(s_.sum()):4d} | vrai {float(dn[s_].mean()):5.2f} px | imaginé {float(R['di'][s_].norm(dim=-1).mean()):5.2f} | cos {cs:+.2f} | erreur de déplacement {float((R['di'][s_] - R['dt'][s_]).norm(dim=-1).mean()):5.2f} "
@@ -119,11 +120,12 @@ def main():
         m.train()
 
     S = Stream(0, a.bs, a.workers, 0.0, wkw=dict(wkw)); S.stage = "0e"; ma = None
+    kp_ = np.arange(1, a.kmax + 1, dtype=float) ** a.long_pow; kp_ /= kp_.sum()                       # horizons LONGS tirés plus souvent (plus gros déplacements = signal plus fort)
     for it in range(1, a.steps + 1):
         S.wkw["obj_scale"] = 1.0 if rng.random() < 0.5 else sc
         b1, b2 = S.next(), S.next(); b = {k_: torch.cat([b1[k_], b2[k_]]) for k_ in b1}; hc = b["TOUCH"].abs().sum((1, 2)) > 0
         ic, in_ = torch.where(hc)[0], torch.where(~hc)[0]; nc = min(len(ic), int(round(a.contact * a.bs))); pick = torch.cat([ic[torch.randperm(len(ic))[:nc]], in_[torch.randperm(len(in_))[:a.bs - nc]]])
-        Z, cmd, prop, tch = latents({k_: x[pick] for k_, x in b.items()}); k = int(rng.integers(1, a.kmax + 1)); t = int(rng.integers(3, T - k))
+        Z, cmd, prop, tch = latents({k_: x[pick] for k_, x in b.items()}); k = int(rng.choice(a.kmax, p=kp_)) + 1; t = int(rng.integers(3, T - k))
         cd = cond_of(cmd, prop, tch, t, k); pr, f, o = m(Z[:, t], cd, t, k, zero_flow=it <= a.warm); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean() + a.thing_w * o.mean()   # + légers a priori : les choses restent en place ; il y a peu de choses, beaucoup de fond
         opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(m.parameters(), 1.0); opt.step(); sch.step()
         with torch.no_grad():
