@@ -59,7 +59,7 @@ def main():
     dist = np.hypot((iu // nP - ju // nP).numpy(), (iu % nP - ju % nP).numpy()); bins = np.digitize(dist, (1.5, 2.9))
     def pair_auc(S):                              # S (n, nF, npf, k) vecteurs normalisés -> AUC par tranche de distance, pour « cœur–cœur » et « cœur–bord » contre « cœur–fond »
         fo = FO[:, FR]; fh = FH[:, FR]; core = (fo >= 0.5) & (fh < 0.1); edge = (fo >= 0.1) & (fo < 0.5) & (fh < 0.1); bg = (fo < 0.02) & (fh < 0.02)
-        sim = (S[:, :, iu] * S[:, :, ju]).sum(-1); ci_ = core[:, :, iu]; out = []
+        sim = torch.einsum("nfik,nfjk->nfij", S, S)[:, :, iu, ju]; ci_ = core[:, :, iu]; out = []
         for pos_ in (core, edge):
             row = []
             for b_ in range(3):
