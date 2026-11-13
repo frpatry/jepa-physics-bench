@@ -75,6 +75,14 @@ def main():
     e_c = ((Zc[:, 7] - mt[:, 7:8]) - (Zc[:, 8] - mt[:, 8:9])).abs().mean(-1)
     log(f"   A, cœur d'objet, images 7→8, une fois retirée la MOYENNE de l'image (ce qui change pareil dans toutes les cases) : {float((e_c * CORE).sum() / CORE.sum()):.3f} "
         f"(brut {dz(Zc, 7, 1, CORE):.3f})")
+    for nm, c in (("A tout immobile", 0), ("C scène sans main", 2)):                                                  # HORLOGE ou AGITATION ? le changement 7→8 est-il le même d'une scène à l'autre ?
+        Zc = Z[(c, "vue")]; dv = Zc[:, 8] - Zc[:, 7]; Mb = BG.float().unsqueeze(-1)                                    # (n, npf, d)
+        mpos = (dv * Mb).sum(0) / Mb.sum(0).clamp_min(1)                                                              # changement MOYEN par case (sur les scènes), cases de fond
+        raw = float((dv.abs().mean(-1) * BG).sum() / BG.sum()); res = float(((dv - mpos[None]).abs().mean(-1) * BG).sum() / BG.sum())
+        dn = F.normalize(dv, dim=-1); i1 = torch.randperm(a.n, generator=torch.Generator().manual_seed(1)); cs_ = (dn * dn[i1]).sum(-1); bb = BG & BG[i1]
+        dvo = dv[CORE]; mo = dvo.mean(0, keepdim=True)
+        log(f"   {nm}, images 7→8 — FOND : changement {raw:.3f}, une fois retiré le changement MOYEN de cette case sur toutes les scènes {res:.3f} ; "
+            f"cosinus du changement entre deux scènes différentes (même case) {float(cs_[bb].mean()):+.2f} | CŒUR D'OBJET : {float(dvo.abs().mean()):.3f} → {float((dvo - mo).abs().mean()):.3f} sans le changement moyen")
     log("   lecture : A déjà haut ⇒ le TEMPS seul fait bouger ses latents (son œil date chaque image) ; B ≫ A ⇒ la main ailleurs se répand dans toutes les cases ; C ≈ A ⇒ c'est la VUE de la main")
     log(f"total {time.time() - t_:.0f}s")
 
