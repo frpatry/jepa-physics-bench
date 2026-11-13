@@ -462,6 +462,28 @@ def main():
               f"| erreur imaginée {err(im_t, still, 0):.2f} vs copie {err(copy_r, still, 0):.2f}")
         eh = lambda pr: ((pr - tgt_y)[moved].view(-1, nf, 2, 2).norm(dim=-1)[..., 0] * 32).mean(0)
         print("   objet poussé, erreur par horizon 1..8 : imaginé " + " ".join(f"{x:.1f}" for x in eh(im_t)) + " | copie " + " ".join(f"{x:.1f}" for x in eh(copy_r)))
+        # 2b-bis PAR TYPE DE POUSSÉE (13 nov. 2026) : quand son imagination déplace-t-elle l'objet ? (positions vraies du monde pour TRIER, lecteur pour mesurer)
+        ix_ = keep[ntr:n]; Pp = Yt[..., :2] * 32; Hd = Yt[..., 2:] * 32; tch_ = torch.from_numpy(np.abs(w["TOUCH"][ix_]).sum(-1) > 0)    # (nt, T, 2) px ; (nt, T) contact
+        elan = (Pp[:, h - 1] - Pp[:, h - 3]).norm(dim=-1) > 0.5                                     # l'objet bougeait DÉJÀ à la fin du passé vu (élan : facile)
+        tf_ = tch_[:, h:h + nf]; has_c = tf_.any(1); fc = torch.where(has_c, tf_.float().argmax(1), 0) + h   # 1er contact dans le futur
+        ar_ = torch.arange(len(Pp)); vh_ = Hd[ar_, fc] - Hd[ar_, fc - 1]; uo_ = Pp[ar_, fc - 1] - Hd[ar_, fc - 1]; fr_c = F.cosine_similarity(vh_, uo_, dim=-1)   # geste VERS l'objet ?
+        dreal = Tdisp[:, :2].norm(dim=-1); Ldisp = (im_l[:, -1] - st0) * 32; isT = torch.from_numpy(w["SHAPE"][ix_, 0] == 3)
+        rest = moved & ~elan & has_c
+        def line(nm, sel):
+            if int(sel.sum()) < 8: return f"   {nm:>44s} | n={int(sel.sum()):4d} | trop peu"
+            ei, ec = (((pr - tgt_y)[sel][:, -1, :2].norm(dim=-1) * 32) for pr in (im_t, copy_r))
+            return (f"   {nm:>44s} | n={int(sel.sum()):4d} | réel {dreal[sel].mean():5.2f} px | imaginé {Idisp[sel, :2].norm(dim=-1).mean():5.2f} | gestes d'un AUTRE {Ldisp[sel, :2].norm(dim=-1).mean():5.2f} "
+                    f"| cos(imaginé, réel) {cos(Idisp[sel, :2], Tdisp[sel, :2]):+.2f} | erreur finale imaginé {ei.mean():5.2f} vs copie {ec.mean():5.2f} | bat la copie {float((ei < ec).float().mean()):4.0%}")
+        print("2b-bis PAR TYPE DE POUSSÉE (frames 7 -> 15 ; « au repos » = objet immobile à la fin du passé vu, contact dans le futur) :")
+        for nm, sel in (("tous les objets poussés", moved), ("ÉLAN : l'objet bougeait déjà", moved & elan), ("AU REPOS puis poussé", rest),
+                        ("au repos | geste FRANC vers l'objet (cos > 0.8)", rest & (fr_c > 0.8)), ("au repos | geste de biais (0.5–0.8)", rest & (fr_c > 0.5) & (fr_c <= 0.8)),
+                        ("au repos | geste RASANT (cos < 0.5)", rest & (fr_c <= 0.5)),
+                        ("au repos | petite poussée (< 4 px)", rest & (dreal < 4)), ("au repos | moyenne (4–8 px)", rest & (dreal >= 4) & (dreal < 8)), ("au repos | grande (> 8 px)", rest & (dreal >= 8)),
+                        ("au repos | forme T", rest & isT), ("au repos | autres formes", rest & ~isT),
+                        ("au repos | contact tôt (1er–3e pas)", rest & (fc <= h + 2)), ("au repos | contact tard (4e–8e pas)", rest & (fc > h + 2)),
+                        ("au repos | franc ET grande", rest & (fr_c > 0.8) & (dreal >= 8)), ("objet jamais touché (immobile)", still)):
+            print(line(nm, sel), flush=True)
+        if a.obj_diag == 2: return                # 2 = s'arrêter ici (pas de lecteur neuf)
         # 2c L'OBJET EST-IL DANS L'IMAGINATION ? lecteur NEUF entraîné sur des latents IMAGINÉS (séquences d'entraînement),
         #    testé sur les imaginés tenus à l'écart : s'il lit bien l'objet -> l'info y est (décalage de distribution du lecteur) ;
         #    sinon -> l'imagination a vraiment perdu l'objet.
