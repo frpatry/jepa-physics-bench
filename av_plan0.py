@@ -254,6 +254,8 @@ def main():
     p.add_argument("--thing_cost", type=int, default=0, help="IDÉE USER (14 nov. 2026) : pas de juge entraîné — on INTERROGE SES LATENTS là où ça compte : avec --objimag, la scène imaginée "
                    "et l'image-but sont comparées seulement sur les cases que le module marque « chose » (dans l'une ou l'autre), sa main (située par le bras) mise à part : "
                    "sous sa main le monde est supposé inchangé")
+    p.add_argument("--reach_diag", type=int, default=0, help="1 = DIAG DE PORTÉE (14 nov. 2026 : dans tous les essais le T n'est touché que dans les 10–40 premiers gestes) : tous les 5 gestes, "
+                   "les plans du 1er tirage sont joués dans des copies du monde — part de ceux qui toucheraient vraiment l'objet, et ce que SON coût en dit, selon l'écart main–objet et le moment")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -724,8 +726,19 @@ def main():
                 for it_ in range(a.iters):
                     seg = (mu_ + sd_ * torch.randn(a.pop, K, 2, device=dev)).clamp(-VMAX, VMAX)
                     if a.propose == 1 and it_ == 0: seg[0] = mu_                 # la proposition elle-même est jugée
-                    cand = seg.repeat_interleave(rep, 1)[:, :Hh]
-                    el = seg[cost(cand).argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
+                    cand = seg.repeat_interleave(rep, 1)[:, :Hh]; c_ = cost(cand)
+                    if a.reach_diag and it_ == 0 and (env.t - a.plan_c) % 5 == 0:    # PORTÉE : parmi les plans du 1er tirage, combien toucheraient VRAIMENT l'objet ? son coût le voit-il ?
+                        tc_ = []
+                        Xk = env.X, env.XN; env.X = env.XN = np.zeros(0, np.float32)
+                        try:
+                            for cc in cand.cpu().numpy():
+                                e2 = copy.deepcopy(env)
+                                for ac in cc: e2.step(ac, render=False)
+                                tc_.append(float(np.linalg.norm(e2.P - env.P)) > 1e-4)
+                        finally: env.X, env.XN = Xk
+                        tc_ = np.array(tc_); cn = c_.float().cpu().numpy(); gap = (float(np.linalg.norm(env.P - env.Hp)) - env.rc - env.Rh) * H
+                        reach_log.append((env.t - a.plan_c, gap, tc_.mean(), cn.std(), (cn[tc_].mean() - cn[~tc_].mean()) if tc_.any() and (~tc_).any() else np.nan, cn.mean()))
+                    el = seg[c_.argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
                 if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
                     plan = mu_.repeat_interleave(rep, 0)[:Hh]; gh = cost(plan[None], raw=True)[0].cpu().numpy()
@@ -759,6 +772,7 @@ def main():
         if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
         return d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit)
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
+    reach_log = []                                                      # --reach_diag : (geste, écart main–objet px, part des plans qui toucheraient, écart-type du coût, coût touchent − ne touchent pas, coût moyen)
     def cov_line(res):                                                  # PUSH-T : couverture (finale, MAX = mesure de Diffusion Policy), seuils, ancienne règle
         if a.task != "pusht": return
         cf, cm = res[:, 3], res[:, 4]
@@ -858,6 +872,15 @@ def main():
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
             if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
             cov_line(res)
+            if a.reach_diag and reach_log:      # PORTÉE : le coût reçoit-il un signal de l'objet quand la main est loin ?
+                RL = np.array(reach_log, float); reach_log.clear()
+                print(f"      PORTÉE ({len(RL)} relevés, horizon {h_}, {a.pop} plans du 1er tirage joués pour de vrai) — écart = distance entre le bord de sa main et celui de l'objet", flush=True)
+                print("        écart main–objet | relevés | plans qui TOUCHERAIENT l'objet | relevés où AUCUN plan ne le touche | écart-type de SON coût entre les plans | son coût : plans qui touchent − les autres")
+                for lo, hi in ((-9, 1), (1, 3), (3, 6), (6, 10), (10, 99)):
+                    r_ = RL[(RL[:, 1] >= lo) & (RL[:, 1] < hi)]
+                    if len(r_): print(f"        {('< 1 px (contact)' if hi == 1 else f'{lo}–{hi} px' if hi < 99 else '> 10 px'):>16s} | {len(r_):7d} | {r_[:, 2].mean():30.0%} | {np.mean(r_[:, 2] == 0):33.0%} | {r_[:, 3].mean():38.4f} | {np.nanmean(r_[:, 4]):+.4f}", flush=True)
+                print("        selon le moment : " + " | ".join(f"gestes {lo}–{hi} : écart {RL[(RL[:, 0] >= lo) & (RL[:, 0] < hi), 1].mean():.1f} px, plans qui toucheraient {RL[(RL[:, 0] >= lo) & (RL[:, 0] < hi), 2].mean():.0%}"
+                                                         for lo, hi in ((0, 10), (10, 40), (40, 100), (100, 300)) if ((RL[:, 0] >= lo) & (RL[:, 0] < hi)).any()), flush=True)
             S = np.array(S, dtype=np.float64)                             # (h, err objet, err main, copie objet, copie main, l'objet bouge, phase)
             if S.ndim < 2 or not len(S): continue                         # --propose 2 : rien d'imaginé, pas de dérive à mesurer
             print(f"      DÉRIVE de l'imagination (plan entier exécuté pour de vrai, px) : h | objet qui BOUGE imaginé / copie (n) "
