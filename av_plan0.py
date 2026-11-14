@@ -591,7 +591,7 @@ def main():
     om = None
     if a.objimag:                               # ---------- IMAGINATION PAR OBJET (module sur l'œil gelé)
         from av_objimag import ObjImag
-        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
+        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0), senses=cko["cfg"].get("senses", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
         assert a.goal_img and a.read_level == "top", "--objimag : avec --goal_img (but en image) et l'étage du haut"
         print(f"IMAGINATION PAR OBJET : {a.objimag} (pas {cko['it']}) à la place de l'ancienne imagination pour le coût", flush=True)
     # ---------- 3 & 4 : épisodes
@@ -719,7 +719,7 @@ def main():
             if om is not None and a.goal_img and phase != 1:   # IMAGINATION PAR OBJET : Hh pas d'une image, chacun avec son geste, depuis la dernière image VUE
                 with torch.no_grad():
                     au_ = LN(tgt(tok, torch.arange(tok.size(1), device=dev)[None]))[:, nv + t].expand(K, -1) if om.audio else None      # ce qu'il ENTEND maintenant (latent d'ouïe)
-                    pl, _, _, (AF, AB) = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, aud=au_)
+                    pl, _, _, (AF, AB, _) = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, aud=au_, sens=sens_now(K))
                     c_ = gcost(pl[-1], Hh, cand)
                     if a.sound_w > 0 and om.audio:   # ENVIE DE FAIRE DU BRUIT AVEC QUELQUE CHOSE : son imaginé avec la scène − son que ferait son corps seul, sommé sur le plan
                         e_ = torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).sum(0)
@@ -745,7 +745,18 @@ def main():
                 r_ = torch.cat([read(z_) for z_ in chain(1, cmd[:1])]) if a.chain else read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[:, 2:4] = rb(imagine(ctx.expand(Hh, -1, -1), tib, cmd, ci.expand(Hh, -1))[:, 0])
                 return r_
+        def sens_now(K):                        # ce qu'il entend, sent et son bras MAINTENANT (latents de son œil-cible) : (K, 3, d)
+            if om is None or not getattr(om, "senses", 0): return None
+            if "z" not in sn_c:
+                with torch.no_grad(): zf = LN(tgt(tok, torch.arange(tok.size(1), device=dev)[None]))[0]; sn_c["z"] = torch.stack([zf[nv + t], zf[ic + t], zf[ia + t]])
+            return sn_c["z"][None].expand(K, -1, -1)
+        sn_c = {}
         def heard(cand, i0=nv):                 # SON ouïe imaginée (le bébé) à t+1 .. t+Hh pour chaque plan : (K, Hh, d) ; i0 = ic : son TOUCHER imaginé
+            if om is not None and getattr(om, "senses", 0):                 # module à TOUS LES SENS : l'ouïe / le toucher imaginés viennent de la scène imaginée pas à pas
+                K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
+                with torch.no_grad():
+                    SN = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, sens=sens_now(K))[3][2]
+                return torch.stack(SN, 1)[:, :, 0 if i0 == nv else 1]
             K = len(cand); tia = torch.arange(i0 + t + 1, i0 + t + Hh + 1, device=dev)[:, None]; cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad(): return imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
         cost.heard, cost.s0, cost.sdir, cost.sref, cost.tdir, cost.tref = heard, s0, sdir, sref, tdir, tref

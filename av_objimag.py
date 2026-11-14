@@ -22,8 +22,12 @@ from av_judge import auc
 
 
 class ObjImag(nn.Module):
-    def __init__(s, d, nP, T, h=192, nl=2, beta=6.0, co=None, gate=0, audio=0):
-        super().__init__(); s.nP, s.npf, s.beta, s.gate, s.audio = nP, nP * nP, beta, gate, audio
+    def __init__(s, d, nP, T, h=192, nl=2, beta=6.0, co=None, gate=0, audio=0, senses=0):
+        super().__init__(); s.nP, s.npf, s.beta, s.gate, s.audio, s.senses = nP, nP * nP, beta, gate, audio, senses
+        if senses:                                                      # TOUS LES SENS (bébé v2, étape 6 ; 14 nov. 2026) : à chaque pas il imagine ce qu'il va ENTENDRE, SENTIR (toucher) et son BRAS,
+            s.sens_in = nn.Linear(3 * d, h); nn.init.zeros_(s.sens_in.weight); nn.init.zeros_(s.sens_in.bias)   # à partir de la MÊME scène imaginée (pas d'une imagination à part) ; il reçoit
+            s.sens_q = nn.Parameter(torch.randn(3, h) * 0.02)                                                      # ce qu'il vient d'entendre / sentir (vrai au 1er pas, imaginé ensuite) ;
+            s.sens_out = nn.ModuleList([nn.Sequential(nn.Linear(2 * h, h), nn.GELU(), nn.Linear(h, d)) for _ in range(3)])   # chaque sens REGARDE où il veut dans la scène (attention apprise)
         if audio:                                                       # OUÏE (14 nov. 2026, demande user) : il ENTEND (latent d'ouïe de son œil) et IMAGINE le son de chaque pas
             s.aud_in = nn.Linear(d, h); nn.init.zeros_(s.aud_in.weight); nn.init.zeros_(s.aud_in.bias)
             s.aud_full = nn.Sequential(nn.Linear(h, h), nn.GELU(), nn.Linear(h, d))      # le son du pas, d'après la SCÈNE et le geste
@@ -62,28 +66,32 @@ class ObjImag(nn.Module):
         return (num + 0.05 * fill) / (den.unsqueeze(-1) + 0.05) + s.clock[t + k], f, o
 
 
-def _roll(s, Zt, cmd, prop, tch, t, k, zero_flow=False, aud=None):
+def _roll(s, Zt, cmd, prop, tch, t, k, zero_flow=False, aud=None, sens=None):
     """PAS À PAS (principe du user : un geste, une image) : k pas d'UNE image, chacun avec SON geste. Les cases de la dernière image vue sont des « grains » qui gardent
     leur contenu (dé-daté, lissé une fois) et dont la POSITION avance à chaque pas (pas de flou qui s'accumule) ; à chaque pas le module regarde la scène qu'il vient
     d'imaginer, propose un déplacement (moyenné par groupe), et la main sentie est mise à jour avec le geste. -> [latents imaginés de t+1 .. t+k], déplacement total, « chose »."""
     B, n, d = Zt.shape; dev = Zt.device; C = Zt - s.clock[t]
     C = F.conv2d(C.transpose(1, 2).reshape(B * d, 1, s.nP, s.nP), s.smooth[None, None], padding=1).reshape(B, d, n).transpose(1, 2) * s.gain
     u = F.normalize(s.proj(Zt), dim=-1); A = torch.softmax(s.ps.exp() * (u @ u.transpose(1, 2)), -1); k1 = torch.ones(B, dtype=torch.long, device=dev)
-    P = s.xy[None].expand(B, -1, -1).clone(); pr = prop[:, t].clone(); Zc = Zt; preds = []; o = None; AF, AB = [], []
+    P = s.xy[None].expand(B, -1, -1).clone(); pr = prop[:, t].clone(); Zc = Zt; preds = []; o = None; AF, AB, SN = [], [], []
     for j in range(1, k + 1):
         g = cmd[:, t + j]
         if j > 1: gp = cmd[:, t + j - 1]; pr = torch.cat([pr[:, :2] + 0.1 * gp, gp], -1)                # main SENTIE mise à jour par le geste déjà fait (pas de proprioception du futur)
         cd = torch.cat([g, g, pr, tch[:, t] if j == 1 else torch.zeros_like(tch[:, t])], -1)
         x = s.inp(Zc) + s.pos + s.cond(cd).unsqueeze(1) + s.kemb(k1).unsqueeze(1)
         if s.audio and aud is not None: x = x + s.aud_in(aud).unsqueeze(1)                              # ce qu'il vient d'ENTENDRE (vrai au 1er pas, imaginé ensuite)
+        if s.senses and sens is not None: x = x + s.sens_in(sens.flatten(1)).unsqueeze(1)                 # ce qu'il vient d'entendre, de sentir, son bras (B, 3, d)
         hf = s.tr(x)
+        if s.senses:
+            aw = torch.softmax(hf @ s.sens_q.t() / math.sqrt(hf.size(-1)), 1); pool = torch.einsum("bns,bnh->bsh", aw, hf); hm = hf.mean(1)
+            sens = torch.stack([s.sens_out[i](torch.cat([pool[:, i], hm], -1)) for i in range(3)], 1); SN.append(sens)   # ouïe, toucher, bras imaginés de t+j
         if s.audio: AF.append(s.aud_full(hf.mean(1))); AB.append(s.aud_body(torch.cat([g, pr], -1))); aud = AF[-1]
         if o is None: o = torch.sigmoid(s.objh(hf)).squeeze(-1); w = torch.exp(s.beta * o); bgw = (1 - o).unsqueeze(-1); fill = (bgw * C).sum(1, keepdim=True) / bgw.sum(1, keepdim=True).clamp_min(1e-3) + s.fill
         if not zero_flow:
             rg = s.flow(hf).transpose(1, 2).reshape(B, 2, s.nP, s.nP); gq = ((P + 0.5) / s.nP * 2 - 1).unsqueeze(2)       # déplacement proposé, lu LÀ OÙ SONT les grains
             P = P + A @ F.grid_sample(rg, gq, mode="bilinear", padding_mode="border", align_corners=False).squeeze(-1).transpose(1, 2)
         num, den = s.splat(C, P - s.xy[None], w); Zc = (num + 0.05 * fill) / (den.unsqueeze(-1) + 0.05) + s.clock[t + j]; preds.append(Zc)
-    return preds, P - s.xy[None], o, (AF, AB)
+    return preds, P - s.xy[None], o, (AF, AB, SN)
 ObjImag.roll = _roll
 
 
@@ -102,6 +110,8 @@ def main():
     p.add_argument("--warm", type=int, default=6000, help="pas SANS déplacement au début : l'horloge, le lissage et le gain s'apprennent d'abord (sinon un faux décalage global sert de flou)")
     p.add_argument("--audio", type=int, default=0, help="1 = OUÏE : le module entend (latent d'ouïe de son œil) et imagine le son de chaque pas (cible = latent d'ouïe, aucune étiquette) ; --chain 1")
     p.add_argument("--aud_w", type=float, default=1.0)
+    p.add_argument("--senses", type=int, default=0, help="1 = TOUS LES SENS (bébé v2, étape 6) : à chaque pas le module imagine aussi l'ouïe, le toucher et le bras (cibles = latents de son œil-cible), "
+                   "à partir de la même scène imaginée ; --chain 1"); p.add_argument("--sens_w", type=float, default=1.0)
     p.add_argument("--chain", type=int, default=0, help="1 = PAS À PAS : le module d'un pas enchaîné k fois avec le geste de chaque pas (perte latente à chaque pas)")
     p.add_argument("--init", type=str, default="", help="module de départ (ex. objimag_D17s_v5.pt : horloge, lissage, groupes déjà appris)")
     p.add_argument("--long_pow", type=float, default=0.0, help="tirage des horizons ∝ k^long_pow (0 = uniforme ; 1 = les longs plus souvent)")
@@ -115,8 +125,8 @@ def main():
     for q in tgt.parameters(): q.requires_grad_(False)
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; v = VIEW["0e"]; ix = torch.arange(nv, device=dev)
     co = {"weight": ck["m"]["co_proj.weight"], "bias": ck["m"]["co_proj.bias"]} if "co_proj.weight" in ck["m"] else None
-    assert a.chain or not a.audio, "--audio : avec --chain 1"
-    m = ObjImag(d, nP, T, co=co, gate=a.gate, audio=a.audio).to(dev)
+    assert a.chain or not (a.audio or a.senses), "--audio / --senses : avec --chain 1"
+    m = ObjImag(d, nP, T, co=co, gate=a.gate, audio=a.audio, senses=a.senses).to(dev)
     if a.init: r_ = m.load_state_dict(torch.load(a.init, map_location=dev, weights_only=False)["m"], strict=False); print(f"module de départ : {a.init} (neuf : {sorted({k.split('.')[0] for k in r_.missing_keys})})", flush=True)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.01); sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.steps, pct_start=0.05)
     wkw = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}; sc = float(wkw.get("obj_scale", 1.0))
@@ -125,7 +135,7 @@ def main():
     @torch.no_grad()
     def latents(b):                              # lot -> vrais latents (B, T, npf, d), condition par instant
         tok, cmd = to_tok0(b, st, v, P_, dev); B = len(tok); za = F.layer_norm(tgt(tok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,))   # tous ses sens (la vue en sort identique)
-        return za[:, :nv].view(B, T, npf, d), cmd, tok[:, nv + 2 * T:, :4], tok[:, nv + T:nv + 2 * T, :8], za[:, nv:nv + T]
+        return za[:, :nv].view(B, T, npf, d), cmd, tok[:, nv + 2 * T:, :4], tok[:, nv + T:nv + 2 * T, :8], za[:, nv:nv + 3 * T].view(B, 3, T, d)   # + ouïe, toucher, bras (B, 3, T, d)
     def cond_of(cmd, prop, tch, t, k): return torch.cat([cmd[:, t + 1:t + k + 1].sum(1), cmd[:, t + 1], prop[:, t], tch[:, t]], -1)
 
     # ---------- données d'examen (instruments : masques et positions du monde)
@@ -144,9 +154,14 @@ def main():
             R = {x: [] for x in ("dt", "di", "ht", "hi", "ec", "es", "em", "oo", "ob", "oh", "tc")}
             for b, FO, FH, POS, HND, TCH in EV:
                 for i in range(0, len(FO), 125):
-                    sl = slice(i, i + 125); Z, cmd, prop, tch, Za = latents({k_: x[sl] for k_, x in b.items()}); cd = cond_of(cmd, prop, tch, t, k); au = Za[:, t] if a.audio else None
+                    sl = slice(i, i + 125); Z, cmd, prop, tch, Zs = latents({k_: x[sl] for k_, x in b.items()}); Za = Zs[:, 0]; cd = cond_of(cmd, prop, tch, t, k); au = Za[:, t] if a.audio else None; sn = Zs[:, :, t] if a.senses else None
                     if a.chain:
-                        (pl, f, o, (AF, AB)), (psl, _, _, _) = m.roll(Z[:, t], cmd, prop, tch, t, k, aud=au), m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=True, aud=au); pr, ps_ = pl[-1], psl[-1]
+                        (pl, f, o, (AF, AB, SN)), (psl, _, _, _) = m.roll(Z[:, t], cmd, prop, tch, t, k, aud=au, sens=sn), m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=True, aud=au, sens=sn); pr, ps_ = pl[-1], psl[-1]
+                        if a.senses:                 # sens imaginés (k pas) et vrais, par sens ; « près » = main à moins de 10 px du centre de l'objet à t
+                            SI = torch.stack(SN, 2); R.setdefault("near", []).append((HND[sl, t] - POS[sl, t]).norm(dim=-1) < 10)
+                            for i_ in range(3):
+                                R.setdefault(f"si{i_}", []).append(SI[:, i_].flatten(1).cpu()); R.setdefault(f"sr{i_}", []).append(Zs[:, i_, t + 1:t + k + 1].flatten(1).cpu())
+                                R.setdefault(f"se{i_}", []).append((SI[:, i_] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu()); R.setdefault(f"sc{i_}", []).append((Zs[:, i_, t:t + 1] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu())
                         if a.audio:
                             R.setdefault("se", []).append(torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).amax(0).cpu()); R.setdefault("sc", []).append(TCH[sl, t + 1:t + k + 1].any(1))
                             for nm_, q_ in (("af", AF[-1]), ("ab", AB[-1]), ("ac", Za[:, t])): R.setdefault(nm_, []).append((q_ - Za[:, t + k]).abs().mean(-1).cpu())
@@ -161,6 +176,16 @@ def main():
             R = {x: torch.cat(y) for x, y in R.items()}; dn = R["dt"].norm(dim=-1); okc = R["oo"] > -1
             if "se" in R: log(f"   t={t} k={k} | OUÏE imaginée : erreur avec la scène {float(R['af'].mean()):.3f} | corps seul {float(R['ab'].mean()):.3f} | recopier {float(R['ac'].mean()):.3f} || "
                               f"« bruit fait avec quelque chose » (scène − corps seul) : dit-il qu'un CONTACT a lieu ? AUC {auc(R['se'].numpy(), R['sc'].numpy()):.2f} (contact dans {float(R['sc'].float().mean()):.0%} des cas)")
+            if "si0" in R and k >= 4:              # ÉTAPE 6 : ses sens IMAGINÉS disent-ils que l'objet va bouger ? (instrument : sonde linéaire, moitié des scènes pour l'apprendre, l'autre pour lire)
+                from sklearn.linear_model import LogisticRegression; from sklearn.preprocessing import StandardScaler; from sklearn.metrics import roc_auc_score
+                y = (dn > 0.5).numpy(); n_ = len(y); tr_ = np.arange(n_) % 2 == 0; te_ = ~tr_; nr = R["near"].numpy()
+                def pa(X):
+                    X = X.float().numpy(); sc_ = StandardScaler().fit(X[tr_]); pr_ = LogisticRegression(C=0.05, max_iter=300).fit(sc_.transform(X[tr_]), y[tr_]).predict_proba(sc_.transform(X[te_]))[:, 1]
+                    a2 = lambda m_: roc_auc_score(y[te_][m_], pr_[m_]) if 0 < y[te_][m_].sum() < m_.sum() else float("nan")
+                    return f"{a2(np.ones(te_.sum(), bool)):.2f} (main près de l'objet {a2(nr[te_]):.2f}, loin {a2(~nr[te_]):.2f})"
+                for i_, nm_ in enumerate(("OUÏE", "TOUCHER", "BRAS")):
+                    log(f"   t={t} k={k} | {nm_:>7s} imaginé(e) : erreur {float(R[f'se{i_}'].mean()):.3f} (recopier {float(R[f'sc{i_}'].mean()):.3f}) || sonde « l'objet va bouger » ({y.mean():.0%} des scènes, {nr.mean():.0%} près) : "
+                        f"sens VRAI {pa(R[f'sr{i_}'])} | sens IMAGINÉ {pa(R[f'si{i_}'])}")
             log(f"   t={t} k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
                 f"main : vrai {float(R['ht'].norm(dim=-1).mean()):.2f} px, imaginé {float(R['hi'].norm(dim=-1).mean()):.2f}, cos {float(F.cosine_similarity(R['hi'], R['ht'], dim=-1)[R['ht'].norm(dim=-1) > 0.5].mean()):+.2f}")
             for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de 4–8 px", (dn >= 4) & (dn < 8)), ("déplacé de > 8 px", dn >= 8)):
@@ -176,11 +201,12 @@ def main():
         S.wkw["obj_scale"] = 1.0 if rng.random() < 0.5 else sc
         b1, b2 = S.next(), S.next(); b = {k_: torch.cat([b1[k_], b2[k_]]) for k_ in b1}; hc = b["TOUCH"].abs().sum((1, 2)) > 0
         ic, in_ = torch.where(hc)[0], torch.where(~hc)[0]; nc = min(len(ic), int(round(a.contact * a.bs))); pick = torch.cat([ic[torch.randperm(len(ic))[:nc]], in_[torch.randperm(len(in_))[:a.bs - nc]]])
-        Z, cmd, prop, tch, Za = latents({k_: x[pick] for k_, x in b.items()}); au = Za[:, :] if a.audio else None; k = int(rng.choice(a.kmax, p=kp_)) + 1; t = int(rng.integers(3, T - k))
+        Z, cmd, prop, tch, Zs = latents({k_: x[pick] for k_, x in b.items()}); Za = Zs[:, 0]; au = Za[:, :] if a.audio else None; k = int(rng.choice(a.kmax, p=kp_)) + 1; t = int(rng.integers(3, T - k))
         cd = cond_of(cmd, prop, tch, t, k)
         if a.chain:
-            pl, f, o, (AF, AB) = m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=it <= a.warm, aud=au[:, t] if a.audio else None); pr = pl[-1]
+            pl, f, o, (AF, AB, SN) = m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=it <= a.warm, aud=au[:, t] if a.audio else None, sens=Zs[:, :, t] if a.senses else None); pr = pl[-1]
             loss = sum(F.smooth_l1_loss(q, Z[:, t + j + 1], beta=0.1) for j, q in enumerate(pl)) / k + a.still_w * f.abs().mean() / k + a.thing_w * o.mean()
+            if a.senses: loss = loss + a.sens_w * sum(F.smooth_l1_loss(x, Zs[:, :, t + j + 1], beta=0.1) for j, x in enumerate(SN)) / k
             if a.audio: loss = loss + a.aud_w * sum(F.smooth_l1_loss(x, Za[:, t + j + 1], beta=0.1) + F.smooth_l1_loss(y, Za[:, t + j + 1], beta=0.1) for j, (x, y) in enumerate(zip(AF, AB))) / k
         else:
             pr, f, o = m(Z[:, t], cd, t, k, zero_flow=it <= a.warm); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean() + a.thing_w * o.mean()   # + légers a priori
@@ -192,7 +218,7 @@ def main():
         if it % 250 == 0:
             log(f"  pas {it:5d} | perte {ma[0]:.4f} | sans déplacement (recopier + horloge) {ma[1]:.4f} | recopier {ma[2]:.4f} | déplacement moyen {ma[3]:.2f} px, plus grand de l'image {ma[4]:.2f} px | « chose » moyenne {ma[5]:.2f} | {time.time() - t_:.0f}s")
         if it % a.eval_every == 0 or it == a.steps:
-            exam(f"au pas {it}"); torch.save(dict(m=m.state_dict(), cfg=dict(d=d, nP=nP, T=T, gate=a.gate, audio=a.audio), it=it, base=a.ckpt), a.out)
+            exam(f"au pas {it}"); torch.save(dict(m=m.state_dict(), cfg=dict(d=d, nP=nP, T=T, gate=a.gate, audio=a.audio, senses=a.senses), it=it, base=a.ckpt), a.out)
     log(f"total {time.time() - t_:.0f}s")
 
 
