@@ -102,6 +102,76 @@ def _things(s, Z, prop):
 ObjImag.things = _things
 
 
+def cond_of(cmd, prop, tch, t, k): return torch.cat([cmd[:, t + 1:t + k + 1].sum(1), cmd[:, t + 1], prop[:, t], tch[:, t]], -1)
+
+
+def build_exam(m, latents, wkw, sc, T, nP, P_, npf, n_eval, kmax, chain, audio, senses, log, t0_):
+    """EXAMEN du module (instruments : positions et masques du monde ; sondes linéaires) -> exam(tag) qui rend les mesures-clés (critères du bébé v2) :
+    amp_k8 (objet poussé de 4–8 px : part de l'amplitude imaginée), cos_k8, immobile_k8 (dérive en px), sens{0,1,2}_pres_k8 (ouïe, toucher, bras imaginés :
+    sonde « l'objet va bouger », main près), transport{i}_pres_k8 (lecture apprise sur le vrai, appliquée à l'imaginé)."""
+    # ---------- données d'examen (instruments : masques et positions du monde)
+    we = {**wkw, "p_out": 0.0, "p_parent": 0.0, "kick": 0.0}; EV = []
+    for c0 in range(0, n_eval, 250):
+        w0 = gen_world0(min(250, n_eval - c0), "0e", T, H, seed=555_000 + c0 // 250, nobj=(1, 1), masks=True, **{**we, "obj_scale": 1.0 if (c0 // 250) % 2 else sc}); MK = w0["MASK"]; nc = len(MK)
+        fc = (MK.reshape(nc, T, MK.shape[2], nP, P_, nP, P_).mean((4, 6)) / 255).reshape(nc, T, MK.shape[2], npf)
+        EV.append((to_torch(to_np([w0])), torch.from_numpy(fc[:, :, 0].astype(np.float32)), torch.from_numpy(fc[:, :, -1].astype(np.float32)), torch.from_numpy(w0["POS"][:, :, 0] * H).float(), torch.from_numpy(w0["HAND"] * H).float(),
+                   torch.from_numpy(np.abs(w0["TOUCH"]).sum(-1) > 0)))
+    log(f"   examen : {n_eval} scènes à un objet (tailles 1 et {sc}) | {time.time() - t0_:.0f}s")
+
+    @torch.no_grad()
+    def exam(tag):
+        m.eval(); RES = {}; log(f"\n=== EXAMEN {tag} (image t -> t+k ; déplacements en px ; instruments = positions du monde) | {time.time() - t0_:.0f}s")
+        for t, k in [(7, k_) for k_ in (1, 2, 4, 8) if k_ <= kmax] + ([(3, 12)] if kmax >= 12 else []):
+            R = {x: [] for x in ("dt", "di", "ht", "hi", "ec", "es", "em", "oo", "ob", "oh", "tc")}
+            for b, FO, FH, POS, HND, TCH in EV:
+                for i in range(0, len(FO), 125):
+                    sl = slice(i, i + 125); Z, cmd, prop, tch, Zs = latents({k_: x[sl] for k_, x in b.items()}); Za = Zs[:, 0]; cd = cond_of(cmd, prop, tch, t, k); au = Za[:, t] if audio else None; sn = Zs[:, :, t] if senses else None
+                    if chain:
+                        (pl, f, o, (AF, AB, SN)), (psl, _, _, _) = m.roll(Z[:, t], cmd, prop, tch, t, k, aud=au, sens=sn), m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=True, aud=au, sens=sn); pr, ps_ = pl[-1], psl[-1]
+                        if senses:                 # sens imaginés (k pas) et vrais, par sens ; « près » = main à moins de 10 px du centre de l'objet à t
+                            SI = torch.stack(SN, 2); R.setdefault("near", []).append((HND[sl, t] - POS[sl, t]).norm(dim=-1) < 10)
+                            for i_ in range(3):
+                                R.setdefault(f"si{i_}", []).append(SI[:, i_].flatten(1).cpu()); R.setdefault(f"sr{i_}", []).append(Zs[:, i_, t + 1:t + k + 1].flatten(1).cpu())
+                                R.setdefault(f"se{i_}", []).append((SI[:, i_] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu()); R.setdefault(f"sc{i_}", []).append((Zs[:, i_, t:t + 1] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu())
+                        if audio:
+                            R.setdefault("se", []).append(torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).amax(0).cpu()); R.setdefault("sc", []).append(TCH[sl, t + 1:t + k + 1].any(1))
+                            for nm_, q_ in (("af", AF[-1]), ("ab", AB[-1]), ("ac", Za[:, t])): R.setdefault(nm_, []).append((q_ - Za[:, t + k]).abs().mean(-1).cpu())
+                    else: pr, f, o = m(Z[:, t], cd, t, k); ps_, _, _ = m(Z[:, t], cd, t, k, zero_flow=True)
+                    f = f.cpu() * P_; o = o.cpu()
+                    fo, fh = FO[sl, t], FH[sl, t]; core = ((fo >= 0.5) & (fh < 0.1)).float(); hc = (fh >= 0.5).float(); bg = ((fo < 0.02) & (fh < 0.02)).float()
+                    avg = lambda x, M: (x * M.unsqueeze(-1)).sum(1) / M.sum(1, keepdim=True).clamp_min(1) if x.dim() == 3 else (x * M).sum(1) / M.sum(1).clamp_min(1)
+                    R["dt"].append(POS[sl, t + k] - POS[sl, t]); R["di"].append(avg(f, core)); R["ht"].append(HND[sl, t + k] - HND[sl, t]); R["hi"].append(avg(f, hc))
+                    ev = (((fo >= 0.1) | (FO[sl, t + k] >= 0.1)) & (fh < 0.02) & (FH[sl, t + k] < 0.02)).float()
+                    for nm, q in (("ec", Z[:, t]), ("es", ps_), ("em", pr)): R[nm].append(avg((q - Z[:, t + k]).abs().mean(-1).cpu(), ev))
+                    R["oo"].append(avg(o, core)); R["ob"].append(avg(o, bg)); R["oh"].append(avg(o, hc)); R["tc"].append(TCH[sl, t + 1:t + k + 1].any(1) & (core.sum(1) > 0) & (ev.sum(1) > 0))
+            R = {x: torch.cat(y) for x, y in R.items()}; dn = R["dt"].norm(dim=-1); okc = R["oo"] > -1
+            if "se" in R: log(f"   t={t} k={k} | OUÏE imaginée : erreur avec la scène {float(R['af'].mean()):.3f} | corps seul {float(R['ab'].mean()):.3f} | recopier {float(R['ac'].mean()):.3f} || "
+                              f"« bruit fait avec quelque chose » (scène − corps seul) : dit-il qu'un CONTACT a lieu ? AUC {auc(R['se'].numpy(), R['sc'].numpy()):.2f} (contact dans {float(R['sc'].float().mean()):.0%} des cas)")
+            if "si0" in R and k >= 4:              # ÉTAPE 6 : ses sens IMAGINÉS disent-ils que l'objet va bouger ? (instrument : sonde linéaire, moitié des scènes pour l'apprendre, l'autre pour lire)
+                from sklearn.linear_model import LogisticRegression; from sklearn.preprocessing import StandardScaler; from sklearn.metrics import roc_auc_score
+                y = (dn > 0.5).numpy(); n_ = len(y); tr_ = np.arange(n_) % 2 == 0; te_ = ~tr_; nr = R["near"].numpy()
+                def pa(X, X2=None, key=None):      # sonde apprise sur X (moitié des scènes), lue sur X2 (l'autre moitié ; par défaut X)
+                    X = X.float().numpy(); X2 = X if X2 is None else X2.float().numpy(); sc_ = StandardScaler().fit(X[tr_]); pr_ = LogisticRegression(C=0.05, max_iter=300).fit(sc_.transform(X[tr_]), y[tr_]).predict_proba(sc_.transform(X2[te_]))[:, 1]
+                    a2 = lambda m_: roc_auc_score(y[te_][m_], pr_[m_]) if 0 < y[te_][m_].sum() < m_.sum() else float("nan")
+                    if key: RES[key] = a2(nr[te_])
+                    return f"{a2(np.ones(te_.sum(), bool)):.2f} (main près de l'objet {a2(nr[te_]):.2f}, loin {a2(~nr[te_]):.2f})"
+                for i_, nm_ in enumerate(("OUÏE", "TOUCHER", "BRAS")):
+                    log(f"   t={t} k={k} | {nm_:>7s} imaginé(e) : erreur {float(R[f'se{i_}'].mean()):.3f} (recopier {float(R[f'sc{i_}'].mean()):.3f}) || sonde « l'objet va bouger » ({y.mean():.0%} des scènes, {nr.mean():.0%} près) : "
+                        f"sens VRAI {pa(R[f'sr{i_}'])} | sens IMAGINÉ {pa(R[f'si{i_}'], key=f'sens{i_}_pres_k{k}')} | lecture apprise sur le VRAI, appliquée à l'IMAGINÉ {pa(R[f'sr{i_}'], R[f'si{i_}'], key=f'transport{i_}_pres_k{k}')}")
+            log(f"   t={t} k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
+                f"main : vrai {float(R['ht'].norm(dim=-1).mean()):.2f} px, imaginé {float(R['hi'].norm(dim=-1).mean()):.2f}, cos {float(F.cosine_similarity(R['hi'], R['ht'], dim=-1)[R['ht'].norm(dim=-1) > 0.5].mean()):+.2f}")
+            for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de 4–8 px", (dn >= 4) & (dn < 8)), ("déplacé de > 8 px", dn >= 8)):
+                if int(s_.sum()) < 10: log(f"      {nm:>32s} | n={int(s_.sum()):4d} | trop peu"); continue
+                cs = float(F.cosine_similarity(R["di"][s_], R["dt"][s_], dim=-1).mean()) if float(dn[s_].mean()) > 0.4 else float("nan")
+                if nm.startswith("objet jamais"): RES[f"immobile_k{k}"] = float(R["di"][s_].norm(dim=-1).mean())
+                if nm.startswith("déplacé de 4"): RES[f"amp_k{k}"] = float(R["di"][s_].norm(dim=-1).mean()) / float(dn[s_].mean()); RES[f"cos_k{k}"] = cs
+                log(f"      {nm:>32s} | n={int(s_.sum()):4d} | vrai {float(dn[s_].mean()):5.2f} px | imaginé {float(R['di'][s_].norm(dim=-1).mean()):5.2f} | cos {cs:+.2f} | erreur de déplacement {float((R['di'][s_] - R['dt'][s_]).norm(dim=-1).mean()):5.2f} "
+                    f"| erreur latente sur l'objet : recopier {float(R['ec'][s_].mean()):.3f} | recopier + horloge {float(R['es'][s_].mean()):.3f} | MODULE {float(R['em'][s_].mean()):.3f}")
+        m.train(); return RES
+
+    return exam
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--out", type=str, default="/content/objimag.pt"); p.add_argument("--steps", type=int, default=6000)
@@ -138,64 +208,8 @@ def main():
     def latents(b):                              # lot -> vrais latents (B, T, npf, d), condition par instant
         tok, cmd = to_tok0(b, st, v, P_, dev); B = len(tok); za = F.layer_norm(tgt(tok, torch.arange(tok.size(1), device=dev).expand(B, -1)).float(), (d,))   # tous ses sens (la vue en sort identique)
         return za[:, :nv].view(B, T, npf, d), cmd, tok[:, nv + 2 * T:, :4], tok[:, nv + T:nv + 2 * T, :8], za[:, nv:nv + 3 * T].view(B, 3, T, d)   # + ouïe, toucher, bras (B, 3, T, d)
-    def cond_of(cmd, prop, tch, t, k): return torch.cat([cmd[:, t + 1:t + k + 1].sum(1), cmd[:, t + 1], prop[:, t], tch[:, t]], -1)
 
-    # ---------- données d'examen (instruments : masques et positions du monde)
-    we = {**wkw, "p_out": 0.0, "p_parent": 0.0, "kick": 0.0}; EV = []
-    for c0 in range(0, a.n_eval, 250):
-        w0 = gen_world0(min(250, a.n_eval - c0), "0e", T, H, seed=555_000 + c0 // 250, nobj=(1, 1), masks=True, **{**we, "obj_scale": 1.0 if (c0 // 250) % 2 else sc}); MK = w0["MASK"]; nc = len(MK)
-        fc = (MK.reshape(nc, T, MK.shape[2], nP, P_, nP, P_).mean((4, 6)) / 255).reshape(nc, T, MK.shape[2], npf)
-        EV.append((to_torch(to_np([w0])), torch.from_numpy(fc[:, :, 0].astype(np.float32)), torch.from_numpy(fc[:, :, -1].astype(np.float32)), torch.from_numpy(w0["POS"][:, :, 0] * H).float(), torch.from_numpy(w0["HAND"] * H).float(),
-                   torch.from_numpy(np.abs(w0["TOUCH"]).sum(-1) > 0)))
-    log(f"   examen : {a.n_eval} scènes à un objet (tailles 1 et {sc}) | {time.time() - t_:.0f}s")
-
-    @torch.no_grad()
-    def exam(tag):
-        m.eval(); log(f"\n=== EXAMEN {tag} (image t -> t+k ; déplacements en px ; instruments = positions du monde) | {time.time() - t_:.0f}s")
-        for t, k in [(7, k_) for k_ in (1, 2, 4, 8) if k_ <= a.kmax] + ([(3, 12)] if a.kmax >= 12 else []):
-            R = {x: [] for x in ("dt", "di", "ht", "hi", "ec", "es", "em", "oo", "ob", "oh", "tc")}
-            for b, FO, FH, POS, HND, TCH in EV:
-                for i in range(0, len(FO), 125):
-                    sl = slice(i, i + 125); Z, cmd, prop, tch, Zs = latents({k_: x[sl] for k_, x in b.items()}); Za = Zs[:, 0]; cd = cond_of(cmd, prop, tch, t, k); au = Za[:, t] if a.audio else None; sn = Zs[:, :, t] if a.senses else None
-                    if a.chain:
-                        (pl, f, o, (AF, AB, SN)), (psl, _, _, _) = m.roll(Z[:, t], cmd, prop, tch, t, k, aud=au, sens=sn), m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=True, aud=au, sens=sn); pr, ps_ = pl[-1], psl[-1]
-                        if a.senses:                 # sens imaginés (k pas) et vrais, par sens ; « près » = main à moins de 10 px du centre de l'objet à t
-                            SI = torch.stack(SN, 2); R.setdefault("near", []).append((HND[sl, t] - POS[sl, t]).norm(dim=-1) < 10)
-                            for i_ in range(3):
-                                R.setdefault(f"si{i_}", []).append(SI[:, i_].flatten(1).cpu()); R.setdefault(f"sr{i_}", []).append(Zs[:, i_, t + 1:t + k + 1].flatten(1).cpu())
-                                R.setdefault(f"se{i_}", []).append((SI[:, i_] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu()); R.setdefault(f"sc{i_}", []).append((Zs[:, i_, t:t + 1] - Zs[:, i_, t + 1:t + k + 1]).abs().mean((1, 2)).cpu())
-                        if a.audio:
-                            R.setdefault("se", []).append(torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).amax(0).cpu()); R.setdefault("sc", []).append(TCH[sl, t + 1:t + k + 1].any(1))
-                            for nm_, q_ in (("af", AF[-1]), ("ab", AB[-1]), ("ac", Za[:, t])): R.setdefault(nm_, []).append((q_ - Za[:, t + k]).abs().mean(-1).cpu())
-                    else: pr, f, o = m(Z[:, t], cd, t, k); ps_, _, _ = m(Z[:, t], cd, t, k, zero_flow=True)
-                    f = f.cpu() * P_; o = o.cpu()
-                    fo, fh = FO[sl, t], FH[sl, t]; core = ((fo >= 0.5) & (fh < 0.1)).float(); hc = (fh >= 0.5).float(); bg = ((fo < 0.02) & (fh < 0.02)).float()
-                    avg = lambda x, M: (x * M.unsqueeze(-1)).sum(1) / M.sum(1, keepdim=True).clamp_min(1) if x.dim() == 3 else (x * M).sum(1) / M.sum(1).clamp_min(1)
-                    R["dt"].append(POS[sl, t + k] - POS[sl, t]); R["di"].append(avg(f, core)); R["ht"].append(HND[sl, t + k] - HND[sl, t]); R["hi"].append(avg(f, hc))
-                    ev = (((fo >= 0.1) | (FO[sl, t + k] >= 0.1)) & (fh < 0.02) & (FH[sl, t + k] < 0.02)).float()
-                    for nm, q in (("ec", Z[:, t]), ("es", ps_), ("em", pr)): R[nm].append(avg((q - Z[:, t + k]).abs().mean(-1).cpu(), ev))
-                    R["oo"].append(avg(o, core)); R["ob"].append(avg(o, bg)); R["oh"].append(avg(o, hc)); R["tc"].append(TCH[sl, t + 1:t + k + 1].any(1) & (core.sum(1) > 0) & (ev.sum(1) > 0))
-            R = {x: torch.cat(y) for x, y in R.items()}; dn = R["dt"].norm(dim=-1); okc = R["oo"] > -1
-            if "se" in R: log(f"   t={t} k={k} | OUÏE imaginée : erreur avec la scène {float(R['af'].mean()):.3f} | corps seul {float(R['ab'].mean()):.3f} | recopier {float(R['ac'].mean()):.3f} || "
-                              f"« bruit fait avec quelque chose » (scène − corps seul) : dit-il qu'un CONTACT a lieu ? AUC {auc(R['se'].numpy(), R['sc'].numpy()):.2f} (contact dans {float(R['sc'].float().mean()):.0%} des cas)")
-            if "si0" in R and k >= 4:              # ÉTAPE 6 : ses sens IMAGINÉS disent-ils que l'objet va bouger ? (instrument : sonde linéaire, moitié des scènes pour l'apprendre, l'autre pour lire)
-                from sklearn.linear_model import LogisticRegression; from sklearn.preprocessing import StandardScaler; from sklearn.metrics import roc_auc_score
-                y = (dn > 0.5).numpy(); n_ = len(y); tr_ = np.arange(n_) % 2 == 0; te_ = ~tr_; nr = R["near"].numpy()
-                def pa(X, X2=None):                # sonde apprise sur X (moitié des scènes), lue sur X2 (l'autre moitié ; par défaut X)
-                    X = X.float().numpy(); X2 = X if X2 is None else X2.float().numpy(); sc_ = StandardScaler().fit(X[tr_]); pr_ = LogisticRegression(C=0.05, max_iter=300).fit(sc_.transform(X[tr_]), y[tr_]).predict_proba(sc_.transform(X2[te_]))[:, 1]
-                    a2 = lambda m_: roc_auc_score(y[te_][m_], pr_[m_]) if 0 < y[te_][m_].sum() < m_.sum() else float("nan")
-                    return f"{a2(np.ones(te_.sum(), bool)):.2f} (main près de l'objet {a2(nr[te_]):.2f}, loin {a2(~nr[te_]):.2f})"
-                for i_, nm_ in enumerate(("OUÏE", "TOUCHER", "BRAS")):
-                    log(f"   t={t} k={k} | {nm_:>7s} imaginé(e) : erreur {float(R[f'se{i_}'].mean()):.3f} (recopier {float(R[f'sc{i_}'].mean()):.3f}) || sonde « l'objet va bouger » ({y.mean():.0%} des scènes, {nr.mean():.0%} près) : "
-                        f"sens VRAI {pa(R[f'sr{i_}'])} | sens IMAGINÉ {pa(R[f'si{i_}'])} | lecture apprise sur le VRAI, appliquée à l'IMAGINÉ {pa(R[f'sr{i_}'], R[f'si{i_}'])}")
-            log(f"   t={t} k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
-                f"main : vrai {float(R['ht'].norm(dim=-1).mean()):.2f} px, imaginé {float(R['hi'].norm(dim=-1).mean()):.2f}, cos {float(F.cosine_similarity(R['hi'], R['ht'], dim=-1)[R['ht'].norm(dim=-1) > 0.5].mean()):+.2f}")
-            for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de 4–8 px", (dn >= 4) & (dn < 8)), ("déplacé de > 8 px", dn >= 8)):
-                if int(s_.sum()) < 10: log(f"      {nm:>32s} | n={int(s_.sum()):4d} | trop peu"); continue
-                cs = float(F.cosine_similarity(R["di"][s_], R["dt"][s_], dim=-1).mean()) if float(dn[s_].mean()) > 0.4 else float("nan")
-                log(f"      {nm:>32s} | n={int(s_.sum()):4d} | vrai {float(dn[s_].mean()):5.2f} px | imaginé {float(R['di'][s_].norm(dim=-1).mean()):5.2f} | cos {cs:+.2f} | erreur de déplacement {float((R['di'][s_] - R['dt'][s_]).norm(dim=-1).mean()):5.2f} "
-                    f"| erreur latente sur l'objet : recopier {float(R['ec'][s_].mean()):.3f} | recopier + horloge {float(R['es'][s_].mean()):.3f} | MODULE {float(R['em'][s_].mean()):.3f}")
-        m.train()
+    exam = build_exam(m, latents, wkw, sc, T, nP, P_, npf, a.n_eval, a.kmax, a.chain, a.audio, a.senses, log, t_)
 
     S = Stream(0, a.bs, a.workers, 0.0, wkw=dict(wkw)); S.stage = "0e"; ma = None
     kp_ = np.arange(1, a.kmax + 1, dtype=float) ** a.long_pow; kp_ /= kp_.sum()                       # horizons LONGS tirés plus souvent (plus gros déplacements = signal plus fort)

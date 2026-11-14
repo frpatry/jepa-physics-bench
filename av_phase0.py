@@ -36,6 +36,8 @@ from vjepa import _idx, _gather, sigreg
 
 T, H = 16, 32
 ORDER = ["0a", "0b", "0c", "0d", "0e"]
+CRIT = {"0a": ("il écoute ses gestes par le bras (erreur en plus si on ment sur ses gestes)", "geste_bras", 0.5), "0b": ("vu ici = senti là (surprise)", "bras", 0.9),   # critères de passage (bébé v2)
+        "0c": ("geste deviné par la vue (R²)", "inverse_r2", 0.5), "0d": ("contact vu mais pas senti (surprise)", "toucher", 0.8)}
 SENS = ("vue", "ouïe", "toucher", "bras")
 KEYS = ("X", "A", "TOUCH", "PROP", "CMD")
 
@@ -259,8 +261,10 @@ class FlowHead(nn.Module):
         return F.linear(F.gelu(F.linear(x, w(s.a.weight), w(s.a.bias))), w(s.b.weight), w(s.b.bias))
 
 class Baby0(nn.Module):
-    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0, mv=0, co=0, fl=0):
+    def __init__(s, din, nv, npf, d, nl, nh, pl, sep, inv_head="attn", resid=False, std_tgt=False, split=False, levels=0, regs=0, reg_frame=False, causal=False, goal_k=0, mv=0, co=0, fl=0, oi=0):
         super().__init__(); s.mv = bool(mv); s.nv = nv
+        if oi:                                                         # BÉBÉ v2 (14 nov. 2026) : l'IMAGINATION PAR OBJET, PAS À PAS, À TOUS LES SENS fait partie du bébé (un seul modèle)
+            from av_objimag import ObjImag; s.oi = ObjImag(d, int(round(npf ** 0.5)), T, senses=1)
         if fl: s.fl_head = FlowHead(d)                                # OÙ ÇA VA (--flow_w) : le déplacement par case relu dans les latents
         if co:                                                         # MOUVEMENT COMMUN (--comove_w) : projection où deux cases du MÊME objet se ressemblent
             s.co_proj = nn.Linear(d, 64); s.co_s = nn.Parameter(torch.tensor(math.log(5.0))); s.co_b = nn.Parameter(torch.zeros(()))
@@ -295,7 +299,7 @@ def baby_from_cfg(cfg, dev):
     Fixe aussi la longueur des séquences du module (T) à celle de l'instantané."""
     global T; T = int(cfg.get("T", 16)); P = cfg["P"]; npf = (H // P) ** 2
     return Baby0(cfg["din"], T * npf, npf, cfg["d"], cfg["nl"], cfg["nh"], cfg["pred_layers"], bool(cfg["sep"]), cfg.get("inv_head", "attn"),
-                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0)), int(cfg.get("goal_k", 0)), int(cfg.get("mv", 0)), int(cfg.get("co", 0)), int(cfg.get("fl", 0))).to(dev)
+                 bool(cfg.get("resid", 0)), bool(cfg.get("std_tgt", 0)), bool(cfg.get("split", 0)), int(cfg.get("levels", 0)), int(cfg.get("regs", 0)), bool(cfg.get("reg_frame", 0)), bool(cfg.get("causal", 0)), int(cfg.get("goal_k", 0)), int(cfg.get("mv", 0)), int(cfg.get("co", 0)), int(cfg.get("fl", 0)), int(cfg.get("oi", 0))).to(dev)
 
 # ---------------------------------------------------------------- données -> tokens
 def layout(nv, npf):
@@ -585,6 +589,17 @@ def main():
     p.add_argument("--flow_pos", type=float, default=10.0, help="--flow_w : poids des cases qui BOUGENT (déplacement sûr) face aux cases inchangées (cible 0)")
     p.add_argument("--hand_hidden", type=float, default=0.0, help="IDÉE USER (2026-11-13) : part des séquences de jeu où sa main N'EST PAS dans l'image (il la SENT : bras, toucher) — "
                    "il pousse des objets tantôt en se voyant, tantôt seulement en se sentant ; demande les images sans main du monde (--goal_w avec --goal_nohand 1)")
+    p.add_argument("--womb", type=int, default=0, help="BÉBÉ v2, étape 0 « DANS LE VENTRE » (idée user) : pendant les N premiers pas (au début de 0a) il ne VOIT rien "
+                   "(image uniforme) : il bouge, s'entend, sent son bras — ajouter N au budget de 0a")
+    p.add_argument("--oi_w", type=float, default=0.0, help="BÉBÉ v2, étapes 5–6 : poids de l'IMAGINATION PAR OBJET PAS À PAS (av_objimag.ObjImag dans le bébé, cibles = latents de l'œil-cible : "
+                   "vue transportée par groupe + ouïe, toucher, bras imaginés depuis la même scène)")
+    p.add_argument("--oi_from", type=int, default=0, help="pas où elle commence"); p.add_argument("--oi_warm", type=int, default=6000, help="échauffement SANS déplacement (sinon faux décalage global)")
+    p.add_argument("--oi_grow", type=int, default=14000, help="puis l'horizon grandit de 1 à --oi_kmax pas sur ce nombre de pas"); p.add_argument("--oi_kmax", type=int, default=12)
+    p.add_argument("--oi_lr", type=float, default=2e-4); p.add_argument("--oi_still", type=float, default=0.005); p.add_argument("--oi_sens_from", type=int, default=0, help="pas où les SENS imaginés commencent à apprendre (étape 6)")
+    p.add_argument("--oi_sens_w", type=float, default=1.0); p.add_argument("--oi_nce", type=float, default=0.5, help="perte de contraste latente sur les sens imaginés (pilote 2 : 0.83 → 0.97)")
+    p.add_argument("--oi_eye", type=int, default=0, help="0 = l'imagination lit l'œil-CIBLE (aucun gradient vers l'œil, comme les pilotes) ; 1 = elle lit l'œil EN LIGNE (l'œil apprend aussi à être imaginable)")
+    p.add_argument("--oi_eval", type=int, default=1000, help="scènes de l'examen de l'imagination par objet")
+    p.add_argument("--gate", type=int, default=0, help="1 = ARRÊT (avec sauvegarde) en fin d'étape si le critère de l'étape n'est pas atteint (sinon il est seulement affiché)")
     p.add_argument("--scale1_share", type=float, default=0.0, help="part des lots de jeu avec des objets de taille 1 (le reste : --obj_scale) — la tâche Push-T garde un T de taille 1")
     p.add_argument("--push_share", type=float, default=0.0, help="ESSAI : part de chaque lot prise parmi les séquences où il a senti un contact (avec --curious > 1 : "
                    "le tri se fait dans le lot élargi) — peut-il APPRENDRE à déplacer l'objet en imagination quand il ne voit presque que des poussées ?")
@@ -635,7 +650,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"obj_scale": a.obj_scale} if a.obj_scale != 1.0 else {}), **({"nohand": True} if a.goal_w > 0 and a.goal_nohand else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"obj_scale": a.obj_scale} if a.obj_scale != 1.0 else {}), **({"nohand": True} if (a.goal_w > 0 and a.goal_nohand) or a.hand_hidden > 0 else {}))
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
@@ -644,7 +659,7 @@ def main():
           f"| commande -> prédicteur seulement | étapes {dict(zip(ORDER, list(starts)))}", flush=True)
     probes = build_probes(a, nv, npf, dev)
     print(f"sonde PIXELS bruts (repère) : main {probes['pix'][0]:.1f} %, objet {probes['pix'][1]:.1f} % de la largeur ({time.time() - t0:.0f}s)", flush=True)
-    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal), a.goal_k if a.goal_w > 0 else 0, int(a.move_w > 0), int(a.comove_w > 0), int(a.flow_w > 0)).to(dev)
+    torch.manual_seed(a.seed); m = Baby0(din, nv, npf, a.d, a.nl, a.nh, a.pred_layers, bool(a.sep), a.inv_head, bool(a.resid), bool(a.std_tgt), bool(a.split), a.levels, a.regs, bool(a.reg_frame), bool(a.causal), a.goal_k if a.goal_w > 0 else 0, int(a.move_w > 0), int(a.comove_w > 0), int(a.flow_w > 0), int(a.oi_w > 0)).to(dev)
     tgt = copy.deepcopy(m.enc).eval()
     for p_ in tgt.parameters(): p_.requires_grad_(False)
     if a.freeze_eye:
@@ -653,12 +668,14 @@ def main():
     mparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("mv_")]         # SENS DU MOUVEMENT (neuf) : même taux que la tête neuve
     cparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("co_")]         # MOUVEMENT COMMUN (neuf) : groupe à part, ajouté en dernier
     fparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("fl_")]         # OÙ ÇA VA (neuf) : groupe à part, ajouté après
-    opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith(("goal.", "mv_", "co_", "fl_"))]}]
+    oparams = [q for n_, q in m.named_parameters() if q.requires_grad and n_.startswith("oi.")]         # IMAGINATION PAR OBJET (bébé v2) : son propre taux, son propre calendrier
+    opt = torch.optim.AdamW([{"params": [q for n_, q in m.named_parameters() if q.requires_grad and not n_.startswith(("goal.", "mv_", "co_", "fl_", "oi."))]}]
                             + ([{"params": gparams, "goal": True}] if gparams else []) + ([{"params": mparams, "goal": True}] if mparams else [])
-                            + ([{"params": cparams, "goal": True}] if cparams else []) + ([{"params": fparams, "goal": True}] if fparams else []), a.lr, weight_decay=0.05)
+                            + ([{"params": cparams, "goal": True}] if cparams else []) + ([{"params": fparams, "goal": True}] if fparams else [])
+                            + ([{"params": oparams, "oi": True, "weight_decay": 0.01}] if oparams else []), a.lr, weight_decay=0.05)
     cfg = dict(P=a.P, d=a.d, nl=a.nl, nh=a.nh, pred_layers=a.pred_layers, sep=a.sep, din=din, budgets=bud, world="av_world0", inv_head=a.inv_head,
                resid=a.resid, std_tgt=a.std_tgt, wkw=wkw, T=T, blocks=a.blocks, surprise_w=a.surprise_w, split=a.split, freeze_eye=a.freeze_eye, ctx_w=a.ctx_w, motion_w=a.motion_w, ctx_on=a.ctx_on, levels=a.levels, low_w=a.low_w, regs=a.regs, reg_frame=a.reg_frame, causal=a.causal, fut_share=a.fut_share, touch_share=a.touch_share, blind=a.blind, curious=a.curious, goal_k=a.goal_k if a.goal_w > 0 else 0, goal_nohand=a.goal_nohand, mv=int(a.move_w > 0), mv_thr=a.move_thr, mv_pos=a.move_pos, co=int(a.comove_w > 0))
-    cfg["fl"] = int(a.flow_w > 0); cfg["hand_hidden"] = a.hand_hidden; cfg["scale1_share"] = a.scale1_share
+    cfg["fl"] = int(a.flow_w > 0); cfg["hand_hidden"] = a.hand_hidden; cfg["scale1_share"] = a.scale1_share; cfg["oi"] = int(a.oi_w > 0); cfg["womb"] = a.womb
     state = dict(it=0, hist=[], exams=[])
     fresh_opt = False
     if os.path.exists(a.ckpt):
@@ -668,7 +685,7 @@ def main():
         if fresh: m.load_state_dict({k: w for k, w in ck["m"].items() if not k.startswith("pred.")}, strict=False); print("œil repris, prédicteur CORPS / MONDE neuf", flush=True)
         else:
             res_ = m.load_state_dict(ck["m"], strict=False)            # une tête GESTES MANQUANTS neuve peut manquer au ckpt (rien d'autre)
-            bad_ = [k for k in res_.missing_keys if not k.startswith(("goal.", "mv_", "co_", "fl_"))] + list(res_.unexpected_keys)
+            bad_ = [k for k in res_.missing_keys if not k.startswith(("goal.", "mv_", "co_", "fl_", "oi."))] + list(res_.unexpected_keys)
             assert not bad_, f"reprise : clés incompatibles {bad_[:5]}"
             new_goal = any(k.startswith("goal.") for k in res_.missing_keys)
             if new_goal: fresh_opt = True; print("tête GESTES MANQUANTS neuve (le reste repris ; optimiseur neuf)", flush=True)
@@ -699,7 +716,7 @@ def main():
         return (F.smooth_l1_loss(pf.float(), y, reduction="none", beta=0.25).sum(-1) * w).sum() / w.sum().clamp_min(1.0)
     def fl_px(pf, y, w):                                              # erreur en px sur les cases qui bougent (w > 0)
         return float(((pf.detach().float() - y).norm(dim=-1) * 4 * w).sum() / w.sum().clamp_min(1e-6))
-    fl_hist = []
+    fl_hist = []; oi_hist = []; oi_exam = None
     def comove_loss(zc, cidx, FL, k=3):
         """MOUVEMENT COMMUN : latents EN LIGNE (gradient vers l'œil) de la dernière image vue t0 de chaque ligne (t0 ≤ T-2, la suite n'est pas vue)
         -> pour chaque paire de cases de t0 : bougent-elles ENSEMBLE dans les k images qui suivent ? Seules les cases IMMOBILES de t0-1 à t0 comptent
@@ -725,6 +742,7 @@ def main():
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
+        if it <= a.womb: v = dict(sigma=3.0, gray=1.0, contrast=0.0)   # DANS LE VENTRE : il ne voit rien (image uniforme) ; il bouge, s'entend, sent son bras
         fe = min(1.0, (it - starts[4]) / max(1, (a.world_end or a.total) - starts[4]))   # avancement dans 0e (figé après --world_end)
         if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + (0.3 if a.calm == 2 else 0.4) * fe}.get(stage, 0.0)
         if a.calm == 1: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - fe)}.get(stage, 1.0)
@@ -737,6 +755,8 @@ def main():
             lr_f = min(1.0, (it - a.lr_restart) / 1000) * a.lr_peak * (0.05 + 0.95 * (1 + math.cos(math.pi * u)) / 2)
         for g in opt.param_groups:
             g["lr"] = a.lr * lr_f
+            if g.get("oi"):                                          # IMAGINATION PAR OBJET : montée sur 500 pas à partir de --oi_from, puis cosinus jusqu'à la fin
+                ko_ = it - a.oi_from; g["lr"] = a.oi_lr * min(1.0, ko_ / 500) * (0.05 + 0.95 * (1 + math.cos(math.pi * ko_ / max(1, a.total - a.oi_from))) / 2) if ko_ > 0 else 0.0; continue
             if g.get("goal"):                                        # tête GESTES MANQUANTS : même forme de cycle, sans le --lr_peak de la relance
                 if a.lr_restart and it > a.lr_restart:
                     u_ = (it - a.lr_restart) / max(1, a.total - a.lr_restart)
@@ -932,10 +952,31 @@ def main():
                         r2 = lambda p_, y_: float(1 - ((p_ - y_) ** 2).sum() / ((y_ - y_.mean((0, 1), keepdim=True)) ** 2).sum().clamp_min(1e-8))
                         hc = contact[:, t0g + 1:t0g + Kg + 1].amax(1) > 0
                         goal_hist.append((r2(pg, yg), r2(pg[:, :1], yg[:, :1]), r2(pg[hc], yg[hc]) if int(hc.sum()) > 4 else float("nan"), Kg))
+            ol = torch.zeros((), device=dev)
+            if a.oi_w > 0 and it > a.oi_from:                            # ÉTAPES 5–6 : imaginer les objets PAS À PAS (un geste, une image), puis tous les sens depuis la même scène imaginée
+                ko = it - a.oi_from; km = 1 if ko <= a.oi_warm else int(min(a.oi_kmax, 1 + (a.oi_kmax - 1) * (ko - a.oi_warm) / max(1, a.oi_grow)))
+                kp_ = np.arange(1, km + 1, dtype=float); k_o = int(rng.choice(km, p=kp_ / kp_.sum())) + 1; t_o = int(rng.integers(3, T - k_o))
+                zf_ = z.float(); Zv = zf_[:, :nv].view(B, T, npf, -1); Zs = zf_[:, nv:].view(B, 3, T, -1); Z0 = Zv[:, t_o]
+                if a.oi_eye:                                             # l'œil EN LIGNE voit le passé jusqu'à t : ses cases de l'image t (le gradient remonte dans l'œil)
+                    ci_o = torch.from_numpy(np.where(fr_np <= t_o)[0]).to(dev).expand(B, -1)
+                    with torch.autocast("cuda", dtype=ADT, enabled=AMP_ON): zo_ = m.enc(_gather(tok, ci_o), ci_o)
+                    Z0 = F.layer_norm(zo_[:, (ci_o[0] >= t_o * npf) & (ci_o[0] < (t_o + 1) * npf)].float(), (a.d,))
+                sens_on = it > a.oi_sens_from
+                pl_, f_o, o_o, (_, _, SN_) = m.oi.roll(Z0, cmd.float(), tok[:, nv + 2 * T:, :4].float(), tok[:, nv + T:nv + 2 * T, :8].float(), t_o, k_o, zero_flow=ko <= a.oi_warm, sens=Zs[:, :, t_o] if sens_on else None)
+                ol = sum(F.smooth_l1_loss(q, Zv[:, t_o + j + 1], beta=0.1) for j, q in enumerate(pl_)) / k_o + a.oi_still * f_o.abs().mean() / k_o
+                oi_c = [float(F.smooth_l1_loss(pl_[-1].detach(), Zv[:, t_o + k_o], beta=0.1)), float(F.smooth_l1_loss(Zv[:, t_o], Zv[:, t_o + k_o], beta=0.1)), float(f_o.detach().norm(dim=-1).mean()) * a.P, float(km), float("nan")]
+                if sens_on:
+                    sl_ = sum(F.smooth_l1_loss(x, Zs[:, :, t_o + j + 1], beta=0.1) for j, x in enumerate(SN_)) / k_o; ol = ol + a.oi_sens_w * sl_; oi_c[4] = float(sl_)
+                    if a.oi_nce > 0:                                     # contraste : le sens imaginé de CETTE scène, pas celui des autres scènes du lot
+                        for j, x in enumerate(SN_):
+                            y_ = Zs[:, :, t_o + j + 1]; mu_ = y_.mean(0, keepdim=True); lg_ = torch.einsum("bsd,csd->sbc", F.normalize(x - mu_, dim=-1), F.normalize(y_ - mu_, dim=-1)) / 0.1
+                            ol = ol + a.oi_nce * F.cross_entropy(lg_.reshape(-1, lg_.size(-1)), torch.arange(lg_.size(-1), device=dev).repeat(3)) / k_o
+                oi_hist.append(oi_c)
+                if len(oi_hist) > 1000: del oi_hist[:-500]
             sr = torch.zeros((), device=dev)
             if a.sig_w > 0 and not a.freeze_eye:
                 with torch.autocast("cuda", enabled=False): sr = sigreg(torch.cat(summ).float())
-            loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl + a.move_w * (ml_r + ml_i + ml_k) + a.comove_w * co_l + a.flow_w * (fl_r + fl_i + fl_k)
+            loss = jl + a.inv_w * il + a.sig_w * sr + a.act_w * al + rl + cw * cl + a.low_w * ll + a.roll_w * ro_l + a.goal_w * gl + a.move_w * (ml_r + ml_i + ml_k) + a.comove_w * co_l + a.flow_w * (fl_r + fl_i + fl_k) + a.oi_w * ol
             if a.flow_w > 0:
                 fl_hist.append(fe_ + [float(mvf_.mean())])
                 if len(fl_hist) > 1000: del fl_hist[:-500]
@@ -950,7 +991,8 @@ def main():
                 if len(roll_obj_hist) > 1000: del roll_obj_hist[:-500]
             scaler.scale(loss / a.accum).backward()
         scaler.unscale_(opt)                                                  # (fp16 : gradients remis à l'échelle AVANT l'écrêtage ; sinon sans effet)
-        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith(('goal.', 'mv_head.', 'co_', 'fl_'))], 1.0)
+        torch.nn.utils.clip_grad_norm_([q for n_, q in m.named_parameters() if not (a.inv_clip and n_.startswith('inv.')) and not n_.startswith(('goal.', 'mv_head.', 'co_', 'fl_', 'oi.'))], 1.0)
+        if a.oi_w > 0: torch.nn.utils.clip_grad_norm_(m.oi.parameters(), 1.0)                # l'imagination par objet à part
         if a.move_w > 0: torch.nn.utils.clip_grad_norm_(m.mv_head.parameters(), 1.0)   # la tête du mouvement à part (elle n'apprend que sur les vrais latents)
         if a.goal_w > 0: torch.nn.utils.clip_grad_norm_(m.goal.parameters(), 1.0)
         if a.flow_w > 0: torch.nn.utils.clip_grad_norm_(m.fl_head.parameters(), 1.0)
@@ -969,6 +1011,10 @@ def main():
             fh_ = np.nanmean(np.array(fl_hist[-500:]), 0)
             print(f"      OÙ ÇA VA (déplacement par case, erreur en px sur les cases qui bougent ; « ne rien dire » ≈ leur déplacement moyen) | vrai {fh_[0]:.2f} | imaginé {fh_[1]:.2f} | déroulé {fh_[2]:.2f} "
                   f"| pertes {ma[12]:.3f} / {ma[13]:.3f} / {ma[14]:.3f} | cases qui bougent {fh_[3]:.1%}", flush=True)
+        if it % 500 == 0 and oi_hist:
+            oh_ = np.nanmean(np.array(oi_hist[-500:], dtype=np.float64), 0)
+            print(f"      IMAGINATION PAR OBJET (pas à pas, horizon jusqu'à {int(oh_[3] + 0.5)}{', échauffement sans déplacement' if it - a.oi_from <= a.oi_warm else ''}) | erreur latente au dernier pas {oh_[0]:.4f} "
+                  f"(recopier {oh_[1]:.4f}) | déplacement moyen {oh_[2]:.2f} px" + (f" | SENS imaginés (ouïe, toucher, bras) {oh_[4]:.4f}" if it > a.oi_sens_from else ""), flush=True)
         if it % 500 == 0 and roll_hist:
             rh_ = np.array(roll_hist[-500:]); print("      DÉROULE (erreur par pas, en repartant de son imagination) : " + " | ".join(f"pas {k + 1} {x:.4f}" for k, x in enumerate(rh_.mean(0))), flush=True)
             if roll_obj_hist:
@@ -991,8 +1037,28 @@ def main():
         if it % a.exam_every == 0 or end_stage or it == a.total:
             m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
+            crit_ok = True
+            if end_stage and stage in CRIT:                           # CRITÈRE DE PASSAGE de l'étape (bébé v2 : affiché ; avec --gate 1, arrêt s'il n'est pas atteint)
+                nm_c, key_c, thr_c = CRIT[stage]; crit_ok = r[key_c] >= thr_c
+                print(f">>> CRITÈRE de fin d'étape {stage} — {nm_c} : {r[key_c]:.2f} (seuil {thr_c:.2f}) : {'PASSÉ' if crit_ok else 'NON ATTEINT'}", flush=True)
+            if a.oi_w > 0 and it > a.oi_from + a.oi_warm:             # ÉTAPES 5–6 : l'imagination par objet et les sens imaginés, mesurés par les instruments d'av_objimag
+                if oi_exam is None:
+                    import sys, av_objimag
+                    if "av_phase0" in sys.modules: sys.modules["av_phase0"].T = T
+                    def oi_lat(b_):
+                        tk_, cm_ = to_tok0(b_, st, VIEW["0e"], a.P, dev); B_ = len(tk_); za_ = F.layer_norm(tgt(tk_, torch.arange(tk_.size(1), device=dev).expand(B_, -1)).float(), (a.d,))
+                        return za_[:, :nv].view(B_, T, npf, a.d), cm_, tk_[:, nv + 2 * T:, :4], tk_[:, nv + T:nv + 2 * T, :8], za_[:, nv:nv + 3 * T].view(B_, 3, T, a.d)
+                    oi_exam = av_objimag.build_exam(m.oi, oi_lat, {k_: x_ for k_, x_ in wkw.items() if k_ not in ("nohand", "same_col", "circ")}, a.obj_scale, T, nP, a.P, npf, a.oi_eval, a.oi_kmax, 1, 0, 1, lambda s_: print(s_, flush=True), t0)
+                ro_ = oi_exam(f"IMAGINATION PAR OBJET au pas {it}"); state.setdefault("oi_exams", []).append((it, ro_)); g_ = lambda k_: ro_.get(k_, float("nan"))
+                ok5 = g_("amp_k8") >= 0.5 and g_("cos_k8") >= 0.8 and g_("immobile_k8") <= 0.5
+                print(f">>> CRITÈRE étape 5 (imaginer les objets, 8 pas) — objet poussé : {g_('amp_k8'):.0%} de l'amplitude (≥ 50 %), direction {g_('cos_k8'):+.2f} (≥ 0.80), immobile {g_('immobile_k8'):.2f} px (≤ 0.50) : {'PASSÉ' if ok5 else 'NON ATTEINT'}", flush=True)
+                if it > a.oi_sens_from:
+                    ok6 = g_("sens0_pres_k8") >= 0.9 and g_("sens1_pres_k8") >= 0.9
+                    print(f">>> CRITÈRE étape 6 (imaginer avec tous les sens, 8 pas, main près de l'objet) — petit lecteur sur l'imaginé : ouïe {g_('sens0_pres_k8'):.2f}, toucher {g_('sens1_pres_k8'):.2f} (≥ 0.90) : {'PASSÉ' if ok6 else 'NON ATTEINT'} "
+                          f"| lecture du vrai appliquée telle quelle à l'imaginé : ouïe {g_('transport0_pres_k8'):.2f}, toucher {g_('transport1_pres_k8'):.2f} (pour mémoire)", flush=True)
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), state=state, cfg=cfg_s(), norm=st), a.ckpt.replace(".pt", f"_{stage}_{it // 1000}k.pt"))
-        stop = a.stop_at and it >= a.stop_at
+        stop = (a.stop_at and it >= a.stop_at) or (a.gate and end_stage and not crit_ok)
+        if a.gate and end_stage and not crit_ok: print(f"ARRÊT (--gate) : critère de l'étape {stage} non atteint — relancer en allongeant son budget (--budgets) ou avec --gate 0", flush=True)
         if it % a.ckpt_every == 0 or it == a.total or stop:
             torch.save(dict(m=m.state_dict(), tgt=tgt.state_dict(), opt=opt.state_dict(), state=state, cfg=cfg_s(), norm=st), a.ckpt + ".tmp")
             os.replace(a.ckpt + ".tmp", a.ckpt)

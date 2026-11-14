@@ -592,7 +592,8 @@ def main():
     om = None
     if a.objimag:                               # ---------- IMAGINATION PAR OBJET (module sur l'œil gelé)
         from av_objimag import ObjImag
-        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0), senses=cko["cfg"].get("senses", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
+        if a.objimag == "self": assert hasattr(m, "oi"), "--objimag self : bébé v2 (imagination par objet dans le bébé)"; om = m.oi.eval(); cko = dict(it=ck["state"]["it"])   # bébé v2 : elle fait partie du bébé
+        else: cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0), senses=cko["cfg"].get("senses", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
         assert a.goal_img and a.read_level == "top", "--objimag : avec --goal_img (but en image) et l'étage du haut"
         print(f"IMAGINATION PAR OBJET : {a.objimag} (pas {cko['it']}) à la place de l'ancienne imagination pour le coût", flush=True)
     # ---------- 3 & 4 : épisodes
