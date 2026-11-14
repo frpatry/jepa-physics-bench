@@ -112,6 +112,8 @@ def main():
     p.add_argument("--aud_w", type=float, default=1.0)
     p.add_argument("--senses", type=int, default=0, help="1 = TOUS LES SENS (bébé v2, étape 6) : à chaque pas le module imagine aussi l'ouïe, le toucher et le bras (cibles = latents de son œil-cible), "
                    "à partir de la même scène imaginée ; --chain 1"); p.add_argument("--sens_w", type=float, default=1.0)
+    p.add_argument("--sens_nce", type=float, default=0.0, help="poids d'une perte de CONTRASTE sur les sens imaginés (pilote 2, 14 nov. 2026) : le sens imaginé d'une scène doit ressembler au vrai sens de CETTE scène "
+                   "plus qu'à celui des autres scènes du lot (écarts à la moyenne du lot des VRAIS sens) — sans elle il imite le sens « en moyenne » et une lecture trouvée sur le vrai ne marche pas sur l'imaginé")
     p.add_argument("--chain", type=int, default=0, help="1 = PAS À PAS : le module d'un pas enchaîné k fois avec le geste de chaque pas (perte latente à chaque pas)")
     p.add_argument("--init", type=str, default="", help="module de départ (ex. objimag_D17s_v5.pt : horloge, lissage, groupes déjà appris)")
     p.add_argument("--long_pow", type=float, default=0.0, help="tirage des horizons ∝ k^long_pow (0 = uniforme ; 1 = les longs plus souvent)")
@@ -179,13 +181,13 @@ def main():
             if "si0" in R and k >= 4:              # ÉTAPE 6 : ses sens IMAGINÉS disent-ils que l'objet va bouger ? (instrument : sonde linéaire, moitié des scènes pour l'apprendre, l'autre pour lire)
                 from sklearn.linear_model import LogisticRegression; from sklearn.preprocessing import StandardScaler; from sklearn.metrics import roc_auc_score
                 y = (dn > 0.5).numpy(); n_ = len(y); tr_ = np.arange(n_) % 2 == 0; te_ = ~tr_; nr = R["near"].numpy()
-                def pa(X):
-                    X = X.float().numpy(); sc_ = StandardScaler().fit(X[tr_]); pr_ = LogisticRegression(C=0.05, max_iter=300).fit(sc_.transform(X[tr_]), y[tr_]).predict_proba(sc_.transform(X[te_]))[:, 1]
+                def pa(X, X2=None):                # sonde apprise sur X (moitié des scènes), lue sur X2 (l'autre moitié ; par défaut X)
+                    X = X.float().numpy(); X2 = X if X2 is None else X2.float().numpy(); sc_ = StandardScaler().fit(X[tr_]); pr_ = LogisticRegression(C=0.05, max_iter=300).fit(sc_.transform(X[tr_]), y[tr_]).predict_proba(sc_.transform(X2[te_]))[:, 1]
                     a2 = lambda m_: roc_auc_score(y[te_][m_], pr_[m_]) if 0 < y[te_][m_].sum() < m_.sum() else float("nan")
                     return f"{a2(np.ones(te_.sum(), bool)):.2f} (main près de l'objet {a2(nr[te_]):.2f}, loin {a2(~nr[te_]):.2f})"
                 for i_, nm_ in enumerate(("OUÏE", "TOUCHER", "BRAS")):
                     log(f"   t={t} k={k} | {nm_:>7s} imaginé(e) : erreur {float(R[f'se{i_}'].mean()):.3f} (recopier {float(R[f'sc{i_}'].mean()):.3f}) || sonde « l'objet va bouger » ({y.mean():.0%} des scènes, {nr.mean():.0%} près) : "
-                        f"sens VRAI {pa(R[f'sr{i_}'])} | sens IMAGINÉ {pa(R[f'si{i_}'])}")
+                        f"sens VRAI {pa(R[f'sr{i_}'])} | sens IMAGINÉ {pa(R[f'si{i_}'])} | lecture apprise sur le VRAI, appliquée à l'IMAGINÉ {pa(R[f'sr{i_}'], R[f'si{i_}'])}")
             log(f"   t={t} k={k} | « chose » dite sur : objet {float(R['oo'].mean()):.2f}, main {float(R['oh'][R['ht'].abs().sum(-1) >= 0].mean()):.2f}, fond {float(R['ob'].mean()):.2f} | "
                 f"main : vrai {float(R['ht'].norm(dim=-1).mean()):.2f} px, imaginé {float(R['hi'].norm(dim=-1).mean()):.2f}, cos {float(F.cosine_similarity(R['hi'], R['ht'], dim=-1)[R['ht'].norm(dim=-1) > 0.5].mean()):+.2f}")
             for nm, s_ in (("objet jamais touché (immobile)", (dn < 0.3)), ("déplacé de 0.5–2 px", (dn >= 0.5) & (dn < 2)), ("déplacé de 2–4 px", (dn >= 2) & (dn < 4)), ("déplacé de 4–8 px", (dn >= 4) & (dn < 8)), ("déplacé de > 8 px", dn >= 8)):
@@ -207,6 +209,10 @@ def main():
             pl, f, o, (AF, AB, SN) = m.roll(Z[:, t], cmd, prop, tch, t, k, zero_flow=it <= a.warm, aud=au[:, t] if a.audio else None, sens=Zs[:, :, t] if a.senses else None); pr = pl[-1]
             loss = sum(F.smooth_l1_loss(q, Z[:, t + j + 1], beta=0.1) for j, q in enumerate(pl)) / k + a.still_w * f.abs().mean() / k + a.thing_w * o.mean()
             if a.senses: loss = loss + a.sens_w * sum(F.smooth_l1_loss(x, Zs[:, :, t + j + 1], beta=0.1) for j, x in enumerate(SN)) / k
+            if a.senses and a.sens_nce > 0:
+                for j, x in enumerate(SN):
+                    y_ = Zs[:, :, t + j + 1]; mu_ = y_.mean(0, keepdim=True); lg = torch.einsum("bsd,csd->sbc", F.normalize(x - mu_, dim=-1), F.normalize(y_ - mu_, dim=-1)) / 0.1
+                    loss = loss + a.sens_nce * F.cross_entropy(lg.reshape(-1, lg.size(-1)), torch.arange(lg.size(-1), device=dev).repeat(3)) / k
             if a.audio: loss = loss + a.aud_w * sum(F.smooth_l1_loss(x, Za[:, t + j + 1], beta=0.1) + F.smooth_l1_loss(y, Za[:, t + j + 1], beta=0.1) for j, (x, y) in enumerate(zip(AF, AB))) / k
         else:
             pr, f, o = m(Z[:, t], cd, t, k, zero_flow=it <= a.warm); loss = F.smooth_l1_loss(pr, Z[:, t + k], beta=0.1) + a.still_w * f.abs().mean() + a.thing_w * o.mean()   # + légers a priori

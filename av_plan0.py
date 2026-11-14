@@ -203,14 +203,15 @@ def snd_report(L, Hh, log, ks=("ah", "ar", "a0", "pj", "pjr"), nom="OUÏE"):
     rel = np.concatenate([np.repeat(x["rel"][None], k, 0) for k, x in zip(n_, L)]); gap = np.concatenate([np.full(k, x["gap"]) for k, x in zip(n_, L)])
     te = ep >= ep.max() - max(1, (ep.max() + 1) // 3) + 1; tr = ~te
     log(f"      {nom} IMAGINÉ(E) ({len(L)} relevés, {n} plans de {Hh} gestes joués pour de vrai ; « glisse » = l'objet bouge de > 0.5 px : {y.mean():.0%} des plans ; sondes entraînées sur {tr.sum()} plans, lues sur {te.sum()} plans d'autres épisodes)")
-    def probe(X):
-        sc = StandardScaler().fit(X[tr]); m_ = LogisticRegression(C=0.05, max_iter=300).fit(sc.transform(X[tr]), y[tr]); return m_.predict_proba(sc.transform(X[te]))[:, 1]
+    def probe(X, X2=None):
+        sc = StandardScaler().fit(X[tr]); m_ = LogisticRegression(C=0.05, max_iter=300).fit(sc.transform(X[tr]), y[tr]); return m_.predict_proba(sc.transform((X if X2 is None else X2)[te]))[:, 1]
     auc = lambda s_, m=None: roc_auc_score(y[te] if m is None else y[te][m], s_ if m is None else s_[m]) if (y[te] if m is None else y[te][m]).min() != (y[te] if m is None else y[te][m]).max() else float("nan")
     near = gap[te] < 6
     for nm, X in (("le son VRAIMENT entendu en jouant le plan (plafond)", AR.reshape(n, -1)), ("SON OUÏE IMAGINÉE pour le plan", AH.reshape(n, -1)),
                   ("sans son : les gestes du plan + où est l'objet par rapport à sa main", np.concatenate([cand.reshape(n, -1), rel], 1)),
                   ("ouïe imaginée + gestes + position", np.concatenate([AH.reshape(n, -1), cand.reshape(n, -1), rel], 1))):
         pr = probe(X); log(f"        sonde « ce plan fait glisser l'objet » sur {nm:<70s} : AUC {auc(pr):.2f} | main à moins de 6 px de l'objet : {auc(pr, near):.2f} | plus loin : {auc(pr, ~near):.2f}")
+    pr = probe(AR.reshape(n, -1), AH.reshape(n, -1)); log(f"        LECTURE APPRISE SUR LE VRAI, APPLIQUÉE À L'IMAGINÉ (ce qu'il faut pour jouer sans juge) : AUC {auc(pr):.2f} | main à moins de 6 px de l'objet : {auc(pr, near):.2f} | plus loin : {auc(pr, ~near):.2f}")
     s1 = np.abs(AH - A0).mean((1, 2)); sp = np.linalg.norm(cand, axis=-1).mean(1); s1r = np.abs(AR - A0).mean((1, 2))
     log(f"        SANS SONDE — écart entre l'ouïe imaginée du plan et celle de « ne rien faire » : dit-il que l'objet glisse ? AUC {roc_auc_score(y, s1):.2f} | la vitesse des gestes seule : AUC {roc_auc_score(y, sp):.2f} | "
         f"cet écart suit la vitesse de sa main : corrélation {np.corrcoef(s1, sp)[0, 1]:+.2f} | (même écart avec le son vraiment entendu : AUC {roc_auc_score(y, s1r):.2f})")
