@@ -786,8 +786,9 @@ def main():
             else: pick = torch.multinomial(e_ / e_.sum(), a.bs, replacement=False).cpu()
             cur_stats.append((float(had_c.mean()), float(had_c[pick].mean())))
             bt_ = {k: x[pick] for k, x in bt_.items()}
-        if a.hand_hidden > 0:                                          # MAIN CACHÉE : dans une part des séquences il ne se voit pas (il se sent)
-            assert "XNH" in bt_, "--hand_hidden : le monde doit rendre les images sans sa main (--goal_w > 0 avec --goal_nohand 1)"
+        if a.hand_hidden > 0 and stage in ("0d", "0e"):                # MAIN CACHÉE : dans une part des séquences de JEU il ne se voit pas (il se sent) — pas pendant « mon bras / mes mains »,
+            #   où sa main est la seule chose à voir (1er lancement du bébé v2, 14 nov. 2026 : main cachée dès 0a -> fin 0a « vu ici/senti là » 55 % au lieu de 75–82 %, bras 0 % au lieu de +7 à +36 %)
+            assert "XNH" in bt_, "--hand_hidden : le monde doit rendre les images sans sa main"
             hid_ = torch.from_numpy(rng.random(len(bt_["X"])) < a.hand_hidden)
             bt_ = {**bt_, "X": torch.where(hid_.view(-1, 1, 1, 1, 1), bt_["XNH"], bt_["X"])}
         bt_all = bt_; opt.zero_grad()                                         # ACCUMULATION (--accum k) : le lot est traité en k morceaux (GPU 16 Go : Kaggle/T4)
