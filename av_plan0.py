@@ -256,6 +256,8 @@ def main():
                    "sous sa main le monde est supposé inchangé")
     p.add_argument("--reach_diag", type=int, default=0, help="1 = DIAG DE PORTÉE (14 nov. 2026 : dans tous les essais le T n'est touché que dans les 10–40 premiers gestes) : tous les 5 gestes, "
                    "les plans du 1er tirage sont joués dans des copies du monde — part de ceux qui toucheraient vraiment l'objet, et ce que SON coût en dit, selon l'écart main–objet et le moment")
+    p.add_argument("--sound_w", type=float, default=0.0, help="OUÏE (14 nov. 2026, demande user) : avec un module --objimag qui imagine le son, poids de l'ENVIE de « faire du bruit avec "
+                   "quelque chose » (son imaginé avec la scène − son de son corps seul) face à la ressemblance au but (les deux centrées-réduites entre les plans) ; 0 = il entend seulement")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -548,7 +550,7 @@ def main():
     om = None
     if a.objimag:                               # ---------- IMAGINATION PAR OBJET (module sur l'œil gelé)
         from av_objimag import ObjImag
-        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
+        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
         assert a.goal_img and a.read_level == "top", "--objimag : avec --goal_img (but en image) et l'étage du haut"
         print(f"IMAGINATION PAR OBJET : {a.objimag} (pas {cko['it']}) à la place de l'ancienne imagination pour le coût", flush=True)
     # ---------- 3 & 4 : épisodes
@@ -644,8 +646,13 @@ def main():
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
             if om is not None and a.goal_img and phase != 1:   # IMAGINATION PAR OBJET : Hh pas d'une image, chacun avec son geste, depuis la dernière image VUE
                 with torch.no_grad():
-                    pl, _, _ = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh)
-                    return gcost(pl[-1], Hh, cand)
+                    au_ = LN(tgt(tok, torch.arange(tok.size(1), device=dev)[None]))[:, nv + t].expand(K, -1) if om.audio else None      # ce qu'il ENTEND maintenant (latent d'ouïe)
+                    pl, _, _, (AF, AB) = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, aud=au_)
+                    c_ = gcost(pl[-1], Hh, cand)
+                    if a.sound_w > 0 and om.audio:   # ENVIE DE FAIRE DU BRUIT AVEC QUELQUE CHOSE : son imaginé avec la scène − son que ferait son corps seul, sommé sur le plan
+                        e_ = torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).sum(0)
+                        c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sound_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
+                    return c_
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
                 with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh, cand)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
@@ -699,6 +706,7 @@ def main():
             if a.task == "pusht": return env.coverage() >= a.cov if a.cov > 0 else lax_now()
             return env.touched if a.task == "toucher" else (env.dist() <= 0 if a.task in ("bouger", "direction") else env.dist() < succ)
         cmax, lax_hit = 0.0, False                                       # PUSH-T : couverture MAX atteinte, ancienne règle atteinte à un moment
+        torch.manual_seed(7000 + ep); PL = []                            # tirages du planificateur FIXÉS par épisode (deux lancements = mêmes plans) ; PL : relevé de JEU par geste
         while env.t < min(EL - 1, a.plan_c + a.plan_steps):         # même nombre de gestes quelle que soit T
             if a.task == "pusht": cmax, lax_hit = max(cmax, env.coverage()), lax_hit or lax_now()
             if a.stop_success and ok_now(): break                    # réussi : l'épisode s'arrête (règle du vrai Push-T)
@@ -761,7 +769,8 @@ def main():
                         film.append(dict(t=int(env.t), X=env.X[env.t].copy(), P=env.P.copy(), Hp=env.Hp.copy(), now=now, im=im, re=re, act=np.asarray(act),
                                          phase=cost.phase, sub=None if cost.sub is None else cost.sub.cpu().numpy(), g=ref,
                                          qi=qty(im[-1], ref), qr=qty(re[-1], env.P if a.task in ("bouger", "direction") else ref)))
-            env.step(np.asarray(act, np.float32))
+            P0_, a0_ = env.P.copy(), env.ang; env.step(np.asarray(act, np.float32)); rel_ = env.Hp - env.P
+            PL.append((float(np.linalg.norm(env.P - P0_)) > 1e-4 or abs(env.ang - a0_) > 1e-4, (float(np.linalg.norm(rel_)) - env.rc - env.Rh) * H, int(((math.degrees(math.atan2(rel_[1], rel_[0])) + 45) % 360) // 90), env.dist()))
         ok = ok_now()                                                    # PUSH-T : couverture (ou ancienne règle si --cov 0)
         cv = env.coverage() if a.task == "pusht" else np.nan
         if a.task == "pusht": cmax, lax_hit = max(cmax, cv), lax_hit or lax_now()
@@ -770,7 +779,10 @@ def main():
                      f"{a.task} | {'bebe' if policy == 'MPC' else policy} | ep. {ep} | {'REUSSI' if ok else 'rate'}" + (f" | couv. max {cmax:.0%}" if a.task == "pusht" else ""),
                      cov=a.task == "pusht", max_frames=a.gif_frames)
         if a.stop_success: steps_used.append(env.t - a.plan_c if ok else -1)
-        return d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit)
+        PL = np.array(PL, float) if len(PL) else np.zeros((1, 4)); pu = np.nonzero(PL[:, 0] > 0)[0]; bo = np.split(pu, np.nonzero(np.diff(pu) > 3)[0] + 1) if len(pu) else []   # poussées = suites de gestes où l'objet bouge
+        good = np.mean([PL[b_[-1], 3] < PL[max(b_[0] - 1, 0), 3] for b_ in bo]) if bo else np.nan
+        return (d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit),
+                float(PL[:, 0].mean()), float(len(bo)), float(len({int(PL[b_[0], 2]) for b_ in bo})), float(np.mean(PL[:, 1] < 3)), good, float(pu.max() if len(pu) else -1))
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
     reach_log = []                                                      # --reach_diag : (geste, écart main–objet px, part des plans qui toucheraient, écart-type du coût, coût touchent − ne touchent pas, coût moyen)
     def cov_line(res):                                                  # PUSH-T : couverture (finale, MAX = mesure de Diffusion Policy), seuils, ancienne règle
@@ -778,6 +790,11 @@ def main():
         cf, cm = res[:, 3], res[:, 4]
         print(f"   {'':>10s}   couverture du T-but : finale {cf.mean():.0%} | MAX atteinte {cm.mean():.0%} (médiane {np.median(cm):.0%}) | MAX ≥ 50 % : {np.mean(cm >= 0.5):.0%}, "
               f"≥ 80 % : {np.mean(cm >= 0.8):.0%}, ≥ 95 % : {np.mean(cm >= 0.95):.0%} | ancienne règle (< 0.06 et < 20°) atteinte : {np.mean(res[:, 5]):.0%}", flush=True)
+    def play_line(res):                                                 # JEU (critère user du 14 nov. 2026) : joue-t-il avec l'objet, y revient-il, change-t-il de côté ?
+        if res.shape[1] < 12 or not has_obj: return
+        print(f"   {'':>10s}   JEU avec l'objet : gestes où il le fait bouger {res[:, 6].mean():.1%} | poussées distinctes par épisode {res[:, 7].mean():.1f} | côtés différents d'où il pousse {res[:, 8].mean():.1f} "
+              f"(≥ 2 côtés dans {np.mean(res[:, 8] >= 2):.0%} des épisodes) | bord de main à moins de 3 px de l'objet {res[:, 9].mean():.0%} du temps | poussées qui RAPPROCHENT du but {np.nanmean(res[:, 10]):.0%} "
+              f"| dernier geste où il le touche (médiane) {int(np.median(res[:, 11]))}", flush=True)
     EL = a.plan_c + a.plan_steps + 1 if a.slide else T                  # durée d'un épisode (fenêtre qui glisse si > T)
     succ = 0.04 if a.task.startswith("main") else 0.06
     near = 3.0 / H                                                       # critère « PRÈS » (bébé de 4–6 mois : arrive près puis corrige) : à moins de 3 px
@@ -860,7 +877,7 @@ def main():
         steps_used.clear(); tp = time.time(); res = np.array([run(e, pol) for e in range(a.episodes)])
         print(f"   {pol:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
         if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
-        cov_line(res)
+        cov_line(res); play_line(res)
     hs = [int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]
     sgs = [int(x) for x in a.subgoals.split(",")] if a.subgoals else [a.subgoal]
     cas = [int(x) for x in a.cost_alls.split(",")] if a.cost_alls else [a.cost_all]
@@ -871,7 +888,7 @@ def main():
             steps_used.clear(); tp = time.time(); res = np.array([run(e, "MPC", recs[e] if e < a.dump_n else None, S, films[e] if e < a.film else None) for e in range(a.episodes)])
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
             if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
-            cov_line(res)
+            cov_line(res); play_line(res)
             if a.reach_diag and reach_log:      # PORTÉE : le coût reçoit-il un signal de l'objet quand la main est loin ?
                 RL = np.array(reach_log, float); reach_log.clear()
                 print(f"      PORTÉE ({len(RL)} relevés, horizon {h_}, {a.pop} plans du 1er tirage joués pour de vrai) — écart = distance entre le bord de sa main et celui de l'objet", flush=True)
