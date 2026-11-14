@@ -214,6 +214,11 @@ def snd_report(L, Hh, log):
     s1 = np.abs(AH - A0).mean((1, 2)); sp = np.linalg.norm(cand, axis=-1).mean(1); s1r = np.abs(AR - A0).mean((1, 2))
     log(f"        SANS SONDE — écart entre l'ouïe imaginée du plan et celle de « ne rien faire » : dit-il que l'objet glisse ? AUC {roc_auc_score(y, s1):.2f} | la vitesse des gestes seule : AUC {roc_auc_score(y, sp):.2f} | "
         f"cet écart suit la vitesse de sa main : corrélation {np.corrcoef(s1, sp)[0, 1]:+.2f} | (même écart avec le son vraiment entendu : AUC {roc_auc_score(y, s1r):.2f})")
+    if "pj" in L[0]:                           # la DIRECTION « ça glisse » tirée de ses latents (glisse − immobile, sans entraînement) : l'ouïe imaginée projetée dessus
+        PJ, PJR = f32("pj"), f32("pjr"); wi = lambda k, f_: np.nanmean([roc_auc_score(x["mv"] > 0.5, f_(x[k])) for x in L if 0 < (x["mv"] > 0.5).sum() < len(x["mv"])])
+        log(f"        DIRECTION « ça glisse » (sans sonde, sans entraînement) — ouïe IMAGINÉE projetée : AUC moyenne sur le plan {roc_auc_score(y, PJ.mean(1)):.2f}, max {roc_auc_score(y, PJ.max(1)):.2f} | "
+            f"ENTRE LES PLANS D'UN MÊME RELEVÉ (ce que voit le planificateur) : moyenne {wi('pj', lambda z: z.mean(1)):.2f}, max {wi('pj', lambda z: z.max(1)):.2f} | "
+            f"son VRAIMENT entendu projeté : {roc_auc_score(y, PJR.mean(1)):.2f}, max {roc_auc_score(y, PJR.max(1)):.2f} (même relevé : {wi('pjr', lambda z: z.mean(1)):.2f}) | projection et vitesse de sa main : corrélation {np.corrcoef(PJ.mean(1), sp)[0, 1]:+.2f}")
     e_ = np.abs(AH - AR).mean((1, 2)); e0 = np.abs(A0 - AR).mean((1, 2))
     log(f"        justesse de l'ouïe imaginée (écart au son vraiment entendu) : plans où l'objet GLISSE {e_[y].mean():.3f} (« ne rien faire » {e0[y].mean():.3f}) | plans où il ne bouge pas {e_[~y].mean():.3f} (« ne rien faire » {e0[~y].mean():.3f})")
     log(f"        le son vraiment entendu change-t-il quand l'objet glisse ? écart moyen entre deux plans du même relevé : {np.mean([np.abs(x['ar'].astype(np.float32)[x['mv'] > 0.5].mean(0) - x['ar'].astype(np.float32)[x['mv'] <= 0.5].mean(0)).mean() for x in L if (x['mv'] > 0.5).any() and (x['mv'] <= 0.5).any()]):.3f} (glisse − ne glisse pas, VRAI) | "
@@ -287,7 +292,8 @@ def main():
     p.add_argument("--snd_goal", type=int, default=0, help="BUT SONORE (14 nov. 2026, idée user : le bébé a grandi avec le son, pas d'entraînement en plus — on lui DONNE le son au "
                    "moment de décider) : l'ouïe de chaque plan est imaginée par le BÉBÉ lui-même (son imagination d'origine) et comparée au son d'une suite voulue, encodée par son œil-cible. "
                    "1 = le son du CHEMIN (le T glisse d'ici vers le but puis se tait ; l'image-but reste « le monde saute au but ») ; 2 = le GLISSEMENT FINAL (le but montré est une suite : "
-                   "le T arrive au but en glissant sur les 3 dernières images, avec son bruit ; l'image-but ET le son viennent de cette suite)")
+                   "le T arrive au but en glissant sur les 3 dernières images, avec son bruit ; l'image-but ET le son viennent de cette suite) ; 3 = CRITÈRE DE CHEMIN : la direction « ça glisse » de ses latents d'ouïe (la suite entendue avec l'objet qui glisse − immobile), "
+                   "son ouïe imaginée projetée dessus, à côté de l'image-but")
     p.add_argument("--snd_diag", type=int, default=0, help="1 = DIAG DE L'OUÏE IMAGINÉE (14 nov. 2026) : tous les 5 gestes, les plans du 1er tirage sont joués dans des copies du monde ; "
                    "SON ouïe imaginée pour chaque plan dit-elle que le plan fera vraiment glisser l'objet ? (face au son vraiment entendu, et aux gestes seuls)")
     p.add_argument("--snd_w", type=float, default=1.0, help="--snd_goal : poids du son face à l'image (les deux centrés-réduits entre les plans)")
@@ -629,20 +635,29 @@ def main():
             dpx = np.abs(gf - (env.XN if a.mask_hand else EX)[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
             gmask = torch.from_numpy(dpx > 0.15).to(dev)
             if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
-        za_g = None
-        if a.snd_goal and a.goal_img:           # BUT SONORE : une suite voulue (images + son du T qui glisse), entendue par son œil-cible -> latents d'ouïe à t+1 .. t+Hh
+        za_g = sdir = sref = None
+        if (a.snd_goal or a.snd_diag) and a.goal_img:   # BUT SONORE : une suite voulue (images + son du T qui glisse), entendue par son œil-cible -> latents d'ouïe à t+1 .. t+Hh
             dg_ = env.g - env.P; dn_ = float(np.linalg.norm(dg_)) + 1e-9; da_ = (env.g_ang - env.ang + math.pi) % (2 * math.pi) - math.pi; jj = np.arange(T)
-            if a.snd_goal == 1: fq = np.clip((jj - t) * a.snd_v / dn_, 0, 1)                                  # 1 : il glisse d'ici vers le but, puis se tait
-            else: fq = 1 - np.clip(t + Hh - jj, 0, 2) * min(a.snd_v, dn_ / 2) / dn_                             # 2 : posé juste avant le but, il y ARRIVE en glissant (3 images)
-            Pq = (env.P[None] + fq[:, None] * dg_[None]).astype(np.float32); Aq = env.ang + fq * da_
-            if a.snd_goal == 1: Pq[:t + 1] = env.POS[s0:s0 + t + 1]
-            Xs = EX[s0:s0 + T].copy()
-            for j in range(t + 1, T): Xs[j] = env.frame(Pq[j], env.Hp, float(Aq[j]), hand=bool(a.goal_hand))
-            rs_ = env.rng.bit_generator.state; bs = env.batch(s0, nohand=not a.see_hand, pos=Pq, vfut=a.snd_hand); env.rng.bit_generator.state = rs_   # (le hasard du monde n'est pas consommé)
-            bs["X"] = torch.from_numpy((Xs * 255).round().astype(np.uint8))[None]
-            with torch.no_grad():
-                tks, _ = to_tok0(bs, st, v, P_, dev); za_g = LN(tgt(tks, torch.arange(tks.size(1), device=dev)[None]))[0, nv + t + 1:nv + t + Hh + 1]   # (Hh, d)
-                if a.snd_goal == 2: zg_all = teachN(tks[:, :nv], torch.arange(nv, device=dev)[None]).view(T, npf, dR)
+            def heard_seq(Pq, Aq):                # la suite (objet en Pq, tourné de Aq) vue et ENTENDUE par son œil-cible -> ouïe (Hh, d), jetons
+                Xs = EX[s0:s0 + T].copy()
+                for j in range(t + 1, T): Xs[j] = env.frame(Pq[j], env.Hp, float(Aq[j]), hand=bool(a.goal_hand))
+                rs_ = env.rng.bit_generator.state; bs = env.batch(s0, nohand=not a.see_hand, pos=Pq, vfut=a.snd_hand); env.rng.bit_generator.state = rs_   # (le hasard du monde n'est pas consommé)
+                bs["X"] = torch.from_numpy((Xs * 255).round().astype(np.uint8))[None]
+                with torch.no_grad():
+                    tks, _ = to_tok0(bs, st, v, P_, dev); return LN(tgt(tks, torch.arange(tks.size(1), device=dev)[None]))[0, nv + t + 1:nv + t + Hh + 1], tks
+            if a.snd_goal in (1, 2):
+                if a.snd_goal == 1: fq = np.clip((jj - t) * a.snd_v / dn_, 0, 1)                              # 1 : il glisse d'ici vers le but, puis se tait
+                else: fq = 1 - np.clip(t + Hh - jj, 0, 2) * min(a.snd_v, dn_ / 2) / dn_                         # 2 : posé juste avant le but, il y ARRIVE en glissant (3 images)
+                Pq = (env.P[None] + fq[:, None] * dg_[None]).astype(np.float32); Aq = env.ang + fq * da_
+                if a.snd_goal == 1: Pq[:t + 1] = env.POS[s0:s0 + t + 1]
+                za_g, tks = heard_seq(Pq, Aq)
+                if a.snd_goal == 2:
+                    with torch.no_grad(): zg_all = teachN(tks[:, :nv], torch.arange(nv, device=dev)[None]).view(T, npf, dR)
+            if a.snd_goal == 3 or a.snd_diag:     # 3 : la DIRECTION « ça glisse » dans SES latents d'ouïe : la même suite entendue avec l'objet qui glisse − avec l'objet immobile (aucun entraînement)
+                u_ = dg_ / dn_ if dn_ > 0.02 else (0.5 - env.P) / (float(np.linalg.norm(0.5 - env.P)) + 1e-9)
+                Ps = np.clip(env.P[None] + np.clip(jj - t, 0, None)[:, None] * a.snd_v * u_[None], env.rc, 1 - env.rc).astype(np.float32); Ps[:t + 1] = env.POS[s0:s0 + t + 1]
+                Pi = Ps.copy(); Pi[t + 1:] = env.P; A_ = np.full(T, env.ang)
+                sref = heard_seq(Pi, A_)[0]; sdir = F.normalize(heard_seq(Ps, A_)[0] - sref, dim=-1)
         tia = torch.arange(nv + t + 1, nv + t + Hh + 1, device=dev)[:, None]       # ouïe imaginée à t+1 .. t+Hh (une requête par horizon)
         fidx = [torch.from_numpy(np.where(fr == t + hh)[0]).to(dev) for hh in range(1, Hh + 1)]   # TOUS les jetons de l'image t+hh (vue d'abord)
         cs_, cm_ = ctx.float().std(-1).mean(), ctx.float().mean(-1).mean()   # échelle des latents de CONTEXTE (l'imaginé est à l'échelle normalisée)
@@ -706,6 +721,9 @@ def main():
                         ah = imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
                         e_ = ((ah - za_g[None]) ** 2).mean(-1)[:, 0 if a.snd_goal == 1 else Hh - 2:].mean(1)
                         c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) + a.snd_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
+                    if a.snd_goal == 3:               # CRITÈRE DE CHEMIN : son ouïe imaginée va-t-elle dans la direction « ça glisse » ? (à côté de l'image-but)
+                        e_ = ((heard(cand) - sref[None]) * sdir[None]).sum(-1).mean(1)
+                        c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.snd_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
                     return c_
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
                 with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh, cand)
@@ -723,7 +741,7 @@ def main():
         def heard(cand):                        # SON ouïe imaginée (le bébé) à t+1 .. t+Hh pour chaque plan : (K, Hh, d)
             K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
             with torch.no_grad(): return imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
-        cost.heard, cost.s0 = heard, s0
+        cost.heard, cost.s0, cost.sdir, cost.sref = heard, s0, sdir, sref
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
     Kp_ = (a.propose_k or m.goal.kmax) if a.propose else 0
@@ -813,7 +831,8 @@ def main():
                         with torch.no_grad():
                             tkr, _ = to_tok0({k: torch.cat([b[k] for b in bs_]) for k in bs_[0]}, st, v, P_, dev); t_ = env.t - cost.s0
                             ar_ = LN(tgt(tkr, torch.arange(tkr.size(1), device=dev)[None].expand(len(tkr), -1)))[:, nv + t_ + 1:nv + t_ + Hh + 1]
-                        snd_log.append(dict(ep=ep, mv=np.array(mv_), ah=cost.heard(cand).half().cpu().numpy(), ar=ar_.half().cpu().numpy(), a0=cost.heard(torch.zeros_like(cand[:1])).half().cpu().numpy(),
+                        ah_ = cost.heard(cand)
+                        snd_log.append(dict(ep=ep, mv=np.array(mv_), ah=ah_.half().cpu().numpy(), pj=((ah_ - cost.sref[None]) * cost.sdir[None]).sum(-1).cpu().numpy(), pjr=((ar_ - cost.sref[None]) * cost.sdir[None]).sum(-1).cpu().numpy(), ar=ar_.half().cpu().numpy(), a0=cost.heard(torch.zeros_like(cand[:1])).half().cpu().numpy(),
                                             cand=cand.cpu().numpy(), rel=(env.P - env.Hp).astype(np.float32), gap=(float(np.linalg.norm(env.P - env.Hp)) - env.rc - env.Rh) * H))
                     el = seg[c_.argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
