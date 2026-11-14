@@ -194,6 +194,31 @@ def oracle(env):
     else: tgt = behind
     d = tgt - Hp; spd = min(VMAX, float(np.linalg.norm(d))); return np.clip(spd * d / max(np.linalg.norm(d), 1e-6), -VMAX, VMAX).astype(np.float32)
 
+def snd_report(L, Hh, log):
+    """--snd_diag : SON ouïe imaginée pour un plan dit-elle que ce plan fera VRAIMENT glisser l'objet ? (instruments : sondes linéaires, épisodes de test à part)"""
+    from sklearn.linear_model import LogisticRegression; from sklearn.preprocessing import StandardScaler; from sklearn.metrics import roc_auc_score
+    f32 = lambda k: np.concatenate([x[k] for x in L]).astype(np.float32); n_ = [len(x["mv"]) for x in L]
+    mv, AH, AR, cand = f32("mv"), f32("ah"), f32("ar"), f32("cand"); n = len(mv); y = mv > 0.5
+    ep = np.concatenate([np.full(k, x["ep"]) for k, x in zip(n_, L)]); A0 = np.concatenate([np.repeat(x["a0"].astype(np.float32), k, 0) for k, x in zip(n_, L)])
+    rel = np.concatenate([np.repeat(x["rel"][None], k, 0) for k, x in zip(n_, L)]); gap = np.concatenate([np.full(k, x["gap"]) for k, x in zip(n_, L)])
+    te = ep >= ep.max() - max(1, (ep.max() + 1) // 3) + 1; tr = ~te
+    log(f"      OUÏE IMAGINÉE ({len(L)} relevés, {n} plans de {Hh} gestes joués pour de vrai ; « glisse » = l'objet bouge de > 0.5 px : {y.mean():.0%} des plans ; sondes entraînées sur {tr.sum()} plans, lues sur {te.sum()} plans d'autres épisodes)")
+    def probe(X):
+        sc = StandardScaler().fit(X[tr]); m_ = LogisticRegression(C=0.05, max_iter=300).fit(sc.transform(X[tr]), y[tr]); return m_.predict_proba(sc.transform(X[te]))[:, 1]
+    auc = lambda s_, m=None: roc_auc_score(y[te] if m is None else y[te][m], s_ if m is None else s_[m]) if (y[te] if m is None else y[te][m]).min() != (y[te] if m is None else y[te][m]).max() else float("nan")
+    near = gap[te] < 6
+    for nm, X in (("le son VRAIMENT entendu en jouant le plan (plafond)", AR.reshape(n, -1)), ("SON OUÏE IMAGINÉE pour le plan", AH.reshape(n, -1)),
+                  ("sans son : les gestes du plan + où est l'objet par rapport à sa main", np.concatenate([cand.reshape(n, -1), rel], 1)),
+                  ("ouïe imaginée + gestes + position", np.concatenate([AH.reshape(n, -1), cand.reshape(n, -1), rel], 1))):
+        pr = probe(X); log(f"        sonde « ce plan fait glisser l'objet » sur {nm:<70s} : AUC {auc(pr):.2f} | main à moins de 6 px de l'objet : {auc(pr, near):.2f} | plus loin : {auc(pr, ~near):.2f}")
+    s1 = np.abs(AH - A0).mean((1, 2)); sp = np.linalg.norm(cand, axis=-1).mean(1); s1r = np.abs(AR - A0).mean((1, 2))
+    log(f"        SANS SONDE — écart entre l'ouïe imaginée du plan et celle de « ne rien faire » : dit-il que l'objet glisse ? AUC {roc_auc_score(y, s1):.2f} | la vitesse des gestes seule : AUC {roc_auc_score(y, sp):.2f} | "
+        f"cet écart suit la vitesse de sa main : corrélation {np.corrcoef(s1, sp)[0, 1]:+.2f} | (même écart avec le son vraiment entendu : AUC {roc_auc_score(y, s1r):.2f})")
+    e_ = np.abs(AH - AR).mean((1, 2)); e0 = np.abs(A0 - AR).mean((1, 2))
+    log(f"        justesse de l'ouïe imaginée (écart au son vraiment entendu) : plans où l'objet GLISSE {e_[y].mean():.3f} (« ne rien faire » {e0[y].mean():.3f}) | plans où il ne bouge pas {e_[~y].mean():.3f} (« ne rien faire » {e0[~y].mean():.3f})")
+    log(f"        le son vraiment entendu change-t-il quand l'objet glisse ? écart moyen entre deux plans du même relevé : {np.mean([np.abs(x['ar'].astype(np.float32)[x['mv'] > 0.5].mean(0) - x['ar'].astype(np.float32)[x['mv'] <= 0.5].mean(0)).mean() for x in L if (x['mv'] > 0.5).any() and (x['mv'] <= 0.5).any()]):.3f} (glisse − ne glisse pas, VRAI) | "
+        f"{np.mean([np.abs(x['ah'].astype(np.float32)[x['mv'] > 0.5].mean(0) - x['ah'].astype(np.float32)[x['mv'] <= 0.5].mean(0)).mean() for x in L if (x['mv'] > 0.5).any() and (x['mv'] <= 0.5).any()]):.3f} (IMAGINÉ)")
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--episodes", type=int, default=60); p.add_argument("--diag", type=int, default=30)
@@ -263,6 +288,8 @@ def main():
                    "moment de décider) : l'ouïe de chaque plan est imaginée par le BÉBÉ lui-même (son imagination d'origine) et comparée au son d'une suite voulue, encodée par son œil-cible. "
                    "1 = le son du CHEMIN (le T glisse d'ici vers le but puis se tait ; l'image-but reste « le monde saute au but ») ; 2 = le GLISSEMENT FINAL (le but montré est une suite : "
                    "le T arrive au but en glissant sur les 3 dernières images, avec son bruit ; l'image-but ET le son viennent de cette suite)")
+    p.add_argument("--snd_diag", type=int, default=0, help="1 = DIAG DE L'OUÏE IMAGINÉE (14 nov. 2026) : tous les 5 gestes, les plans du 1er tirage sont joués dans des copies du monde ; "
+                   "SON ouïe imaginée pour chaque plan dit-elle que le plan fera vraiment glisser l'objet ? (face au son vraiment entendu, et aux gestes seuls)")
     p.add_argument("--snd_w", type=float, default=1.0, help="--snd_goal : poids du son face à l'image (les deux centrés-réduits entre les plans)")
     p.add_argument("--snd_v", type=float, default=0.03, help="--snd_goal : vitesse du glissement voulu (par image)")
     p.add_argument("--snd_hand", type=float, default=0.06, help="--snd_goal : vitesse de main supposée dans le son voulu (sa main fait du bruit en bougeant : sans ça, le son voulu dirait « ne bouge pas »)")
@@ -693,6 +720,10 @@ def main():
                 r_ = torch.cat([read(z_) for z_ in chain(1, cmd[:1])]) if a.chain else read(imagine(ctx.expand(Hh, -1, -1), tis, cmd, ci.expand(Hh, -1)))
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[:, 2:4] = rb(imagine(ctx.expand(Hh, -1, -1), tib, cmd, ci.expand(Hh, -1))[:, 0])
                 return r_
+        def heard(cand):                        # SON ouïe imaginée (le bébé) à t+1 .. t+Hh pour chaque plan : (K, Hh, d)
+            K = len(cand); cmd = cmd0.expand(K, -1, -1).clone(); cmd[:, t + 1:] = 0; cmd[:, t + 1:t + 1 + Hh] = cand / 0.05
+            with torch.no_grad(): return imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
+        cost.heard, cost.s0 = heard, s0
         cost.traj, cost.now, cost.phase, cost.sub, cost.gt = traj, now, phase, sub, gt
         return cost
     Kp_ = (a.propose_k or m.goal.kmax) if a.propose else 0
@@ -773,6 +804,17 @@ def main():
                         finally: env.X, env.XN = Xk
                         tc_ = np.array(tc_); cn = c_.float().cpu().numpy(); gap = (float(np.linalg.norm(env.P - env.Hp)) - env.rc - env.Rh) * H
                         reach_log.append((env.t - a.plan_c, gap, tc_.mean(), cn.std(), (cn[tc_].mean() - cn[~tc_].mean()) if tc_.any() and (~tc_).any() else np.nan, cn.mean()))
+                    if a.snd_diag and it_ == 0 and (env.t - a.plan_c) % 5 == 0:      # OUÏE IMAGINÉE : chaque plan joué pour de vrai — l'objet glisse-t-il, et qu'entend-il vraiment ?
+                        mv_, bs_ = [], []
+                        for cc in cand.cpu().numpy():
+                            e2 = copy.deepcopy(env)
+                            for ac in cc: e2.step(ac)
+                            mv_.append(float(np.linalg.norm(e2.P - env.P)) * H); bs_.append(e2.batch(cost.s0, nohand=not a.see_hand))
+                        with torch.no_grad():
+                            tkr, _ = to_tok0({k: torch.cat([b[k] for b in bs_]) for k in bs_[0]}, st, v, P_, dev); t_ = env.t - cost.s0
+                            ar_ = LN(tgt(tkr, torch.arange(tkr.size(1), device=dev)[None].expand(len(tkr), -1)))[:, nv + t_ + 1:nv + t_ + Hh + 1]
+                        snd_log.append(dict(ep=ep, mv=np.array(mv_), ah=cost.heard(cand).half().cpu().numpy(), ar=ar_.half().cpu().numpy(), a0=cost.heard(torch.zeros_like(cand[:1])).half().cpu().numpy(),
+                                            cand=cand.cpu().numpy(), rel=(env.P - env.Hp).astype(np.float32), gap=(float(np.linalg.norm(env.P - env.Hp)) - env.rc - env.Rh) * H))
                     el = seg[c_.argsort()[:max(4, a.pop // 8)]]; mu_, sd_ = el.mean(0), el.std(0) + 0.01
                 act = mu_[0].cpu().numpy()
                 if rec is not None:                                      # ANIMATION : où le bébé IMAGINE que tout sera à la fin de son plan
@@ -811,6 +853,7 @@ def main():
         return (d0, env.dist(), float(ok), cv, cmax if a.task == "pusht" else np.nan, float(lax_hit),
                 float(PL[:, 0].mean()), float(len(bo)), float(len({int(PL[b_[0], 2]) for b_ in bo})), float(np.mean(PL[:, 1] < 3)), good, float(pu.max() if len(pu) else -1))
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
+    snd_log = []                                                        # --snd_diag : un relevé = les plans du 1er tirage (ouïe imaginée, son vraiment entendu, déplacement réel de l'objet)
     reach_log = []                                                      # --reach_diag : (geste, écart main–objet px, part des plans qui toucheraient, écart-type du coût, coût touchent − ne touchent pas, coût moyen)
     def cov_line(res):                                                  # PUSH-T : couverture (finale, MAX = mesure de Diffusion Policy), seuils, ancienne règle
         if a.task != "pusht": return
@@ -925,6 +968,7 @@ def main():
                     if len(r_): print(f"        {('< 1 px (contact)' if hi == 1 else f'{lo}–{hi} px' if hi < 99 else '> 10 px'):>16s} | {len(r_):7d} | {r_[:, 2].mean():30.0%} | {np.mean(r_[:, 2] == 0):33.0%} | {r_[:, 3].mean():38.4f} | {np.nanmean(r_[:, 4]):+.4f}", flush=True)
                 print("        selon le moment : " + " | ".join(f"gestes {lo}–{hi} : écart {RL[(RL[:, 0] >= lo) & (RL[:, 0] < hi), 1].mean():.1f} px, plans qui toucheraient {RL[(RL[:, 0] >= lo) & (RL[:, 0] < hi), 2].mean():.0%}"
                                                          for lo, hi in ((0, 10), (10, 40), (40, 100), (100, 300)) if ((RL[:, 0] >= lo) & (RL[:, 0] < hi)).any()), flush=True)
+            if a.snd_diag and snd_log: snd_report(snd_log, h_, lambda s_: print(s_, flush=True)); snd_log.clear()
             S = np.array(S, dtype=np.float64)                             # (h, err objet, err main, copie objet, copie main, l'objet bouge, phase)
             if S.ndim < 2 or not len(S): continue                         # --propose 2 : rien d'imaginé, pas de dérive à mesurer
             print(f"      DÉRIVE de l'imagination (plan entier exécuté pour de vrai, px) : h | objet qui BOUGE imaginé / copie (n) "
