@@ -249,6 +249,8 @@ def main():
                    "de « l'imagination est mauvaise » (avec --goal_img ou --judge)")
     p.add_argument("--task_scale", type=float, default=1.0, help="taille des objets de la TÂCHE × task_scale (0 = celle du monde vécu, --obj_scale de l'entraînement) ; "
                    "constat du 13 nov. 2026 : les tâches gardaient des objets de taille 1 alors que D17q/D17r ont joué avec des objets × 1.8")
+    p.add_argument("--objimag", type=str, default="", help="IMAGINATION PAR OBJET (av_objimag.py, 13 nov. 2026) : module purement latent (groupes transportés pas à pas + horloge) "
+                   "posé sur son œil, utilisé À LA PLACE de l'ancienne imagination pour comparer au but (--goal_img, sans juge) ; chaque pas du plan = un geste, une image")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -538,6 +540,12 @@ def main():
         from av_judge import build_judge
         judge = build_judge(m, teachN, imagine, cfg, st, dev, dR, max(([int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h]) + ([a.plan_h] if a.diag > 0 else [])), mode=a.judge,
                             plan_c=a.plan_c, n=a.judge_n, steps=a.judge_steps, seeds=a.judge_seeds, log=lambda s_: print(s_, flush=True))
+    om = None
+    if a.objimag:                               # ---------- IMAGINATION PAR OBJET (module sur l'œil gelé)
+        from av_objimag import ObjImag
+        cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
+        assert a.goal_img and a.read_level == "top", "--objimag : avec --goal_img (but en image) et l'étage du haut"
+        print(f"IMAGINATION PAR OBJET : {a.objimag} (pas {cko['it']}) à la place de l'ancienne imagination pour le coût", flush=True)
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
@@ -622,6 +630,10 @@ def main():
                 else: r_ = read(imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1)))[:, None]
                 if rb is not None and a.hand_sense == "bras": r_ = r_.clone(); r_[..., 2:4] = arm_hand(K, cmd, a.cost_all and not raw)
             if raw: return r_[:, -1]                                     # positions imaginées (objet x,y, main x,y) à t+Hh
+            if om is not None and a.goal_img and phase != 1:   # IMAGINATION PAR OBJET : Hh pas d'une image, chacun avec son geste, depuis la dernière image VUE
+                with torch.no_grad():
+                    pl, _, _ = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh)
+                    return gcost(pl[-1], Hh, cand)
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
                 with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh, cand)
             if phase == 1: c_ = (r_[..., 2:4] - sub).norm(dim=-1)                              # sous-but : la MAIN au point
