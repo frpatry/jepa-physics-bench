@@ -80,6 +80,13 @@ def _roll(s, Zt, cmd, prop, tch, t, k, zero_flow=False):
 ObjImag.roll = _roll
 
 
+def _things(s, Z, prop):
+    """OÙ SONT LES CHOSES ? Z (B, npf, d) latents (vus ou imaginés), prop (B, 4) main sentie -> « chose » par case (B, npf), sans geste ni toucher."""
+    cd = torch.cat([torch.zeros(len(Z), 4, device=Z.device), prop, torch.zeros(len(Z), 8, device=Z.device)], -1)
+    return torch.sigmoid(s.objh(s.tr(s.inp(Z) + s.pos + s.cond(cd).unsqueeze(1) + s.kemb(torch.ones(len(Z), dtype=torch.long, device=Z.device)).unsqueeze(1)))).squeeze(-1)
+ObjImag.things = _things
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--out", type=str, default="/content/objimag.pt"); p.add_argument("--steps", type=int, default=6000)

@@ -251,6 +251,9 @@ def main():
                    "constat du 13 nov. 2026 : les tâches gardaient des objets de taille 1 alors que D17q/D17r ont joué avec des objets × 1.8")
     p.add_argument("--objimag", type=str, default="", help="IMAGINATION PAR OBJET (av_objimag.py, 13 nov. 2026) : module purement latent (groupes transportés pas à pas + horloge) "
                    "posé sur son œil, utilisé À LA PLACE de l'ancienne imagination pour comparer au but (--goal_img, sans juge) ; chaque pas du plan = un geste, une image")
+    p.add_argument("--thing_cost", type=int, default=0, help="IDÉE USER (14 nov. 2026) : pas de juge entraîné — on INTERROGE SES LATENTS là où ça compte : avec --objimag, la scène imaginée "
+                   "et l'image-but sont comparées seulement sur les cases que le module marque « chose » (dans l'une ou l'autre), sa main (située par le bras) mise à part : "
+                   "sous sa main le monde est supposé inchangé")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -599,6 +602,13 @@ def main():
         def gcost(zi, hh, cand=None):           # zi (K, npf, dR) imaginé à t+hh -> écart au but, sur les cases qui doivent changer
             if judge is not None: return judge(zi, zg_all[t + hh][None].expand(len(zi), -1, -1))   # JUGE APPRIS : gestes qui séparent la scène imaginée du but
             e_ = ((zi.float() - zg_all[t + hh][None]) ** 2).sum(-1)
+            if a.thing_cost and om is not None and cand is not None:      # --thing_cost : comparer là où il y a une CHOSE (imaginée ou voulue), pas tout le décor
+                pr_ = tok[:, nv + 2 * T + t, :4]; zg_ = zg_all[t + hh][None].float(); zn_ = zt.float() - om.clock[t] + om.clock[t + hh]      # scène actuelle remise à la date de t+hh
+                o_g, o_n, o_i = om.things(zg_, pr_), om.things(zn_, pr_), om.things(zi.float(), pr_.expand(len(zi), -1)); e0 = ((zn_ - zg_) ** 2).sum(-1)
+                hp = (torch.from_numpy(env.Hp).to(dev)[None] + cand[:, :hh].sum(1)).clamp(env.Rh, 1 - env.Rh)
+                hid = (cxy[None] - hp[:, None]).abs().amax(-1) < 0.5 / nP + 0.85 * env.Rh                               # cases où sera sa main : monde supposé inchangé
+                w_ = torch.where(hid, torch.maximum(o_g, o_n).expand(len(zi), -1), torch.maximum(o_g.expand(len(zi), -1), o_i)); ee = torch.where(hid, e0.expand(len(zi), -1), e_)
+                return (w_ * ee).sum(-1) / w_.sum(-1).clamp_min(1e-3)
             if a.mask_hand and cand is not None:  # --mask_hand : les cases où sera SA MAIN (bras : main sentie + gestes du plan) ne comptent pas
                 hp = (torch.from_numpy(env.Hp).to(dev)[None] + cand[:, :hh].sum(1)).clamp(env.Rh, 1 - env.Rh)
                 keep = gmask[None] & ~((cxy[None] - hp[:, None]).abs().amax(-1) < 0.5 / nP + 0.85 * env.Rh)
