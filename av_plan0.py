@@ -160,10 +160,11 @@ class Push0:
             s.TOUCH[t, 1::2] = np.maximum(s.TOUCH[t, 1::2], np.where(s.echo * tr_[1::2] > 0.05, s.echo * tr_[1::2], 0))
         s.vact[t] = s.Hp - H0; s.PROP[t] = np.concatenate([s.Hp, s.vact[t] + s.vib]) + s.rng.normal(0, 0.005, 4); s.record(t, render)
         s.vib = (-s.echo * s.vib if float(np.abs(s.vib).max()) * s.echo > 0.002 else np.zeros(2)).astype(np.float32)
-    def batch(s, s0=0, nohand=False):
+    def batch(s, s0=0, nohand=False, pos=None, vfut=0.0):
         """vécu jusqu'à t -> lot (1, T, ...) des images s0 .. s0+T-1 (FENÊTRE ; s0 = 0 = comme avant) ; le futur est rempli « immobile » (hors contexte)."""
         W = slice(s0, s0 + T); t = s.t - s0
-        Pp, Hh = s.POS[W].copy(), s.HAND[W].copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[s.t], s.HAND[s.t]; vact = s.vact[W].copy(); vact[t + 1:] = 0
+        Pp, Hh = s.POS[W].copy(), s.HAND[W].copy(); Pp[t + 1:], Hh[t + 1:] = s.POS[s.t], s.HAND[s.t]; vact = s.vact[W].copy(); vact[t + 1:] = (vfut, 0)
+        if pos is not None: Pp = pos.copy()                             # (--snd_goal) positions de l'objet données : le SON d'une suite voulue
         extra = cont_sound(2 * s.hum * np.linalg.norm(vact, axis=1) / 0.08, Hh[:, 0], T, s.rng, "froisse")
         extra = extra + hum_signal(Pp[:, None], np.array([s.mat]), np.array([s.m]), T, s.hum, 1, "fric")
         ev = [(e[0] - s0,) + tuple(e[1:]) for e in s.ev if 0 <= e[0] - s0 < T]                  # chocs dans la fenêtre (temps décalés)
@@ -258,6 +259,13 @@ def main():
                    "les plans du 1er tirage sont joués dans des copies du monde — part de ceux qui toucheraient vraiment l'objet, et ce que SON coût en dit, selon l'écart main–objet et le moment")
     p.add_argument("--sound_w", type=float, default=0.0, help="OUÏE (14 nov. 2026, demande user) : avec un module --objimag qui imagine le son, poids de l'ENVIE de « faire du bruit avec "
                    "quelque chose » (son imaginé avec la scène − son de son corps seul) face à la ressemblance au but (les deux centrées-réduites entre les plans) ; 0 = il entend seulement")
+    p.add_argument("--snd_goal", type=int, default=0, help="BUT SONORE (14 nov. 2026, idée user : le bébé a grandi avec le son, pas d'entraînement en plus — on lui DONNE le son au "
+                   "moment de décider) : l'ouïe de chaque plan est imaginée par le BÉBÉ lui-même (son imagination d'origine) et comparée au son d'une suite voulue, encodée par son œil-cible. "
+                   "1 = le son du CHEMIN (le T glisse d'ici vers le but puis se tait ; l'image-but reste « le monde saute au but ») ; 2 = le GLISSEMENT FINAL (le but montré est une suite : "
+                   "le T arrive au but en glissant sur les 3 dernières images, avec son bruit ; l'image-but ET le son viennent de cette suite)")
+    p.add_argument("--snd_w", type=float, default=1.0, help="--snd_goal : poids du son face à l'image (les deux centrés-réduits entre les plans)")
+    p.add_argument("--snd_v", type=float, default=0.03, help="--snd_goal : vitesse du glissement voulu (par image)")
+    p.add_argument("--snd_hand", type=float, default=0.06, help="--snd_goal : vitesse de main supposée dans le son voulu (sa main fait du bruit en bougeant : sans ça, le son voulu dirait « ne bouge pas »)")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -594,6 +602,21 @@ def main():
             dpx = np.abs(gf - (env.XN if a.mask_hand else EX)[env.t]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1)        # où la scène doit changer
             gmask = torch.from_numpy(dpx > 0.15).to(dev)
             if not bool(gmask.any()): gmask = torch.ones(npf, dtype=torch.bool, device=dev)
+        za_g = None
+        if a.snd_goal and a.goal_img:           # BUT SONORE : une suite voulue (images + son du T qui glisse), entendue par son œil-cible -> latents d'ouïe à t+1 .. t+Hh
+            dg_ = env.g - env.P; dn_ = float(np.linalg.norm(dg_)) + 1e-9; da_ = (env.g_ang - env.ang + math.pi) % (2 * math.pi) - math.pi; jj = np.arange(T)
+            if a.snd_goal == 1: fq = np.clip((jj - t) * a.snd_v / dn_, 0, 1)                                  # 1 : il glisse d'ici vers le but, puis se tait
+            else: fq = 1 - np.clip(t + Hh - jj, 0, 2) * min(a.snd_v, dn_ / 2) / dn_                             # 2 : posé juste avant le but, il y ARRIVE en glissant (3 images)
+            Pq = (env.P[None] + fq[:, None] * dg_[None]).astype(np.float32); Aq = env.ang + fq * da_
+            if a.snd_goal == 1: Pq[:t + 1] = env.POS[s0:s0 + t + 1]
+            Xs = EX[s0:s0 + T].copy()
+            for j in range(t + 1, T): Xs[j] = env.frame(Pq[j], env.Hp, float(Aq[j]), hand=bool(a.goal_hand))
+            rs_ = env.rng.bit_generator.state; bs = env.batch(s0, nohand=not a.see_hand, pos=Pq, vfut=a.snd_hand); env.rng.bit_generator.state = rs_   # (le hasard du monde n'est pas consommé)
+            bs["X"] = torch.from_numpy((Xs * 255).round().astype(np.uint8))[None]
+            with torch.no_grad():
+                tks, _ = to_tok0(bs, st, v, P_, dev); za_g = LN(tgt(tks, torch.arange(tks.size(1), device=dev)[None]))[0, nv + t + 1:nv + t + Hh + 1]   # (Hh, d)
+                if a.snd_goal == 2: zg_all = teachN(tks[:, :nv], torch.arange(nv, device=dev)[None]).view(T, npf, dR)
+        tia = torch.arange(nv + t + 1, nv + t + Hh + 1, device=dev)[:, None]       # ouïe imaginée à t+1 .. t+Hh (une requête par horizon)
         fidx = [torch.from_numpy(np.where(fr == t + hh)[0]).to(dev) for hh in range(1, Hh + 1)]   # TOUS les jetons de l'image t+hh (vue d'abord)
         cs_, cm_ = ctx.float().std(-1).mean(), ctx.float().mean(-1).mean()   # échelle des latents de CONTEXTE (l'imaginé est à l'échelle normalisée)
         def chain(K, cmd):                      # --chain : IMAGINER PAS À PAS (idée user) — image t+1 depuis le vrai passé, puis t+2 en repartant de t+1
@@ -652,6 +675,10 @@ def main():
                     if a.sound_w > 0 and om.audio:   # ENVIE DE FAIRE DU BRUIT AVEC QUELQUE CHOSE : son imaginé avec la scène − son que ferait son corps seul, sommé sur le plan
                         e_ = torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).sum(0)
                         c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sound_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
+                    if za_g is not None:             # BUT SONORE : SON ouïe imaginée (le bébé, pas le module) le long du plan, face au son voulu
+                        ah = imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
+                        e_ = ((ah - za_g[None]) ** 2).mean(-1)[:, 0 if a.snd_goal == 1 else Hh - 2:].mean(1)
+                        c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) + a.snd_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
                     return c_
             if a.goal_img and phase != 1:       # (avec --subgoal : d'abord AMENER LA MAIN derrière l'objet — l'image-but ne guide pas une main loin du T)
                 with torch.no_grad(): return gcost((chain(K, cmd)[-1] if a.chain else imagine(ctx.expand(K, -1, -1), ti.expand(K, -1), cmd, ci.expand(K, -1))).view(K, npf, dR), Hh, cand)
