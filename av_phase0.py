@@ -742,7 +742,8 @@ def main():
     md_t, fr_t = torch.from_numpy(md_np).to(dev), torch.from_numpy(fr_np).to(dev)
     while state["it"] < a.total:
         it = state["it"] = state["it"] + 1; stage, f = stage_of(it); S.stage = stage; v = view_at(stage, f)
-        if it <= a.womb: v = dict(sigma=3.0, gray=1.0, contrast=0.0)   # DANS LE VENTRE : il ne voit rien (image uniforme) ; il bouge, s'entend, sent son bras
+        wb = it <= a.womb; keepm = (md_np != 0) if wb else np.ones(len(md_np), bool)   # DANS LE VENTRE : AVEUGLE (user : « aveugle c'est aveugle, c'est pas voir rien ») — la vue n'existe pas :
+        #   ni dans ce qu'il perçoit, ni dans ce qu'il doit deviner ; il bouge, s'entend, sent son bras (1er essai : image uniforme dans le calcul = 95 % de cases triviales -> il n'apprenait pas ses gestes)
         fe = min(1.0, (it - starts[4]) / max(1, (a.world_end or a.total) - starts[4]))   # avancement dans 0e (figé après --world_end)
         if a.outside: S.wkw["p_out"] = {"0d": 0.1 + 0.2 * f, "0e": 0.3 + (0.3 if a.calm == 2 else 0.4) * fe}.get(stage, 0.0)
         if a.calm == 1: S.wkw["calm"] = {"0d": 1 - 0.6 * f, "0e": 0.4 * (1 - fe)}.get(stage, 1.0)
@@ -771,7 +772,7 @@ def main():
                 for i0 in range(0, len(bt_["X"]), a.bs):
                     tk_, cm_ = to_tok0({k: x[i0:i0 + a.bs] for k, x in bt_.items()}, st, v, a.P, dev); Bc, Nc, _ = tk_.shape
                     z_ = F.layer_norm(tgt(tk_, torch.arange(Nc, device=dev).expand(Bc, -1)).float(), (a.d,)); t0c = int(rng.integers(3, T - 2))
-                    ci_ = torch.from_numpy(np.where(fr_np <= t0c)[0]).to(dev).expand(Bc, -1); ti_ = torch.from_numpy(np.where(fr_np > t0c)[0]).to(dev).expand(Bc, -1)
+                    ci_ = torch.from_numpy(np.where((fr_np <= t0c) & keepm)[0]).to(dev).expand(Bc, -1); ti_ = torch.from_numpy(np.where((fr_np > t0c) & keepm)[0]).to(dev).expand(Bc, -1)
                     pr_ = m.pred(m.context(_gather(tk_, ci_), ci_), ti_, cm_, ci_).float()
                     errs_.append((pr_ - _gather(z_, ti_)).abs().mean((1, 2)))
                 e_ = torch.cat(errs_).clamp_min(1e-6)
@@ -796,6 +797,9 @@ def main():
             bt_ = {k: x[mb_::a.accum] for k, x in bt_all.items()} if a.accum > 1 else bt_all
             tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
             pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
+            if wb:                                                       # aveugle : les devinettes ne portent que sur l'ouïe, le toucher, le bras (celles de vue tombent)
+                pairs = [(c_ & keepm, g_ & keepm) for c_, g_ in pairs]; pairs = [(c_, g_) for c_, g_ in pairs if c_[0].any() and g_[0].any()]
+                if not pairs: t0w = int(rng.integers(3, T - 2)); pairs = [(np.broadcast_to((fr_np <= t0w) & keepm, (B, N)).copy(), np.broadcast_to((fr_np > t0w) & keepm, (B, N)).copy())]
             contact = (bt_["TOUCH"].to(dev).abs().sum(-1) > 0).float()                 # (B, T) frames avec contact
             with torch.autocast("cuda", dtype=ADT, enabled=AMP_ON):
                 with torch.no_grad():
@@ -871,7 +875,7 @@ def main():
                             pf_i = m.fl_head(fzf_[:, 1:], fzf_[:, :-1], frozen=True)
                             fl_i = fl_i + fl_loss(pf_i, FT, wf_ * imf_) / len(pairs); fe_[1] = fl_px(pf_i, FT, mvf_ * imf_)
                 jl = jl / len(pairs); il = torch.zeros((), device=dev)
-                if a.inv_w > 0:                                          # CONTINGENCE : vision SEULE (le bras serait un raccourci)
+                if a.inv_w > 0 and not wb:                               # CONTINGENCE : vision SEULE (le bras serait un raccourci) — pas dans le ventre
                     ts = torch.from_numpy(rng.choice(np.arange(1, T), a.inv_k, replace=False)).to(dev)
                     zv = m.enc(tok[:, :nv], full[:, :nv]).view(B, T, npf, -1)
                     il = F.smooth_l1_loss(m.inv(zv[:, ts - 1].flatten(0, 1), zv[:, ts].flatten(0, 1)).float(), cmd[:, ts].flatten(0, 1))
@@ -906,7 +910,7 @@ def main():
                         nc_ = np.array([float((contact[:, s_:s_ + K_].sum(1) > 0).sum()) for s_ in t0s]) + 0.5
                         t0r = int(rng.choice(t0s, p=nc_ / nc_.sum()))
                     else: t0r = int(rng.choice(t0s))
-                    cid = torch.from_numpy(np.where(fr_np <= t0r)[0]).to(dev).expand(B, -1)   # vrai passé jusqu'à t0r
+                    cid = torch.from_numpy(np.where((fr_np <= t0r) & keepm)[0]).to(dev).expand(B, -1)   # vrai passé jusqu'à t0r
                     cx = m.context(_gather(tok, cid), cid); cs_, cm_ = cx.float().std(-1).mean().detach(), cx.float().mean(-1).mean().detach()
                     if a.roll_obj > 0:
                         zv_r = z[:, :nv].view(B, T, npf, -1); chr_ = (zv_r[:, 1:] - zv_r[:, :-1]).abs().mean(-1)
@@ -914,7 +918,7 @@ def main():
                     if a.move_w > 0: prv_m = z[:, t0r * npf:(t0r + 1) * npf]     # la dernière image VUE (vrais latents) : point de départ du mouvement
                     if a.flow_w > 0: prv_f = z[:, t0r * npf:(t0r + 1) * npf]
                     for k_ in range(1, K_ + 1):
-                        fi = torch.from_numpy(np.where(fr_np == t0r + k_)[0]).to(dev).expand(B, -1)    # TOUS les jetons de l'image t0r+k
+                        fi = torch.from_numpy(np.where((fr_np == t0r + k_) & keepm)[0]).to(dev).expand(B, -1)    # TOUS les jetons de l'image t0r+k
                         o_ = m.pred(cx, fi, cmd, cid).float(); d_ = o_ - _gather(z, fi)
                         d_ = (d_ ** 2 if a.loss == "mse" else d_.abs()).mean(-1)
                         w_r = torch.gather(wmot, 1, fi) if wmot is not None else torch.ones_like(d_)
@@ -1035,8 +1039,8 @@ def main():
         if it % 500 == 0 and cur_stats:
             cs_ = np.array(cur_stats[-500:]); print(f"      CURIOSITÉ : séquences avec contact — essayées {cs_[:, 0].mean():.0%}, ÉTUDIÉES {cs_[:, 1].mean():.0%}", flush=True)
         end_stage = it < a.total and stage_of(it + 1)[0] != stage
-        if it % a.exam_every == 0 or end_stage or it == a.total:
-            m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else ""), state["exams"][0][1] if state["exams"] else None)
+        if it % a.exam_every == 0 or end_stage or it == a.total or it == a.womb:
+            m.eval(); r = exam(m, tgt, probes, st, v, a, dev, nv, npf, f"pas {it} étape {stage}" + (" (FIN D'ÉTAPE)" if end_stage else " (SORTIE DU VENTRE)" if it == a.womb else ""), state["exams"][0][1] if state["exams"] else None)
             state["exams"].append((f"pas {it} ({stage})", r)); m.train()
             crit_ok = True
             if end_stage and stage in CRIT:                           # CRITÈRE DE PASSAGE de l'étape (bébé v2 : affiché ; avec --gate 1, arrêt s'il n'est pas atteint)
