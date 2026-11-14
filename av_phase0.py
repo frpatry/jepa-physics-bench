@@ -589,6 +589,9 @@ def main():
     p.add_argument("--flow_pos", type=float, default=10.0, help="--flow_w : poids des cases qui BOUGENT (déplacement sûr) face aux cases inchangées (cible 0)")
     p.add_argument("--hand_hidden", type=float, default=0.0, help="IDÉE USER (2026-11-13) : part des séquences de jeu où sa main N'EST PAS dans l'image (il la SENT : bras, toucher) — "
                    "il pousse des objets tantôt en se voyant, tantôt seulement en se sentant ; demande les images sans main du monde (--goal_w avec --goal_nohand 1)")
+    p.add_argument("--p_auto", type=float, default=-1.0, help="part des objets qui bougent SEULS au début d'une séquence (-1 = réglage du monde : (1 − calme) × (1 − repos), soit 20 → 43 % en 0e) ; "
+                   "0 = AUCUN objet ne bouge seul (user, 14 nov. 2026 : avec la main cachée, un objet qui bouge seul lui apprendrait que les objets bougent sans cause) — seuls sa main ou celle d'un parent les font bouger")
+    p.add_argument("--hh_low", type=float, default=-1.0, help="part de main cachée jusqu'au pas --hh_until (ensuite --hand_hidden) ; -1 = --hand_hidden tout du long"); p.add_argument("--hh_until", type=int, default=0)
     p.add_argument("--womb", type=int, default=0, help="BÉBÉ v2, étape 0 « DANS LE VENTRE » (idée user) : pendant les N premiers pas (au début de 0a) il ne VOIT rien "
                    "(image uniforme) : il bouge, s'entend, sent son bras — ajouter N au budget de 0a")
     p.add_argument("--oi_w", type=float, default=0.0, help="BÉBÉ v2, étapes 5–6 : poids de l'IMAGINATION PAR OBJET PAS À PAS (av_objimag.ObjImag dans le bébé, cibles = latents de l'œil-cible : "
@@ -651,6 +654,7 @@ def main():
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
     wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"obj_scale": a.obj_scale} if a.obj_scale != 1.0 else {}), **({"nohand": True} if (a.goal_w > 0 and a.goal_nohand) or a.hand_hidden > 0 else {}))
+    if a.p_auto >= 0: wkw["p_auto"] = a.p_auto
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
     st = dict(amu=A0.mean((0, 1)).to(dev), asd=(A0.std((0, 1)) + 1e-4).to(dev), tsd=torch.from_numpy(ws["TOUCH"]).std((0, 1)).clamp_min(0.01).to(dev))
@@ -790,7 +794,7 @@ def main():
         if a.hand_hidden > 0 and stage in ("0d", "0e"):                # MAIN CACHÉE : dans une part des séquences de JEU il ne se voit pas (il se sent) — pas pendant « mon bras / mes mains »,
             #   où sa main est la seule chose à voir (1er lancement du bébé v2, 14 nov. 2026 : main cachée dès 0a -> fin 0a « vu ici/senti là » 55 % au lieu de 75–82 %, bras 0 % au lieu de +7 à +36 %)
             assert "XNH" in bt_, "--hand_hidden : le monde doit rendre les images sans sa main"
-            hid_ = torch.from_numpy(rng.random(len(bt_["X"])) < a.hand_hidden)
+            hid_ = torch.from_numpy(rng.random(len(bt_["X"])) < (a.hh_low if a.hh_low >= 0 and it <= a.hh_until else a.hand_hidden))
             bt_ = {**bt_, "X": torch.where(hid_.view(-1, 1, 1, 1, 1), bt_["XNH"], bt_["X"])}
         bt_all = bt_; opt.zero_grad()                                         # ACCUMULATION (--accum k) : le lot est traité en k morceaux (GPU 16 Go : Kaggle/T4)
         for mb_ in range(a.accum):

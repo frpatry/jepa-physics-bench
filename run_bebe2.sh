@@ -9,5 +9,5 @@ python -u av_phase0.py --ckpt "$CKPT" --total "$TOTAL" --womb 4000 --budgets 100
   --touch_masks 1 --contact_w 4 --p_obj 0.8 --mob_size 0.16 --calm 2 --outside 1 --parent 0.4 --inv_clip 1 \
   --ctx_w 0.5 --ctx_on enc --causal 1 --fut_share 0.7 --blind 1 --curious 3 --echo 0.5 --damp 0.5 \
   --eyes_share 0.15 --replay 0.1 --motion_w 1.0 --shape_phys 1 --roll_w 1.0 --roll_k 3 --roll_obj 4 \
-  --obj_scale 1.8 --scale1_share 0.5 --hand_hidden 0.5 --comove_samecol 0.3 \
+  --obj_scale 1.8 --scale1_share 0.5 --hand_hidden 0.5 --hh_low 0.25 --hh_until 60000 --p_auto 0 --comove_samecol 0.3 \
   --oi_w 1.0 --oi_from 60000 --oi_warm 6000 --oi_grow 14000 --oi_kmax 12 --oi_sens_from 80000 --oi_nce 0.5 "$@"
