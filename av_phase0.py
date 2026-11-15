@@ -599,6 +599,7 @@ def main():
     p.add_argument("--oi_from", type=int, default=0, help="pas où elle commence"); p.add_argument("--oi_warm", type=int, default=6000, help="échauffement SANS déplacement (sinon faux décalage global)")
     p.add_argument("--oi_grow", type=int, default=14000, help="puis l'horizon grandit de 1 à --oi_kmax pas sur ce nombre de pas"); p.add_argument("--oi_kmax", type=int, default=12)
     p.add_argument("--oi_lr", type=float, default=2e-4); p.add_argument("--oi_still", type=float, default=0.005); p.add_argument("--oi_sens_from", type=int, default=0, help="pas où les SENS imaginés commencent à apprendre (étape 6)")
+    p.add_argument("--oi_sens_ramp", type=int, default=0, help="montée douce du poids des sens imaginés sur ce nombre de pas (15 nov. 2026 : lancés d'un coup à 80k, l'objet poussé imaginé est retombé de 32 % à 12 % en 5000 pas)")
     p.add_argument("--oi_sens_w", type=float, default=1.0); p.add_argument("--oi_nce", type=float, default=0.5, help="perte de contraste latente sur les sens imaginés (pilote 2 : 0.83 → 0.97)")
     p.add_argument("--oi_eye", type=int, default=0, help="0 = l'imagination lit l'œil-CIBLE (aucun gradient vers l'œil, comme les pilotes) ; 1 = elle lit l'œil EN LIGNE (l'œil apprend aussi à être imaginable)")
     p.add_argument("--oi_eval", type=int, default=1000, help="scènes de l'examen de l'imagination par objet")
@@ -975,11 +976,12 @@ def main():
                 ol = sum(F.smooth_l1_loss(q, Zv[:, t_o + j + 1], beta=0.1) for j, q in enumerate(pl_)) / k_o + a.oi_still * f_o.abs().mean() / k_o
                 oi_c = [float(F.smooth_l1_loss(pl_[-1].detach(), Zv[:, t_o + k_o], beta=0.1)), float(F.smooth_l1_loss(Zv[:, t_o], Zv[:, t_o + k_o], beta=0.1)), float(f_o.detach().norm(dim=-1).mean()) * a.P, float(km), float("nan")]
                 if sens_on:
-                    sl_ = sum(F.smooth_l1_loss(x, Zs[:, :, t_o + j + 1], beta=0.1) for j, x in enumerate(SN_)) / k_o; ol = ol + a.oi_sens_w * sl_; oi_c[4] = float(sl_)
+                    rs_w = min(1.0, (it - a.oi_sens_from) / a.oi_sens_ramp) if a.oi_sens_ramp > 0 else 1.0
+                    sl_ = sum(F.smooth_l1_loss(x, Zs[:, :, t_o + j + 1], beta=0.1) for j, x in enumerate(SN_)) / k_o; ol = ol + rs_w * a.oi_sens_w * sl_; oi_c[4] = float(sl_)
                     if a.oi_nce > 0:                                     # contraste : le sens imaginé de CETTE scène, pas celui des autres scènes du lot
                         for j, x in enumerate(SN_):
                             y_ = Zs[:, :, t_o + j + 1]; mu_ = y_.mean(0, keepdim=True); lg_ = torch.einsum("bsd,csd->sbc", F.normalize(x - mu_, dim=-1), F.normalize(y_ - mu_, dim=-1)) / 0.1
-                            ol = ol + a.oi_nce * F.cross_entropy(lg_.reshape(-1, lg_.size(-1)), torch.arange(lg_.size(-1), device=dev).repeat(3)) / k_o
+                            ol = ol + rs_w * a.oi_nce * F.cross_entropy(lg_.reshape(-1, lg_.size(-1)), torch.arange(lg_.size(-1), device=dev).repeat(3)) / k_o
                 oi_hist.append(oi_c)
                 if len(oi_hist) > 1000: del oi_hist[:-500]
             sr = torch.zeros((), device=dev)
