@@ -373,20 +373,24 @@ class Stream:
         while len(s.q) < s.prefetch: s.q.append(s.pool.apply_async(_batch0, ((10_000_000 + s.i, s.mix(), s.wkw),))); s.i += 1
         return {k: torch.from_numpy(v) for k, v in s.q.popleft().get().items()}
 
-def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eyes_share=0.0, fut_max=0):
+def masks0(B, nP, nv, rng, n_masks, touch=0, fut_share=0.0, touch_share=0.0, eyes_share=0.0, fut_max=0, solo_share=0.0):
     """[(contexte (B,N), cible (B,N))] — même nombre de tokens par ligne. touch > 0 : autant de tirages en plus
     « devine ce que tu SENS » (toucher entier deviné par la vue, l'ouïe, le bras et les gestes).
     eyes_share : part de la devinette « YEUX FERMÉS » (idée user) — il voit jusqu'à t0 puis plus rien, mais continue de SENTIR
-    (toucher, bras) et d'ENTENDRE ; il doit imaginer ce qu'il VERRA en rouvrant les yeux -> obligé de se servir du toucher et du son."""
+    (toucher, bras) et d'ENTENDRE ; il doit imaginer ce qu'il VERRA en rouvrant les yeux -> obligé de se servir du toucher et du son.
+    solo_share : part de la devinette « UN SEUL SENS » (principe user, 15 nov. 2026) — il ne perçoit QUE la vue, ou QUE l'ouïe, ou QUE le toucher, et devine tout le reste :
+    un sens peut manquer, mais ce qu'il perçoit n'est jamais contredit (remplace la main effacée de l'image, qui montrait un objet poussé sans main)."""
     md, fr = layout(nv, nP * nP); N = len(md); pairs = []
     for _ in range(n_masks):
         if fut_share > 0:                                            # IMAGINER LA SUITE domine ; « DEVINE CE QUE TU SENS » garde sa part (touch_share)
             r_ = rng.random()
             st = "future" if r_ < fut_share else "touch" if r_ < fut_share + touch_share else "eyes" if r_ < fut_share + touch_share + eyes_share \
-                else rng.choice(["tube", "vblock", "cross"] + ([] if touch_share > 0 else ["touch"] * touch))
+                else "solo" if r_ < fut_share + touch_share + eyes_share + solo_share else rng.choice(["tube", "vblock", "cross"] + ([] if touch_share > 0 else ["touch"] * touch))
         else: st = rng.choice(["tube", "vblock", "future", "future", "cross"] + ["touch"] * touch)
         tg = np.zeros((B, N), bool)
         if st == "touch": tg[:] = md == 2; pairs.append((~tg, tg)); continue
+        if st == "solo":                                             # UN SEUL SENS perçu (vue, ouïe ou toucher) : il devine tous les autres
+            cm = np.broadcast_to(md == rng.integers(0, 3), (B, N)).copy(); pairs.append((cm, ~cm)); continue
         if st == "eyes":                                             # YEUX FERMÉS après t0 : il sent et entend tout, il imagine ce qu'il verra
             t0 = rng.integers(3, T - 3); tg[:] = (md == 0) & (fr > t0) & ((fr <= t0 + fut_max) if fut_max else True)
             cm = ~tg & ((fr <= t0 + fut_max) if fut_max else True); pairs.append((cm, tg)); continue
@@ -617,6 +621,8 @@ def main():
     p.add_argument("--fut_max", type=int, default=0, help="HORIZON PLAFONNÉ des devinettes « imaginer la suite » et « yeux fermés » : seulement les K images "
                    "après t0 (0 = jusqu'à la fin). D19 (T=32, causal) n'apprenait PAS à se servir de ses gestes avec des horizons jusqu'à 28 images ; "
                    "K=8 = comme à T=16, avec un passé deux fois plus long")
+    p.add_argument("--solo_share", type=float, default=0.0, help="avec --fut_share : part de la devinette « UN SEUL SENS » (principe user, 15 nov. 2026) : il ne perçoit que la vue, "
+                   "ou que l'ouïe, ou que le toucher, et devine le reste — un sens peut manquer, jamais d'incohérence entre ce qu'il voit et ce qu'il sent")
     p.add_argument("--eyes_share", type=float, default=0.0, help="avec --fut_share : part de la devinette « YEUX FERMÉS » (idée user) : il voit jusqu'à t0, "
                    "puis sent (toucher, bras) et entend sans voir, et doit imaginer ce qu'il verra en rouvrant les yeux")
     p.add_argument("--curious", type=int, default=1, help="CURIOSITÉ : k > 1 = il essaie k fois plus de séquences qu'il n'en étudie et étudie surtout celles qui "
@@ -801,7 +807,7 @@ def main():
         for mb_ in range(a.accum):
             bt_ = {k: x[mb_::a.accum] for k, x in bt_all.items()} if a.accum > 1 else bt_all
             tok, cmd = to_tok0(bt_, st, v, a.P, dev); B, N, _ = tok.shape
-            pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max); full = torch.arange(N, device=dev).expand(B, -1)
+            pairs = masks0(B, nP, nv, rng, a.n_masks, a.touch_masks, a.fut_share, a.touch_share, a.eyes_share, a.fut_max, a.solo_share); full = torch.arange(N, device=dev).expand(B, -1)
             if wb:                                                       # aveugle : les devinettes ne portent que sur l'ouïe, le toucher, le bras (celles de vue tombent)
                 pairs = [(c_ & keepm, g_ & keepm) for c_, g_ in pairs]; pairs = [(c_, g_) for c_, g_ in pairs if c_[0].any() and g_[0].any()]
                 if not pairs: t0w = int(rng.integers(3, T - 2)); pairs = [(np.broadcast_to((fr_np <= t0w) & keepm, (B, N)).copy(), np.broadcast_to((fr_np > t0w) & keepm, (B, N)).copy())]
