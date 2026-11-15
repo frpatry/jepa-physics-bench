@@ -304,6 +304,9 @@ def main():
                    "--objimag) : « vais-je SENTIR un contact à ce pas ? » — cible = SON vrai toucher (aucune étiquette du monde, jamais Push-T, bébé figé). Dans le coût : l'image donne le but, "
                    "ses sens imaginés donnent le chemin (plans où il sent qu'il touchera quelque chose)")
     p.add_argument("--sens_w", type=float, default=1.0, help="--sens_reader : poids du contact imaginé face à l'image-but (coût centré-réduit entre les plans)"); p.add_argument("--sens_steps", type=int, default=3000)
+    p.add_argument("--sens_diag", type=int, default=0, help="1 = DIAG du petit lecteur (15 nov. 2026 : dans Push-T ses sens imaginés ne favorisent pas les plans qui touchent) : en jeu libre, annonce-t-il un contact "
+                   "À VENIR (il ne touche rien maintenant) selon la distance main–objet et l'horizon ? ; avec --reach_diag : dans Push-T, plans joués pour de vrai — ses sens imaginés / son coût image séparent-ils "
+                   "les plans qui touchent, et que disent ses sens selon l'endroit où finit la main (coins) ?")
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -604,7 +607,7 @@ def main():
     if a.sens_reader:                           # ---------- ÉTAPE 7 : petit lecteur de ses sens IMAGINÉS, appris sur son jeu libre (cible = son vrai toucher)
         assert om is not None and getattr(om, "senses", 0), "--sens_reader : avec une imagination par objet à TOUS LES SENS (--objimag self, bébé v2)"
         from sklearn.metrics import roc_auc_score
-        tq = time.time(); kr = max(([int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h])); FE, YY, NR, MV = [], [], [], []; rg_ = np.random.default_rng(5)
+        tq = time.time(); kr = max(([int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h])); FE, YY, NR, MV, DD, T0, JJ = [], [], [], [], [], [], []; rg_ = np.random.default_rng(5)
         wkr = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}
         for c0 in range(0, a.sens_reader, 500):
             w = gen_world0(min(500, a.sens_reader - c0), "0e", T, H, seed=4242 + c0 // 500, **wkr); bw = to_torch(to_np([w]))
@@ -617,6 +620,7 @@ def main():
                     SN = om.roll(zv, cmd.float(), tok[:, nv + 2 * T:, :4].float(), tok[:, nv + T:nv + 2 * T, :8].float(), t_, k_, sens=sn0)[3][2]
                 FE.append(torch.stack(SN, 1)[:, :, :2].flatten(2).flatten(0, 1).cpu()); YY.append((bi["TOUCH"][:, t_ + 1:t_ + k_ + 1].float().abs().sum(-1) > 1e-6).flatten())
                 dd_ = (hd_[i:i + 50, t_, None] - ps_[i:i + 50, t_]).norm(dim=-1).amin(1) * H; NR.append((dd_ < 10)[:, None].expand(-1, k_).flatten())
+                DD.append(dd_[:, None].expand(-1, k_).flatten()); T0.append((bi["TOUCH"][:, t_].float().abs().sum(-1) > 1e-6)[:, None].expand(-1, k_).flatten()); JJ.append(torch.arange(1, k_ + 1)[None].expand(len(dd_), -1).flatten())
                 MV.append(((ps_[i:i + 50, t_ + 1:t_ + k_ + 1] - ps_[i:i + 50, t_:t_ + k_]).norm(dim=-1).amax(-1) * H > 0.05).flatten())
         FE, YY, NR, MV = torch.cat(FE), torch.cat(YY).float(), torch.cat(NR).numpy(), torch.cat(MV).numpy(); ntr_ = int(0.8 * len(FE)); fm_, fs_ = FE[:ntr_].mean(0).to(dev), FE[:ntr_].std(0).to(dev) + 1e-6
         torch.manual_seed(0); net_ = torch.nn.Sequential(torch.nn.Linear(2 * d, 128), torch.nn.GELU(), torch.nn.Linear(128, 1)).to(dev); op_ = torch.optim.AdamW(net_.parameters(), 1e-3, weight_decay=1e-2)
@@ -629,6 +633,15 @@ def main():
         print(f"PETIT LECTEUR DE SES SENS IMAGINÉS (jeu libre, {a.sens_reader} séquences, horizons 1..{kr}, cible = son vrai toucher ; contact senti dans {YY.mean():.0%} des pas) — sur des scènes jamais vues : "
               f"« je sentirai un contact » AUC {au_(ye_, pe_):.2f} (main près d'un objet {au_(ye_[ne_], pe_[ne_]):.2f}) | instrument : dit-il aussi « un objet bouge à ce pas » ? AUC {au_(me_, pe_):.2f} "
               f"(main près {au_(me_[ne_], pe_[ne_]):.2f}) | {time.time() - tq:.0f}s", flush=True)
+        if a.sens_diag:                         # contact À VENIR : il ne touche rien à t ; par distance (centres) main–objet le plus proche à t et par horizon
+            de_, t0e, je_ = torch.cat(DD).numpy()[ntr_:], torch.cat(T0).numpy()[ntr_:], torch.cat(JJ).numpy()[ntr_:]
+            print(f"   DIAG — déjà en contact à t ({t0e.mean():.0%} des pas) : AUC {au_(ye_[t0e], pe_[t0e]):.2f} | PAS de contact à t : AUC {au_(ye_[~t0e], pe_[~t0e]):.2f} (contact à venir dans {ye_[~t0e].mean():.0%} des pas)", flush=True)
+            print("   DIAG — contact À VENIR (pas de contact à t) : distance main–objet à t (centres, px) | pas | contact à venir | AUC tous horizons | horizon 1–2 | 3–5 | 6+ | P(contact) dite : s'il y aura contact / sinon", flush=True)
+            for lo_, hi_ in ((0, 8), (8, 12), (12, 16), (16, 99)):
+                q_ = ~t0e & (de_ >= lo_) & (de_ < hi_)
+                if q_.sum() < 50: continue
+                hz = " | ".join(f"{au_(ye_[q_ & (je_ >= j0) & (je_ <= j1)], pe_[q_ & (je_ >= j0) & (je_ <= j1)]):.2f}" for j0, j1 in ((1, 2), (3, 5), (6, 99)))
+                print(f"      {lo_:>2d}–{hi_:<2d} px | {int(q_.sum()):6d} | {ye_[q_].mean():4.0%} | {au_(ye_[q_], pe_[q_]):.2f} | {hz} | {pe_[q_ & ye_].mean() if (q_ & ye_).any() else float('nan'):.2f} / {pe_[q_ & ~ye_].mean():.2f}", flush=True)
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
@@ -760,7 +773,7 @@ def main():
                         e_ = torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).sum(0)
                         c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sound_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
                     if sens_rd is not None:          # ÉTAPE 7 : ses sens imaginés donnent le CHEMIN — part des pas du plan où il sent qu'il touchera quelque chose
-                        e_ = sens_rd(torch.stack(SNp, 1)[:, :, :2].flatten(2)).mean(1); cost.sens = e_
+                        e_ = sens_rd(torch.stack(SNp, 1)[:, :, :2].flatten(2)).mean(1); cost.sens, cost.img = e_, c_
                         c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sens_w * (e_ - e_.mean()) / (e_.std() + 0.05)
                     if za_g is not None:             # BUT SONORE : SON ouïe imaginée (le bébé, pas le module) le long du plan, face au son voulu
                         ah = imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
@@ -877,6 +890,10 @@ def main():
                                 tc_.append(float(np.linalg.norm(e2.P - env.P)) > 1e-4)
                         finally: env.X, env.XN = Xk
                         tc_ = np.array(tc_); cn = c_.float().cpu().numpy(); gap = (float(np.linalg.norm(env.P - env.Hp)) - env.rc - env.Rh) * H
+                        if a.sens_diag and sens_rd is not None and hasattr(cost, "sens"):   # ses sens imaginés / son coût image, plan par plan ; où finit la main (0–3 : coins haut-gauche, haut-droite, bas-gauche, bas-droite ; 4 : ailleurs)
+                            he_ = np.clip(env.Hp[None] + cand.cpu().numpy().sum(1), env.Rh, 1 - env.Rh); zx, zy = he_[:, 0], he_[:, 1]
+                            zn_ = np.where(((zx < 0.3) | (zx > 0.7)) & ((zy < 0.3) | (zy > 0.7)), (zx > 0.5) + 2 * (zy > 0.5), 4)
+                            sens_log.append((np.full(len(tc_), gap), tc_, cost.sens.float().cpu().numpy(), cost.img.float().cpu().numpy(), zn_))
                         reach_log.append((env.t - a.plan_c, gap, tc_.mean(), cn.std(), (cn[tc_].mean() - cn[~tc_].mean()) if tc_.any() and (~tc_).any() else np.nan, cn.mean()))
                     if a.snd_diag and it_ == 0 and (env.t - a.plan_c) % 5 == 0:      # OUÏE IMAGINÉE : chaque plan joué pour de vrai — l'objet glisse-t-il, et qu'entend-il vraiment ?
                         mv_, bs_ = [], []
@@ -930,6 +947,7 @@ def main():
                 float(PL[:, 0].mean()), float(len(bo)), float(len({int(PL[b_[0], 2]) for b_ in bo})), float(np.mean(PL[:, 1] < 3)), good, float(pu.max() if len(pu) else -1))
     steps_used = []                                                     # --stop_success : gestes utilisés par épisode réussi
     snd_log = []                                                        # --snd_diag : un relevé = les plans du 1er tirage (ouïe imaginée, son vraiment entendu, déplacement réel de l'objet)
+    sens_log = []                                                       # --sens_diag : (écart, touche vraiment, P(contact) imaginée, coût image, zone où finit la main) par plan
     reach_log = []                                                      # --reach_diag : (geste, écart main–objet px, part des plans qui toucheraient, écart-type du coût, coût touchent − ne touchent pas, coût moyen)
     def cov_line(res):                                                  # PUSH-T : couverture (finale, MAX = mesure de Diffusion Policy), seuils, ancienne règle
         if a.task != "pusht": return
@@ -1035,6 +1053,16 @@ def main():
             print(f"   {nm:>10s} | {res[:, 1].mean():15.3f} | {np.mean(res[:, 2]):17.0%} | {np.mean(res[:, 0] - res[:, 1]):+13.3f} | {np.mean(res[:, 1] < near):13.0%}  ({time.time() - tp:.0f}s)", flush=True)
             if a.stop_success and steps_used: su_ = [x for x in steps_used if x >= 0]; print(f"   {'':>10s}   gestes jusqu'à la réussite : " + (f"médiane {int(np.median(su_))}, min {min(su_)}, max {max(su_)} ({len(su_)} réussites)" if su_ else "aucune réussite"), flush=True)
             cov_line(res); play_line(res)
+            if a.sens_diag and sens_log:        # ses sens imaginés séparent-ils les plans qui touchent VRAIMENT ? (plans du 1er tirage joués dans des copies du monde)
+                from sklearn.metrics import roc_auc_score
+                g_, y_, se_, im_, zn_ = (np.concatenate([x[i] for x in sens_log]) for i in range(5)); y_ = y_.astype(bool); au2 = lambda yy, qq: roc_auc_score(yy, qq) if 0 < yy.sum() < len(yy) else float("nan")
+                print("      DIAG SENS (Push-T, plans joués pour de vrai) : écart main–objet | plans | touchent | AUC « touchera » : SES SENS imaginés | son coût IMAGE (bas = bon) dit-il que toucher est bon ? | P(contact) dite : touchent / ne touchent pas", flush=True)
+                for lo_, hi_, nm_ in ((-99, 1, "< 1 px"), (1, 3, "1–3 px"), (3, 6, "3–6 px"), (6, 10, "6–10 px"), (10, 99, "> 10 px")):
+                    q_ = (g_ >= lo_) & (g_ < hi_)
+                    if q_.sum() < 64: continue
+                    print(f"        {nm_:>8s} | {int(q_.sum()):6d} | {y_[q_].mean():4.0%} | {au2(y_[q_], se_[q_]):.2f} | {au2(y_[q_], -im_[q_]):.2f} | {se_[q_ & y_].mean() if (q_ & y_).any() else float('nan'):.2f} / {se_[q_ & ~y_].mean():.2f}", flush=True)
+                print("        P(contact) dite pour les plans qui NE touchent PAS, selon l'endroit où finirait la main : " + " | ".join(f"{nm_} {se_[~y_ & (zn_ == i)].mean():.2f} (n={int((~y_ & (zn_ == i)).sum())})" for i, nm_ in enumerate(("coin haut-gauche", "coin haut-droite", "coin bas-gauche", "coin bas-droite", "ailleurs")) if (~y_ & (zn_ == i)).any()), flush=True)
+                print("        son coût IMAGE moyen pour ces mêmes plans : " + " | ".join(f"{nm_} {im_[~y_ & (zn_ == i)].mean():.2f}" for i, nm_ in enumerate(("coin haut-gauche", "coin haut-droite", "coin bas-gauche", "coin bas-droite", "ailleurs")) if (~y_ & (zn_ == i)).any()), flush=True)
             if a.reach_diag and reach_log:      # PORTÉE : le coût reçoit-il un signal de l'objet quand la main est loin ?
                 RL = np.array(reach_log, float); reach_log.clear()
                 print(f"      PORTÉE ({len(RL)} relevés, horizon {h_}, {a.pop} plans du 1er tirage joués pour de vrai) — écart = distance entre le bord de sa main et celui de l'objet", flush=True)
