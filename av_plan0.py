@@ -300,6 +300,10 @@ def main():
     p.add_argument("--snd_w", type=float, default=1.0, help="--snd_goal : poids du son face à l'image (les deux centrés-réduits entre les plans)")
     p.add_argument("--snd_v", type=float, default=0.03, help="--snd_goal : vitesse du glissement voulu (par image)")
     p.add_argument("--snd_hand", type=float, default=0.06, help="--snd_goal : vitesse de main supposée dans le son voulu (sa main fait du bruit en bougeant : sans ça, le son voulu dirait « ne bouge pas »)")
+    p.add_argument("--sens_reader", type=int, default=0, help="ÉTAPE 7 (bébé v2, 15 nov. 2026) : N séquences de JEU LIBRE pour un PETIT LECTEUR de ses sens IMAGINÉS (ouïe + toucher imaginés pas à pas par "
+                   "--objimag) : « vais-je SENTIR un contact à ce pas ? » — cible = SON vrai toucher (aucune étiquette du monde, jamais Push-T, bébé figé). Dans le coût : l'image donne le but, "
+                   "ses sens imaginés donnent le chemin (plans où il sent qu'il touchera quelque chose)")
+    p.add_argument("--sens_w", type=float, default=1.0, help="--sens_reader : poids du contact imaginé face à l'image-but (coût centré-réduit entre les plans)"); p.add_argument("--sens_steps", type=int, default=3000)
     p.add_argument("--see_hand", type=int, default=1, help="0 = IDÉE USER (13 nov. 2026) : sa main N'EST PAS dans les images qu'il voit pendant la tâche (il la sent par le bras "
                    "et le toucher) ni dans l'image-but — sans réentraînement ; les GIF, eux, montrent toujours la main")
     p.add_argument("--mask_hand", type=int, default=0, help="1 = la comparaison au but (--goal_img sans juge) IGNORE les cases où sera sa main après le geste "
@@ -596,6 +600,35 @@ def main():
         else: cko = torch.load(a.objimag, map_location=dev, weights_only=False); om = ObjImag(d, nP, T, gate=cko["cfg"].get("gate", 0), audio=cko["cfg"].get("audio", 0), senses=cko["cfg"].get("senses", 0)).to(dev); om.load_state_dict(cko["m"]); om.eval()
         assert a.goal_img and a.read_level == "top", "--objimag : avec --goal_img (but en image) et l'étage du haut"
         print(f"IMAGINATION PAR OBJET : {a.objimag} (pas {cko['it']}) à la place de l'ancienne imagination pour le coût", flush=True)
+    sens_rd = None
+    if a.sens_reader:                           # ---------- ÉTAPE 7 : petit lecteur de ses sens IMAGINÉS, appris sur son jeu libre (cible = son vrai toucher)
+        assert om is not None and getattr(om, "senses", 0), "--sens_reader : avec une imagination par objet à TOUS LES SENS (--objimag self, bébé v2)"
+        from sklearn.metrics import roc_auc_score
+        tq = time.time(); kr = max(([int(x) for x in a.plan_hs.split(",")] if a.plan_hs else [a.plan_h])); FE, YY, NR, MV = [], [], [], []; rg_ = np.random.default_rng(5)
+        wkr = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}
+        for c0 in range(0, a.sens_reader, 500):
+            w = gen_world0(min(500, a.sens_reader - c0), "0e", T, H, seed=4242 + c0 // 500, **wkr); bw = to_torch(to_np([w]))
+            hd_ = torch.from_numpy(w["HAND"]).float(); ps_ = torch.from_numpy(w["POS"]).float()                       # (instruments : main, objets)
+            for i in range(0, len(hd_), 50):
+                bi = {k: x[i:i + 50] for k, x in bw.items()}; t_ = int(rg_.integers(a.plan_c, T - 2)); k_ = min(kr, T - 1 - t_)
+                with torch.no_grad():
+                    tok, cmd = to_tok0(bi, st, v, P_, dev); B_ = len(tok); zv = LN(tgt(tok[:, :nv], torch.arange(nv, device=dev).expand(B_, -1))).view(B_, T, npf, d)[:, t_]
+                    zf = LN(tgt(tok, torch.arange(tok.size(1), device=dev).expand(B_, -1))); sn0 = torch.stack([zf[:, nv + t_], zf[:, ic + t_], zf[:, ia + t_]], 1)
+                    SN = om.roll(zv, cmd.float(), tok[:, nv + 2 * T:, :4].float(), tok[:, nv + T:nv + 2 * T, :8].float(), t_, k_, sens=sn0)[3][2]
+                FE.append(torch.stack(SN, 1)[:, :, :2].flatten(2).flatten(0, 1).cpu()); YY.append((bi["TOUCH"][:, t_ + 1:t_ + k_ + 1].float().abs().sum(-1) > 1e-6).flatten())
+                dd_ = (hd_[i:i + 50, t_, None] - ps_[i:i + 50, t_]).norm(dim=-1).amin(1) * H; NR.append((dd_ < 10)[:, None].expand(-1, k_).flatten())
+                MV.append(((ps_[i:i + 50, t_ + 1:t_ + k_ + 1] - ps_[i:i + 50, t_:t_ + k_]).norm(dim=-1).amax(-1) * H > 0.05).flatten())
+        FE, YY, NR, MV = torch.cat(FE), torch.cat(YY).float(), torch.cat(NR).numpy(), torch.cat(MV).numpy(); ntr_ = int(0.8 * len(FE)); fm_, fs_ = FE[:ntr_].mean(0).to(dev), FE[:ntr_].std(0).to(dev) + 1e-6
+        torch.manual_seed(0); net_ = torch.nn.Sequential(torch.nn.Linear(2 * d, 128), torch.nn.GELU(), torch.nn.Linear(128, 1)).to(dev); op_ = torch.optim.AdamW(net_.parameters(), 1e-3, weight_decay=1e-2)
+        Ftr, Ytr_ = FE[:ntr_].to(dev), YY[:ntr_].to(dev); pw_ = ((1 - Ytr_.mean()) / Ytr_.mean().clamp_min(1e-3)).clamp(1, 20)
+        for _ in range(a.sens_steps):
+            ix_ = torch.randint(0, ntr_, (1024,), device=dev); l_ = F.binary_cross_entropy_with_logits(net_((Ftr[ix_] - fm_) / fs_).squeeze(-1), Ytr_[ix_], pos_weight=pw_); op_.zero_grad(); l_.backward(); op_.step()
+        net_.eval(); sens_rd = lambda x: torch.sigmoid(net_((x.float() - fm_) / fs_).squeeze(-1))                     # (…, 2d) ouïe + toucher imaginés -> P(je sens un contact)
+        with torch.no_grad(): pe_ = sens_rd(FE[ntr_:].to(dev)).cpu().numpy()
+        ye_, ne_, me_ = YY[ntr_:].numpy() > 0, NR[ntr_:], MV[ntr_:]; au_ = lambda y_, q_: roc_auc_score(y_, q_) if 0 < y_.sum() < len(y_) else float("nan")
+        print(f"PETIT LECTEUR DE SES SENS IMAGINÉS (jeu libre, {a.sens_reader} séquences, horizons 1..{kr}, cible = son vrai toucher ; contact senti dans {YY.mean():.0%} des pas) — sur des scènes jamais vues : "
+              f"« je sentirai un contact » AUC {au_(ye_, pe_):.2f} (main près d'un objet {au_(ye_[ne_], pe_[ne_]):.2f}) | instrument : dit-il aussi « un objet bouge à ce pas » ? AUC {au_(me_, pe_):.2f} "
+              f"(main près {au_(me_[ne_], pe_[ne_]):.2f}) | {time.time() - tq:.0f}s", flush=True)
     # ---------- 3 & 4 : épisodes
     def imag_cost(env, Hh):
         s0 = max(0, env.t + Hh - (T - 1)) if a.slide else 0                # FENÊTRE : ses T dernières images, avec la place pour imaginer Hh images
@@ -721,11 +754,14 @@ def main():
             if om is not None and a.goal_img and phase != 1:   # IMAGINATION PAR OBJET : Hh pas d'une image, chacun avec son geste, depuis la dernière image VUE
                 with torch.no_grad():
                     au_ = LN(tgt(tok, torch.arange(tok.size(1), device=dev)[None]))[:, nv + t].expand(K, -1) if om.audio else None      # ce qu'il ENTEND maintenant (latent d'ouïe)
-                    pl, _, _, (AF, AB, _) = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, aud=au_, sens=sens_now(K))
+                    pl, _, _, (AF, AB, SNp) = om.roll(zt.float().expand(K, -1, -1), cmd, tok[:, nv + 2 * T:, :4].expand(K, -1, -1), tok[:, nv + T:nv + 2 * T, :8].expand(K, -1, -1), t, Hh, aud=au_, sens=sens_now(K))
                     c_ = gcost(pl[-1], Hh, cand)
                     if a.sound_w > 0 and om.audio:   # ENVIE DE FAIRE DU BRUIT AVEC QUELQUE CHOSE : son imaginé avec la scène − son que ferait son corps seul, sommé sur le plan
                         e_ = torch.stack([(x - y).abs().mean(-1) for x, y in zip(AF, AB)]).sum(0)
                         c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sound_w * (e_ - e_.mean()) / (e_.std() + 1e-6)
+                    if sens_rd is not None:          # ÉTAPE 7 : ses sens imaginés donnent le CHEMIN — part des pas du plan où il sent qu'il touchera quelque chose
+                        e_ = sens_rd(torch.stack(SNp, 1)[:, :, :2].flatten(2)).mean(1); cost.sens = e_
+                        c_ = (c_ - c_.mean()) / (c_.std() + 1e-6) - a.sens_w * (e_ - e_.mean()) / (e_.std() + 0.05)
                     if za_g is not None:             # BUT SONORE : SON ouïe imaginée (le bébé, pas le module) le long du plan, face au son voulu
                         ah = imagine(ctx.expand(K * Hh, -1, -1), tia.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))[:, 0].float().view(K, Hh, -1)[..., :d]
                         e_ = ((ah - za_g[None]) ** 2).mean(-1)[:, 0 if a.snd_goal == 1 else Hh - 2:].mean(1)
