@@ -190,6 +190,7 @@ def main():
     p.add_argument("--gate", type=int, default=0, help="1 = v3 : déplacement × « chose » (échec, gardé pour mémoire)")
     p.add_argument("--thing_w", type=float, default=0.0, help="a priori « peu de choses, beaucoup de fond » : petit coût sur la part de cases dites « chose »")
     p.add_argument("--still_w", type=float, default=0.005, help="a priori « les choses restent en place » : petit coût sur le déplacement moyen (en cases)")
+    p.add_argument("--obj_scale", type=float, default=0.0, help="taille des gros objets du monde d'entraînement / d'examen du module (0 = celle du monde vécu par le bébé)")
     p.add_argument("--eval_every", type=int, default=2000); p.add_argument("--seed", type=int, default=0); p.add_argument("--dev", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     a = p.parse_args(); dev = a.dev; t_ = time.time(); log = lambda s_: print(s_, flush=True); torch.manual_seed(a.seed); rng = np.random.default_rng(a.seed)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]
@@ -201,7 +202,9 @@ def main():
     m = ObjImag(d, nP, T, co=co, gate=a.gate, audio=a.audio, senses=a.senses).to(dev)
     if a.init: r_ = m.load_state_dict(torch.load(a.init, map_location=dev, weights_only=False)["m"], strict=False); print(f"module de départ : {a.init} (neuf : {sorted({k.split('.')[0] for k in r_.missing_keys})})", flush=True)
     opt = torch.optim.AdamW(m.parameters(), a.lr, weight_decay=0.01); sch = torch.optim.lr_scheduler.OneCycleLR(opt, a.lr, total_steps=a.steps, pct_start=0.05)
-    wkw = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}; sc = float(wkw.get("obj_scale", 1.0))
+    wkw = {k: x for k, x in cfg.get("wkw", {}).items() if k not in ("nohand", "same_col", "circ")}
+    if a.obj_scale > 0: wkw["obj_scale"] = a.obj_scale                                                # (comparer des yeux de lignées différentes dans le MÊME monde)
+    sc = float(wkw.get("obj_scale", 1.0))
     log(f"IMAGINATION PAR OBJET, purement latente (œil GELÉ, pas {ck['state']['it']}) : {sum(q.numel() for q in m.parameters()) / 1e6:.2f} M de paramètres, {a.steps} pas, lots de {a.bs}, horizons 1..{a.kmax}")
 
     @torch.no_grad()
