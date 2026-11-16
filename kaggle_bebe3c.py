@@ -19,6 +19,6 @@ ck = f"{D}/bebe3c.pt"; shutil.copy(best, ck); print(f"REPRISE au pas {it0} depui
 for f in glob.glob("/kaggle/input/**/run_bebe3c.log", recursive=True):   # le journal suit la sauvegarde
     if os.path.dirname(f) == os.path.dirname(best): shutil.copy(f, f"{D}/run_bebe3c.log")
 sh(f"cd {REPO} && PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True timeout {HEURES}h bash run_bebe3.sh {ck} {TOTAL} --motion_w 0 --roll_w 0 --solo_share 0 "
-   f"--accum 4 --ckpt_every 500 {EXTRA} >> {D}/run_bebe3c.log 2>&1")
+   f"--accum 4 --ckpt_every 500 {EXTRA} 2>&1 | tee -a {D}/run_bebe3c.log | grep --line-buffered -E '^ +pas +[0-9]*(000|500) |OBJET|objet|critère|Error|error|Traceback'")   # journal complet dans le fichier ; l'essentiel en direct
 sh(f"tail -c 3000 {D}/run_bebe3c.log; ls -la {D}")
 print("FIN pas", int(torch.load(ck, map_location="cpu", weights_only=False)["state"]["it"]), flush=True)
