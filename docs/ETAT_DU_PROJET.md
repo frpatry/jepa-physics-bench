@@ -1,5 +1,7 @@
 # État du projet (mis à jour le 9 octobre 2026)
 
+> **Note (17 nov. 2026)** : ce document décrit l'état du projet au **9 octobre 2026**. Pour l'état actuel (imagination par objet, bébé v3c), voir le [README](../README.md).
+
 Ce document décrit la phase en cours : l'**avenue multisensorielle « bébé »**, et plus
 précisément la **phase 0 « mes mains »** et les **boîtes-objets**. Pour le chemin qui y
 mène, voir [HISTORIQUE.md](HISTORIQUE.md).

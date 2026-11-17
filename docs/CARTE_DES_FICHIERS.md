@@ -1,5 +1,7 @@
 # Carte des fichiers
 
+> **Note (17 nov. 2026)** : ce document décrit l'état du projet au **9 octobre 2026**. Pour l'état actuel (imagination par objet, bébé v3c), voir le [README](../README.md).
+
 Tout le code est à la racine du dépôt : les scripts s'importent entre eux par leur nom
 et les notebooks Colab les appellent par chemin après un `git pull`. Les fichiers ne sont
 donc **pas** rangés en dossiers ; cette carte les regroupe par **époque / axe de
