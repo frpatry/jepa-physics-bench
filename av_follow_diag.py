@@ -1,4 +1,5 @@
 """
+SUIVRE LES BONS GESTES, SANS DÉCISION (v2 : pousseur continu + but a posteriori = là où le T finit ; « si les latents sont bons, l'image finale devrait être près du but »)
 SUIVRE LES BONS GESTES, SANS DÉCISION (idée user, 17 nov. 2026 ; bébé GELÉ, aucun entraînement)
 « En sachant exactement quel geste doit être utilisé, interroge les latents pour ce geste, fais le geste, et ainsi de suite. Aucune décision du meilleur geste. »
 Un oracle (instrument : il connaît l'état et la physique) joue Push-T : il contourne le T, se place derrière, pousse. À CHAQUE geste de sa partie on interroge
@@ -16,12 +17,22 @@ from PIL import Image, ImageDraw
 import av_phase0, av_plan0
 from av_phase0 import baby_from_cfg, to_tok0, H
 from av_world0 import VIEW
-from av_plan0 import Push0, oracle, VMAX
+from av_plan0 import Push0, VMAX
+
+
+def pusher(env):
+    """bons gestes (instrument : il connaît l'état) : contourner le T, se placer derrière lui par rapport au but, pousser EN CONTINU vers le but."""
+    P, g, Hp = env.P, env.g, env.Hp; dg = g - P; dist = float(np.linalg.norm(dg)); u = dg / (dist + 1e-6); perp = np.array([-u[1], u[0]])
+    if dist < 0.01: return np.zeros(2, np.float32)
+    behind = P - u * (env.rc + env.Rh + 0.005); rel = Hp - P
+    if np.linalg.norm(Hp - behind) < 0.03 or (rel @ u < 0 and abs(rel @ perp) < 0.03): return np.clip(u * 0.04, -VMAX, VMAX).astype(np.float32)
+    tg = P + (perp if rel @ perp > 0 else -perp) * (env.rc + env.Rh + 0.06) - u * 0.05 if rel @ u > -(env.rc + env.Rh) * 0.5 else behind
+    d_ = tg - Hp; return np.clip(min(VMAX, float(np.linalg.norm(d_))) * d_ / max(np.linalg.norm(d_), 1e-6), -VMAX, VMAX).astype(np.float32)
 
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--ckpt", required=True); p.add_argument("--out", default="suivre.gif"); p.add_argument("--episodes", type=int, default=10)
-    p.add_argument("--steps", type=int, default=150); p.add_argument("--h", type=int, default=8); p.add_argument("--show", type=int, default=3)
+    p.add_argument("--steps", type=int, default=120); p.add_argument("--h", type=int, default=8); p.add_argument("--show", type=int, default=3)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time(); log = lambda s_: print(s_, flush=True)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]; av_phase0.T = T; av_plan0.T = T
     m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval(); om = m.oi.eval()
@@ -31,9 +42,12 @@ def main():
     for ep in range(a.episodes):
         env = Push0(ep, task="pusht", damp=wk.get("damp", 0.0), echo=wk.get("echo", 0.0), shape_phys=bool(wk.get("shape_phys", False)), L=a.steps + 2 + Hh + T, obj_scale=wk.get("obj_scale", 1.0))
         c0 = env.coverage(); cov = [c0]
-        for _ in range(a.steps): env.step(oracle(env)); cov.append(env.coverage())
+        for _ in range(a.steps): env.step(pusher(env)); cov.append(env.coverage())
         te = env.t; mvd = float(np.mean(np.linalg.norm(np.diff(env.POS[:te + 1], axis=0), axis=1) * H > 0.05)); ev_all = list(env.ev); film = []
-        log(f"  partie {ep} : couverture {c0:.0%} -> {cov[-1]:.0%} (max {max(cov):.0%}) | gestes où le T bouge {mvd:.0%} | {time.time() - t0:.0f}s")
+        log(f"  partie {ep} : couverture du but d'origine {c0:.0%} -> {cov[-1]:.0%} (max {max(cov):.0%}) | gestes où le T bouge {mvd:.0%} | {time.time() - t0:.0f}s")
+        env.g, env.g_ang = env.POS[te].copy(), float(env.ANG[te])        # BUT A POSTERIORI = là où le T finit vraiment : ces gestes mènent EXACTEMENT au but
+        if hasattr(env, "_gc"): del env._gc
+        cov = [env.coverage(env.POS[q], env.ANG[q]) for q in range(te + 1)]
         for tau in range(T - 1 - Hh, te - Hh):
             s0 = max(0, tau + Hh - (T - 1)); t = tau - s0
             env.t = tau; env.ev = [e for e in ev_all if e[0] <= tau]; b = env.batch(s0); env.t = te; env.ev = ev_all            # ce qu'il a vécu jusqu'à tau (comme au jeu)
@@ -43,7 +57,14 @@ def main():
                 seen = lambda q: LN(tgt(tok[:, :(q + 1) * npf], torch.arange((q + 1) * npf, device=dev)[None]))[:, -npf:]          # l'image q vue avec le passé seulement
                 zt = seen(t); zf = LN(tgt(tok, torch.arange(tok.size(1), device=dev)[None]))[0]; sn = torch.stack([zf[nv + t], zf[ic + t], zf[ia + t]])[None]
                 X0 = env.X[tau]; wh0 = cellfrac((X0.min(-1) > 0.85).astype(np.float32)); co0 = cellfrac(((X0.max(-1) > 0.15) & (X0.min(-1) <= 0.85)).astype(np.float32))
-                row = dict(ep=ep, tau=tau)
+                row = dict(ep=ep, tau=tau, cov0=cov[tau], cov8=cov[tau + Hh])
+                gf = env.frame(env.g, env.HAND[tau], env.g_ang, hand=False); Xg = env.X[s0:s0 + T].copy(); Xg[t + 1:] = gf; bg = dict(b); bg["X"] = torch.from_numpy((Xg * 255).round().astype(np.uint8))[None]
+                tkg, _ = to_tok0(bg, st, v, P_, dev); zg = LN(tgt(tkg[:, :nv], torch.arange(nv, device=dev)[None])).view(T, npf, d)[t + Hh]      # le but, encodé comme dans le planificateur
+                gm = torch.from_numpy(np.abs(gf - env.X[tau]).max(-1).reshape(nP, P_, nP, P_).max((1, 3)).reshape(-1) > 0.15).to(dev); gm = gm if bool(gm.any()) else torch.ones_like(gm)
+                pr_ = tok[:, ia + t, :4]; og = om.things(zg[None].float(), pr_)[0]
+                def costs(z):                    # écart au but : simple (cases qui doivent changer) | « choses » (là où il y a une chose, voulue ou obtenue)
+                    e = ((z.float() - zg) ** 2).sum(-1); w_ = torch.maximum(og, om.things(z[None].float(), pr_)[0]); return float(e[gm].mean()), float((w_ * e).sum() / w_.sum().clamp_min(1e-3))
+                row["c_vrai"] = costs(seen(t + Hh)[0]); row["c_rien"] = costs(zt[0] - om.clock[t] + om.clock[t + Hh])
                 for k in (1, Hh):
                     Xk = env.X[tau + k]; whk = cellfrac((Xk.min(-1) > 0.85).astype(np.float32)); cok = cellfrac(((Xk.max(-1) > 0.15) & (Xk.min(-1) <= 0.85)).astype(np.float32))
                     wo = torch.from_numpy(co0 * (wh0 < 0.1)); whd = torch.from_numpy(wh0 * (wh0 > 0.15)); evm = torch.from_numpy((((co0 >= 0.1) | (cok >= 0.1)) & (wh0 < 0.02) & (whk < 0.02)).astype(np.float32))
@@ -54,6 +75,7 @@ def main():
                     for nm, s_ in (("S", sn), ("N", None)):                  # S : sens du 1er pas donnés (jeu) | N : non (entraînement avant l'étape des sens)
                         pl, f, o, _ = om.roll(zt, cmd, tok[:, ia:, :4], tok[:, ic:ia, :8], t, k, sens=s_); f = f[0].cpu() * P_
                         row[f"io{k}{nm}"] = avg(f, wo).numpy(); row[f"ih{k}{nm}"] = avg(f, whd).numpy(); row[f"em{k}{nm}"] = avg((pl[-1][0].cpu() - zr).abs().mean(-1), evm)
+                        if k == Hh: row[f"c_im{nm}"] = costs(pl[-1][0])
                 R.append(row)
                 if ep < a.show and (tau - (T - 1 - Hh)) % 2 == 0: film.append((env.X[tau + Hh].copy(), env.POS[tau].copy(), env.POS[tau + Hh].copy(), row[f"io{Hh}S"].copy(), row[f"io{Hh}N"].copy(), tau, cov[tau + Hh]))
         films.append(film)
@@ -71,6 +93,16 @@ def main():
             if mv.sum() >= 5: log(f"     T qui BOUGE (n={int(mv.sum())}) : vrai {dn[mv].mean():.2f} px, imaginé {n_(io[mv]).mean():.2f} px ({n_(io[mv]).mean() / dn[mv].mean():.0%}), direction (cos) {cosm(io[mv], do[mv]):+.2f} | latents : {f3(mv)}")
             log(f"     T IMMOBILE (n={int(sl.sum())}) : déplacement imaginé {n_(io[sl]).mean():.2f} px | latents : {f3(sl)}")
             log(f"     MAIN (n={int(hm.sum())}) : vrai {hn[hm].mean():.2f} px, imaginé {n_(ih[hm]).mean():.2f} px ({n_(ih[hm]).mean() / hn[hm].mean():.0%}), direction (cos) {cosm(ih[hm], dh[hm]):+.2f}")
+    # ---------- le COÛT voit-il le progrès ? (but a posteriori : ces gestes mènent exactement au but)
+    cv8, cv0 = st_("cov8"), st_("cov0"); dn8 = n_(st_(f"do{Hh}")); C = {k_: st_(k_) for k_ in ("c_vrai", "c_rien", "c_imS", "c_imN")}
+    for j, cn in enumerate(("coût SIMPLE (cases qui doivent changer)", "coût « CHOSES »")):
+        log(f"\n=== ÉCART AU BUT, {cn} — selon la couverture du but {Hh} gestes plus tard : vrai futur | imaginé (sens donnés) | imaginé (sans) | si rien ne bougeait")
+        for lo, hi in ((0, 0.2), (0.2, 0.5), (0.5, 0.8), (0.8, 0.95), (0.95, 1.01)):
+            q = (cv8 >= lo) & (cv8 < hi)
+            if q.sum() >= 5: log(f"     couverture {lo:.0%}–{min(hi, 1):.0%} (n={int(q.sum()):4d}) : {C['c_vrai'][q, j].mean():7.3f} | {C['c_imS'][q, j].mean():7.3f} | {C['c_imN'][q, j].mean():7.3f} | {C['c_rien'][q, j].mean():7.3f}")
+        up = (dn8 > 1) & (cv8 > cv0 + 0.02)
+        if up.sum() >= 5: log(f"     quand les bons gestes font AVANCER le T vers le but (n={int(up.sum())}) : le coût préfère-t-il ces gestes à « ne rien faire » ? avec le vrai futur {np.mean(C['c_vrai'][up, j] < C['c_rien'][up, j]):.0%} des cas | "
+                              f"avec l'imaginé (sens donnés) {np.mean(C['c_imS'][up, j] < C['c_rien'][up, j]):.0%} | avec l'imaginé (sans) {np.mean(C['c_imN'][up, j] < C['c_rien'][up, j]):.0%}")
     # ---------- GIF
     S = 8; W = H * S; nfr = max(len(f_) for f_ in films[:a.show]); frames = []
     def cross(dr, x, y, c, r=6): dr.line([x - r, y, x + r, y], fill=c, width=2); dr.line([x, y - r, x, y + r], fill=c, width=2)
