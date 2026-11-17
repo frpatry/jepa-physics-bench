@@ -24,9 +24,9 @@ Build an artificial "baby", 100 % self-supervised, that:
 
 The thread is **developmental**: each choice (order of stages, blurry vision first, the
 hand before objects…) should be relatable to what is known about infants. Sourced notes:
-[recherche_bebe_mains.md](recherche_bebe_mains.md),
-[recherche_bebe_objets.md](recherche_bebe_objets.md),
-[recherche_bebe_corps_monde.md](recherche_bebe_corps_monde.md).
+[recherche_bebe_mains.md](docs/recherche_bebe_mains.md),
+[recherche_bebe_objets.md](docs/recherche_bebe_objets.md),
+[recherche_bebe_corps_monde.md](docs/recherche_bebe_corps_monde.md).
 
 ## Ground rules
 
@@ -147,12 +147,13 @@ Kaggle background sessions (two kernels relaying each other from the latest chec
 | `run_bebe2.sh`, `run_bebe3.sh` | full training recipes |
 | `av_*_diag.py`, `av_motion_probe.py` | frozen-model diagnostics (one question each, stated in the docstring) |
 
-All scripts sit at the root and import each other by name; notebooks call them by path
-after a `git pull`. That is why the code is not split into packages.
+The current scripts (`av_*`, plus `vjepa.py` which they import) sit at the root and import
+each other by name; notebooks call them by path after a `git pull`. Earlier stages of the
+project live in [archive/](archive/); design and research notes in [docs/](docs/).
 
 ## Documentation
 
-- [conception_bebe_v2.md](conception_bebe_v2.md) — design of the from-scratch, gradual training (French).
+- [conception_bebe_v2.md](docs/conception_bebe_v2.md) — design of the from-scratch, gradual training (French).
 - [docs/HISTORIQUE.md](docs/HISTORIQUE.md) — project stages since June 2026 and lessons (French).
 - [docs/ETAT_DU_PROJET.md](docs/ETAT_DU_PROJET.md), [docs/CARTE_DES_FICHIERS.md](docs/CARTE_DES_FICHIERS.md) —
   detailed state and file map **as of 9 October 2026** (French; superseded by this README for the current state).

@@ -95,11 +95,11 @@ qui travaille sur 64 carrés aux contenus globaux, où le corps prend toute la c
 
 ## 2. Les boîtes-objets (en cours)
 
-Fondements : [recherche_bebe_objets.md](../recherche_bebe_objets.md) (neuf règles
+Fondements : [recherche_bebe_objets.md](recherche_bebe_objets.md) (neuf règles
 tirées de la littérature : quelques « pointeurs » d'objets interchangeables, la position
 avant l'apparence, l'émergence par le mouvement commun, l'objet inerte par défaut, la
 main distinguée par la contingence…). Conception :
-[conception_boites_objets.md](../conception_boites_objets.md).
+[conception_boites_objets.md](conception_boites_objets.md).
 
 Principe (`av_slots0.py`) :
 
