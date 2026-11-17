@@ -58,7 +58,7 @@ def main():
         log(f"  IMAGE FIXE (la 1re image répétée {T} fois, {n - ntr} scènes) : position LUE d'une image à la suivante — objet {float(st_[..., 0].mean()):.2f} px, main {float(st_[..., 1].mean()):.2f} px (vrai : 0) | "
             f"erreur de position : objet {float(ex[..., 0].mean()):.2f} px, main {float(ex[..., 1].mean()):.2f} px | écart total lu entre la 1re et la dernière image : objet {float((Pf[:, -1, :2] - Pf[:, 0, :2]).norm(dim=-1).mean() * H):.2f} px")
         log(f"  IMAGE FIXE, latents : changement d'une image à la suivante {float(dz.mean()):.3f} | une fois l'horloge moyenne retirée {float(dzc.mean()):.3f} || pour comparer, vraies scènes (la main bouge) une fois l'horloge retirée : {float(dzr.mean()):.3f}")
-        X = X.copy(); X[ntr:] = X[ntr:, :1]; Pt, E = Pf, ex; a.out = a.out.replace(".gif", "_fixe.gif"); dt = torch.zeros(n - ntr, T - 1, 2)
+        X = X.copy(); X[ntr:] = X[ntr:, :1]; Pt, E = Pf, ex; a.out = a.out.replace(".gif", "_fixe.gif"); dt = torch.zeros(n - ntr, T - 1, 2); Yt = Yt[:, :1].expand(-1, T, -1)
     # ---------- GIF : des scènes où l'objet bouge d'abord (plus parlantes), puis quelconques
     order = torch.argsort(-(dt.norm(dim=-1).sum(1))); show = [int(x) for x in order[:a.show // 2]] + [int(x) for x in range(n - ntr) if x not in set(order[:a.show // 2].tolist())][:a.show - a.show // 2]
     S = a.scale; W = H * S; cols = min(3, len(show)); rows = (len(show) + cols - 1) // cols; frames = []
