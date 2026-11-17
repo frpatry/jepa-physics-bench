@@ -756,7 +756,7 @@ def main():
                 vr = torch.from_numpy(np.where((fr <= t + Hh) & (md == 0))[0]).to(dev)[None].expand(K, -1)
                 with torch.no_grad():
                     tkr, _ = to_tok0(bK, st, v, P_, dev)
-                    return gcost(teachN(torch.gather(tkr, 1, vr.unsqueeze(-1).expand(-1, -1, tkr.size(-1))), vr)[:, -npf:], Hh)
+                    return gcost(teachN(torch.gather(tkr, 1, vr.unsqueeze(-1).expand(-1, -1, tkr.size(-1))), vr)[:, -npf:], Hh, cand)   # (cand : le MÊME coût qu'avec l'imagination, --thing_cost compris)
             with torch.no_grad():
                 if a.cost_all and not raw:                               # coût à CHAQUE pas du plan (arriver tôt, pas « plus tard ») : (K, Hh, 4)
                     r_ = read(imagine(ctx.expand(K * Hh, -1, -1), tis.repeat(K, 1), cmd.repeat_interleave(Hh, 0), ci.expand(K * Hh, -1))).view(K, Hh, 4)
