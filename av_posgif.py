@@ -18,7 +18,7 @@ from av_plan0 import LocalReader
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--ckpt", required=True); p.add_argument("--out", default="pos.gif"); p.add_argument("--n", type=int, default=3000); p.add_argument("--steps", type=int, default=4000)
-    p.add_argument("--show", type=int, default=6); p.add_argument("--scale", type=int, default=10)
+    p.add_argument("--still", type=int, default=0, help="1 = IMAGE FIXE : la 1re image répétée T fois, que lit-on dans les latents ?"); p.add_argument("--show", type=int, default=6); p.add_argument("--scale", type=int, default=10)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time(); log = lambda s_: print(s_, flush=True)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]; av_phase0.T = T
     m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval()
@@ -46,6 +46,19 @@ def main():
     dl = ((Pt[:, 1:, :2] - Pt[:, :-1, :2]) * H); dt = ((Yt[:, 1:, :2] - Yt[:, :-1, :2]) * H); big = dt.norm(dim=-1) > 0.5
     log(f"  DÉPLACEMENT de l'objet d'une image à la suivante (quand il bouge de > 0.5 px, n={int(big.sum())}) : vrai {float(dt[big].norm(dim=-1).mean()):.2f} px, lu {float(dl[big].norm(dim=-1).mean()):.2f} px, "
         f"direction (cos) {float(F.cosine_similarity(dl[big], dt[big], dim=-1).mean()):+.2f} | quand il est immobile : déplacement lu {float(dl[~big].norm(dim=-1).mean()):.2f} px (tremblement de la lecture)")
+    if a.still:                                 # ---------- IMAGE FIXE (question user : sur une image qui ne change pas, l'objet « bouge »-t-il dans les latents ?) : la 1re image répétée T fois
+        bs = {k: x[ntr:].clone() for k, x in b.items()}; bs["X"] = bs["X"][:, :1].expand(-1, T, *bs["X"].shape[2:]).clone(); Zf = []
+        with torch.no_grad():
+            for i in range(0, n - ntr, 50):
+                tok, _ = to_tok0({k: x[i:i + 50] for k, x in bs.items()}, st, v, P_, dev); Zf.append(F.layer_norm(tgt(tok[:, :nv], ix.expand(len(tok), -1)).float(), (d,)).view(-1, T, npf, d).cpu())
+            Zf = torch.cat(Zf); Pf = torch.cat([(ro(Zf.flatten(0, 1)[i:i + 512].to(dev)).cpu() * sd + mu) for i in range(0, (n - ntr) * T, 512)]).view(n - ntr, T, 4)
+        st_ = (Pf[:, 1:] - Pf[:, :-1]).view(n - ntr, T - 1, 2, 2).norm(dim=-1) * H; ex = (Pf - Yt[:, :1]).view(n - ntr, T, 2, 2).norm(dim=-1) * H
+        dz = (Zf[:, 1:] - Zf[:, :-1]).abs().mean(-1); zc = Zf - Zf.mean(0, keepdim=True); dzc = (zc[:, 1:] - zc[:, :-1]).abs().mean(-1)
+        Zr = Z[ntr:].float(); zr = Zr - Zr.mean(0, keepdim=True); dzr = (zr[:, 1:] - zr[:, :-1]).abs().mean(-1)
+        log(f"  IMAGE FIXE (la 1re image répétée {T} fois, {n - ntr} scènes) : position LUE d'une image à la suivante — objet {float(st_[..., 0].mean()):.2f} px, main {float(st_[..., 1].mean()):.2f} px (vrai : 0) | "
+            f"erreur de position : objet {float(ex[..., 0].mean()):.2f} px, main {float(ex[..., 1].mean()):.2f} px | écart total lu entre la 1re et la dernière image : objet {float((Pf[:, -1, :2] - Pf[:, 0, :2]).norm(dim=-1).mean() * H):.2f} px")
+        log(f"  IMAGE FIXE, latents : changement d'une image à la suivante {float(dz.mean()):.3f} | une fois l'horloge moyenne retirée {float(dzc.mean()):.3f} || pour comparer, vraies scènes (la main bouge) une fois l'horloge retirée : {float(dzr.mean()):.3f}")
+        X = X.copy(); X[ntr:] = X[ntr:, :1]; Pt, E = Pf, ex; a.out = a.out.replace(".gif", "_fixe.gif"); dt = torch.zeros(n - ntr, T - 1, 2)
     # ---------- GIF : des scènes où l'objet bouge d'abord (plus parlantes), puis quelconques
     order = torch.argsort(-(dt.norm(dim=-1).sum(1))); show = [int(x) for x in order[:a.show // 2]] + [int(x) for x in range(n - ntr) if x not in set(order[:a.show // 2].tolist())][:a.show - a.show // 2]
     S = a.scale; W = H * S; cols = min(3, len(show)); rows = (len(show) + cols - 1) // cols; frames = []
