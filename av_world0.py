@@ -118,8 +118,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     push (0..1) : JEU DE POUSSÉE (17 nov. 2026, demande user : « garbage in, garbage out » — mesuré : 26 % seulement du mouvement des objets venait de SA main,
     en coups de 3–4 images, alors que Push-T demande des poussées lentes et longues) — (1) les objets ne bougent presque plus seuls (5 %) ; (2) quand il SENT un
     contact (toucher actif), 7 fois sur 10 il POUSSE 8–16 images, vers là où il l'a senti ou dans le sens de son geste, parfois en tournant un peu ; il s'arrête s'il
-    ne sent plus rien ; (3) vitesses de 0.2 à 3.2 px par image, autant de gestes lents que de rapides, tremblement proportionnel à la vitesse ; (4) 4 fois sur 10 sa
-    main démarre CONTRE un objet. Toujours aveugle aux positions des objets : il ne réagit qu'à ce qu'il sent. push = 0 : monde inchangé (mêmes tirages)."""
+    ne sent plus rien ; (3) vitesses de 0.2 à 3.2 px par image, autant de gestes lents que de rapides, tremblement proportionnel à la vitesse ; (4) une fois sur deux sa
+    main démarre CONTRE un objet. v2 (accord user) : avec blind=False, 4 gestes sur 10 sont des TRAITS lents et longs VERS un objet qu'il voit ; les MÊMES traits à vide
+    1 fois sur 4 (sinon « geste lent et long » voudrait dire « l'objet avance »). push = 0 : monde inchangé (mêmes tirages)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
@@ -178,7 +179,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             Hp = place(rng.uniform(lo_c, hi_c, 2) if out else rng.uniform(max(lo_c, 0.05), min(hi_c, 0.95), 2))
             if N == 0 or np.all(np.linalg.norm(P - Hp, axis=1) > rc + Rh + 0.02): break
         adj = None
-        if push > 0 and N > 0 and rng.random() < 0.4 * push:         # JEU DE POUSSÉE : sa main démarre CONTRE un objet (d'un côté quelconque)
+        if push > 0 and N > 0 and rng.random() < 0.5 * push:         # JEU DE POUSSÉE : sa main démarre CONTRE un objet (d'un côté quelconque)
             k_ = int(rng.integers(N)); a_ = rng.uniform(0, 2 * math.pi); Hp = place(P[k_] + (rc[k_] + Rh + 0.015) * np.array([math.cos(a_), math.sin(a_)], np.float32)); adj = k_
         if cf["mobile"]:                                             # MOBILE (hochet suspendu) hors de portée
             mt = int(rng.choice(3, p=[0.55, 0.25, 0.20])); tcut = int(rng.integers(5, T - 4))   # tirages FIXES (paires appariées)
@@ -207,9 +208,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     stk = False; trig = False
                     if push > 0:                                     # JEU DE POUSSÉE : un quart de TRAITS à vide, et (s'il regarde) 3 sur 10 VERS un objet qu'il voit
                         r_ = rng.random()
-                        if r_ < 0.25 * push: stk = True; mode, dirv, left, spd, turn = stroke(rng.uniform(0, 2 * math.pi), 0.01, 0.06)
-                        elif N > 0 and not blind and r_ < 0.55 * push:
-                            d_ = P[int(rng.integers(N))] - Hp; stk = True; mode, dirv, left, spd, turn = stroke(math.atan2(d_[1], d_[0]) + rng.normal(0, 0.25), 0.01, 0.06)
+                        if r_ < 0.25 * push: stk = True; mode, dirv, left, spd, turn = stroke(rng.uniform(0, 2 * math.pi), 0.01, 0.08)
+                        elif N > 0 and not blind and r_ < 0.65 * push:
+                            d_ = P[int(rng.integers(N))] - Hp; stk = True; mode, dirv, left, spd, turn = stroke(math.atan2(d_[1], d_[0]) + rng.normal(0, 0.25), 0.01, 0.08)
                     if stk: pass
                     elif circ > 0 and lastd is not None and rng.random() < 0.1:   # il rejoue un geste récent, SANS contact (rejouer ≠ contact)
                         mode, dirv, rb = "rejoue", lastd, int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5)); spd = max(spd, 0.03); CIRC[i, t] = 2
@@ -327,7 +328,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                     elif TSRC[i, t] == 1 and lastd is not None and rng.random() < 0.7 * push:   # (pendant un trait déjà en cours : rien, il continue)
                         fd = (felt - Hp) / (float(np.linalg.norm(felt - Hp)) + 1e-6) if felt is not None else lastd
                         dirv = fd if rng.random() < 0.6 else np.asarray(lastd, np.float64); mode, nocon, trig = "pousse", 0, True; left = int(rng.integers(8, 17))
-                        spd = float(np.exp(rng.uniform(lv_lo, math.log(0.05)))); turn = float(rng.normal(0, 0.06)) if rng.random() < 0.4 else 0.0
+                        spd = float(np.exp(rng.uniform(lv_lo, math.log(0.06)))); turn = float(rng.normal(0, 0.06)) if rng.random() < 0.4 else 0.0
                 if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
                     cb, dirv, spd = True, lastd, max(spd, 0.03); CIRC[i, t] = 1
                     if rng.random() < 0.3 or felt is None: mode, left = "direction", int(rng.integers(2, 6))   # il CONTINUE : il pousse
