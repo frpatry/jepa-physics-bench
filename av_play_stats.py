@@ -45,6 +45,7 @@ def stats(nm, tracks, log):
     L = np.array([e[0] for e in ep] or [0]); A = np.array([e[1] for e in ep] or [0.0]); ncs = np.mean([bool(ct.any()) for _, _, _, ct in tracks])
     log(f"\n=== {nm} : {len(tracks)} suivis d'objet, {len(D)} images")
     log(f"  D'OÙ VIENT LE MOUVEMENT DES OBJETS (part du trajet total) : de LUI {pc(D[C == 0].sum() / tot)} | main du parent {pc(D[C == 1].sum() / tot)} | objets lancés seuls {pc(D[C == 2].sum() / tot)}")
+    log("  (détail) " + " | ".join(f"{nm_} : {sum(1 for t_ in tracks if t_[1] == c_)} suivis, dont {sum(1 for t_ in tracks if t_[1] == c_ and dd(t_[0]).sum() > 0.5)} où l'objet bouge, trajet total {D[C == c_].sum():.0f} px" for c_, nm_ in ((0, "lui"), (1, "parent"), (2, "lancé"))))
     log(f"  CONTACT : images où sa main touche un objet {pc(CT.mean())} | suivis avec au moins un contact {pc(ncs)} | épisodes de contact : {len(ep) / max(len(me), 1):.2f} par suivi, durée moyenne {L.mean():.1f} images "
         f"(1–2 images {pc(np.mean(L <= 2))}, 3–7 {pc(np.mean((L >= 3) & (L < 8)))}, ≥ 8 {pc(np.mean(L >= 8))}) | trajet de l'objet par épisode : < 0.5 px {pc(np.mean(A < 0.5))}, 0.5–2 px {pc(np.mean((A >= 0.5) & (A < 2)))}, 2–6 px {pc(np.mean((A >= 2) & (A < 6)))}, > 6 px {pc(np.mean(A >= 6))}")
     log(f"  OBJET qu'il fait bouger, par image : bouge (> 0.02 px) {pc(np.mean(Dm > 0.02))} des images | quand il bouge : lent (< 0.3 px) {pc(np.mean(mvf < 0.3))}, moyen (0.3–1 px) {pc(np.mean((mvf >= 0.3) & (mvf < 1)))}, rapide (> 1 px) {pc(np.mean(mvf >= 1))}"
