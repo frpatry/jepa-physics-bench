@@ -307,8 +307,8 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                                 J = -2 * s_ * m[k] * m[j] / (m[k] + m[j]); V[k] += J / m[k] * nv; V[j] -= J / m[j] * nv
                                 om[k] += rng.normal(0, 0.1); om[j] += rng.normal(0, 0.1)
                                 xc = float((P[k, 0] + P[j, 0]) / 2); ga = att_out((P[k] + P[j]) / 2); ev += [(t - 0.5, k, J * ga, xc), (t - 0.5, j, J * ga, xc)]
-                            push = (rc[k] + rc[j] - dist) / 2
-                            P[k] = np.clip(P[k] + push * nv, rc[k] - mg, 1 - rc[k] + mg); P[j] = np.clip(P[j] - push * nv, rc[j] - mg, 1 - rc[j] + mg)
+                            sep_ = (rc[k] + rc[j] - dist) / 2          # (ne pas nommer « push » : c'est le réglage du jeu de poussée)
+                            P[k] = np.clip(P[k] + sep_ * nv, rc[k] - mg, 1 - rc[k] + mg); P[j] = np.clip(P[j] - sep_ * nv, rc[j] - mg, 1 - rc[j] + mg)
                 if fric > 0:
                     v_ = np.linalg.norm(V, axis=1, keepdims=True); V *= np.clip(1 - fric / (v_ + 1e-9), 0, 1)
                     om *= 0.97 if fric < 0.003 else 0.9
