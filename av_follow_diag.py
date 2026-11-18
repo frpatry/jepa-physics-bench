@@ -11,7 +11,7 @@ vraiment être faits (1 pas, et les 8 suivants), puis on compare à ce qui se pa
 GIF : la vraie image 8 gestes plus tard, croix = vrai centre du T, ronds = centre de départ + déplacement imaginé (jaune : sens donnés, orange : sans).
   python av_follow_diag.py --ckpt bebe3c.pt --out suivre.gif
 """
-import argparse, copy, time
+import argparse, copy, glob, json, time
 import numpy as np, torch, torch.nn.functional as F
 from PIL import Image, ImageDraw
 import av_phase0, av_plan0
@@ -32,22 +32,26 @@ def pusher(env):
 
 def main():
     p = argparse.ArgumentParser(); p.add_argument("--ckpt", required=True); p.add_argument("--out", default="suivre.gif"); p.add_argument("--episodes", type=int, default=10)
-    p.add_argument("--steps", type=int, default=120); p.add_argument("--h", type=int, default=8); p.add_argument("--show", type=int, default=3)
+    p.add_argument("--steps", type=int, default=120); p.add_argument("--rec", type=str, default="", help="dossier de parties JOUÉES PAR L'UTILISATEUR (pusht_record.py) : ses gestes sont rejoués tels quels, le but est le vrai but"); p.add_argument("--h", type=int, default=8); p.add_argument("--show", type=int, default=3)
     a = p.parse_args(); dev = "cuda" if torch.cuda.is_available() else "cpu"; t0 = time.time(); log = lambda s_: print(s_, flush=True)
     ck = torch.load(a.ckpt, map_location=dev, weights_only=False); cfg, st = ck["cfg"], ck["norm"]; T = int(cfg.get("T", 16)); d = cfg["d"]; av_phase0.T = T; av_plan0.T = T
     m = baby_from_cfg(cfg, dev); m.load_state_dict(ck["m"]); m.eval(); tgt = copy.deepcopy(m.enc); tgt.load_state_dict(ck["tgt"]); tgt.eval(); om = m.oi.eval()
     P_ = cfg["P"]; nP = H // P_; npf = nP * nP; nv = T * npf; v = VIEW["0e"]; wk = cfg.get("wkw", {}); Hh = a.h; LN = lambda u: F.layer_norm(u.float(), (d,)); ic, ia = nv + T, nv + 2 * T
     cellfrac = lambda M: M.reshape(nP, P_, nP, P_).mean((1, 3)).reshape(npf)                       # part de chaque case (instrument : couleurs des pixels)
     R = []; films = []; log(f"SUIVRE LES BONS GESTES : bébé au pas {ck['state']['it']} | {a.episodes} parties de l'oracle, {a.steps} gestes, horizon {Hh}")
-    for ep in range(a.episodes):
-        env = Push0(ep, task="pusht", damp=wk.get("damp", 0.0), echo=wk.get("echo", 0.0), shape_phys=bool(wk.get("shape_phys", False)), L=a.steps + 2 + Hh + T, obj_scale=wk.get("obj_scale", 1.0))
+    recs = [json.load(open(f)) for f in sorted(glob.glob(a.rec + "/*.json"))] if a.rec else []
+    for ep, rc_ in enumerate(recs or [None] * a.episodes):
+        seed = rc_["ep"] if rc_ else ep; nst = rc_["n"] if rc_ else a.steps
+        env = Push0(seed, task="pusht", damp=wk.get("damp", 0.0), echo=wk.get("echo", 0.0), shape_phys=bool(wk.get("shape_phys", False)), L=nst + 2 + Hh + T, obj_scale=wk.get("obj_scale", 1.0))
         c0 = env.coverage(); cov = [c0]
-        for _ in range(a.steps): env.step(pusher(env)); cov.append(env.coverage())
+        for i_ in range(nst): env.step(np.array(rc_["cmd"][i_], np.float32) if rc_ else pusher(env)); cov.append(env.coverage())
+        if rc_: log(f"  partie {ep} (T n° {seed}, {nst} gestes de l'utilisateur) : écart du rejeu avec l'enregistrement {float(np.abs(env.POS[:nst + 1] - np.array(rc_['pos'])).max() * H):.3f} px")
         te = env.t; mvd = float(np.mean(np.linalg.norm(np.diff(env.POS[:te + 1], axis=0), axis=1) * H > 0.05)); ev_all = list(env.ev); film = []
         log(f"  partie {ep} : couverture du but d'origine {c0:.0%} -> {cov[-1]:.0%} (max {max(cov):.0%}) | gestes où le T bouge {mvd:.0%} | {time.time() - t0:.0f}s")
-        env.g, env.g_ang = env.POS[te].copy(), float(env.ANG[te])        # BUT A POSTERIORI = là où le T finit vraiment : ces gestes mènent EXACTEMENT au but
-        if hasattr(env, "_gc"): del env._gc
-        cov = [env.coverage(env.POS[q], env.ANG[q]) for q in range(te + 1)]
+        if not rc_:
+            env.g, env.g_ang = env.POS[te].copy(), float(env.ANG[te])    # BUT A POSTERIORI = là où le T finit vraiment : ces gestes mènent EXACTEMENT au but
+            if hasattr(env, "_gc"): del env._gc
+            cov = [env.coverage(env.POS[q], env.ANG[q]) for q in range(te + 1)]
         for tau in range(T - 1 - Hh, te - Hh):
             s0 = max(0, tau + Hh - (T - 1)); t = tau - s0
             env.t = tau; env.ev = [e for e in ev_all if e[0] <= tau]; b = env.batch(s0); env.t = te; env.ev = ev_all            # ce qu'il a vécu jusqu'à tau (comme au jeu)
