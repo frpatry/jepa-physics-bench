@@ -177,8 +177,9 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             out = lo < 0 and rng.random() < 0.3                     # 0b : la main commence parfois HORS du champ
             Hp = place(rng.uniform(lo_c, hi_c, 2) if out else rng.uniform(max(lo_c, 0.05), min(hi_c, 0.95), 2))
             if N == 0 or np.all(np.linalg.norm(P - Hp, axis=1) > rc + Rh + 0.02): break
+        adj = None
         if push > 0 and N > 0 and rng.random() < 0.4 * push:         # JEU DE POUSSÉE : sa main démarre CONTRE un objet (d'un côté quelconque)
-            k_ = int(rng.integers(N)); a_ = rng.uniform(0, 2 * math.pi); Hp = place(P[k_] + (rc[k_] + Rh + 0.015) * np.array([math.cos(a_), math.sin(a_)], np.float32))
+            k_ = int(rng.integers(N)); a_ = rng.uniform(0, 2 * math.pi); Hp = place(P[k_] + (rc[k_] + Rh + 0.015) * np.array([math.cos(a_), math.sin(a_)], np.float32)); adj = k_
         if cf["mobile"]:                                             # MOBILE (hochet suspendu) hors de portée
             mt = int(rng.choice(3, p=[0.55, 0.25, 0.20])); tcut = int(rng.integers(5, T - 4))   # tirages FIXES (paires appariées)
             mt = mt if force_mtype is None else force_mtype; tcut = (tcut if force_tcut is None else force_tcut) if mt == 2 else T; MTYPE[i] = mt
@@ -192,14 +193,25 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
             pwait, ppush, pspd = int(rng.integers(0, 4)), int(rng.integers(2, 5)), rng.uniform(0.03, 0.07); pmode = "attend"
         left, mode, spd, tgt, dirv = 0, "immobile", vmax, None, None
         rb, cb, lastd, felt = 0, False, None, None                               # réaction circulaire : pas de recul restants, geste rejoué en cours, dernière direction
-        nocon, turn = 0, 0.0; lv_lo = math.log(0.006)                            # JEU DE POUSSÉE : images sans contact pendant une poussée, virage par image
+        nocon, turn, trig = 0, 0.0, False; lv_lo = math.log(0.006)               # JEU DE POUSSÉE : images sans contact pendant une poussée, virage par image, poussée déclenchée par un contact
+        def stroke(a_, lo_=0.006, hi_=0.05):                         # TRAIT lent, long et régulier (le MÊME geste au contact, vers un objet et à vide : le geste ne trahit pas le contact)
+            return "pousse", np.array([math.cos(a_), math.sin(a_)]), int(rng.integers(8, 17)), float(np.exp(rng.uniform(math.log(lo_), math.log(hi_)))), (float(rng.normal(0, 0.06)) if rng.random() < 0.4 else 0.0)
+        if adj is not None:                                          # il démarre contre un objet : 6 fois sur 10 il pousse VERS lui (s'il regarde), sinon ailleurs
+            d_ = P[adj] - Hp; mode, dirv, left, spd, turn = stroke(math.atan2(d_[1], d_[0]) + rng.normal(0, 0.3) if (not blind and rng.random() < 0.6) else rng.uniform(0, 2 * math.pi))
         pg = 0.35 if stage == "0c" else 0.15                         # 0c : plus de gigotage (les coups de pied du mobile)
         for t in range(T):
             if t > 0:
                 if left <= 0:                                        # BABILLAGE (modes de v5)
                     left = rng.integers(2, 7); u_ = rng.random(); spd = rng.uniform(0.015, vmax); mode = "tgt"; cb = False
                     if push > 0 and rng.random() < push: left = rng.integers(3, 11); spd = float(np.exp(rng.uniform(lv_lo, math.log(vmax))))   # lent comme rapide, gestes plus longs
-                    if circ > 0 and lastd is not None and rng.random() < 0.1:   # il rejoue un geste récent, SANS contact (rejouer ≠ contact)
+                    stk = False; trig = False
+                    if push > 0:                                     # JEU DE POUSSÉE : un quart de TRAITS à vide, et (s'il regarde) 3 sur 10 VERS un objet qu'il voit
+                        r_ = rng.random()
+                        if r_ < 0.25 * push: stk = True; mode, dirv, left, spd, turn = stroke(rng.uniform(0, 2 * math.pi), 0.01, 0.06)
+                        elif N > 0 and not blind and r_ < 0.55 * push:
+                            d_ = P[int(rng.integers(N))] - Hp; stk = True; mode, dirv, left, spd, turn = stroke(math.atan2(d_[1], d_[0]) + rng.normal(0, 0.25), 0.01, 0.06)
+                    if stk: pass
+                    elif circ > 0 and lastd is not None and rng.random() < 0.1:   # il rejoue un geste récent, SANS contact (rejouer ≠ contact)
                         mode, dirv, rb = "rejoue", lastd, int(rng.integers(1, 3)); left = rb + int(rng.integers(2, 5)); spd = max(spd, 0.03); CIRC[i, t] = 2
                     elif N > 0 and calm > 0 and rng.random() < 0.35 * calm: mode = "immobile"   # il REGARDE, sans rien faire (monde lisible)
                     elif N > 0 and u_ < p_obj and not blind:            # p_obj : part des gestes VERS un objet (run 2 : plus de contacts)
@@ -311,10 +323,10 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
                 if push > 0:                                         # JEU DE POUSSÉE : il réagit à ce qu'il SENT (jamais à la position de l'objet)
                     if mode == "pousse":
                         nocon = 0 if TSRC[i, t] > 0 else nocon + 1
-                        if nocon >= 3: left = 0                       # il ne sent plus rien : il arrête de pousser
-                    elif TSRC[i, t] == 1 and lastd is not None and rng.random() < 0.7 * push:
+                        if trig and nocon >= 4: left = 0              # (poussée née d'un contact) il ne sent plus rien : il arrête
+                    elif TSRC[i, t] == 1 and lastd is not None and rng.random() < 0.7 * push:   # (pendant un trait déjà en cours : rien, il continue)
                         fd = (felt - Hp) / (float(np.linalg.norm(felt - Hp)) + 1e-6) if felt is not None else lastd
-                        dirv = fd if rng.random() < 0.6 else np.asarray(lastd, np.float64); mode, nocon = "pousse", 0; left = int(rng.integers(8, 17))
+                        dirv = fd if rng.random() < 0.6 else np.asarray(lastd, np.float64); mode, nocon, trig = "pousse", 0, True; left = int(rng.integers(8, 17))
                         spd = float(np.exp(rng.uniform(lv_lo, math.log(0.05)))); turn = float(rng.normal(0, 0.06)) if rng.random() < 0.4 else 0.0
                 if circ > 0 and TSRC[i, t] == 1 and not cb and lastd is not None and rng.random() < circ:   # RÉACTION CIRCULAIRE (il l'a SENTI)
                     cb, dirv, spd = True, lastd, max(spd, 0.03); CIRC[i, t] = 1

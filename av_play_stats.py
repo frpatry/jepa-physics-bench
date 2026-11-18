@@ -27,20 +27,30 @@ def runs(mv):
 
 
 def stats(nm, tracks, log):
-    """tracks : [(pos (T,2) px, mine (T-1,) bool = déplacement dû à SA main, hand (T,2) px)]"""
-    D = np.concatenate([np.linalg.norm(np.diff(p, axis=0), axis=1) for p, _, _ in tracks]); M = np.concatenate([m for _, m, _ in tracks]); Dh = np.concatenate([np.linalg.norm(np.diff(h, axis=0), axis=1) for _, _, h in tracks])
-    R = [(l, float(np.linalg.norm(p[t0 + l] - p[t0]))) for p, _, _ in tracks for t0, l in runs(np.linalg.norm(np.diff(p, axis=0), axis=1) > 0.2)]; L = np.array([r[0] for r in R] or [0]); A = np.array([r[1] for r in R] or [0.0])
-    W = np.concatenate([np.linalg.norm(p[8:] - p[:-8], axis=1) for p, _, _ in tracks if len(p) > 8]); Wh = np.concatenate([np.linalg.norm(h[8:] - h[:-8], axis=1) for _, _, h in tracks if len(h) > 8])
-    nseq = len(tracks); nfr = len(D); pc = lambda x: f"{100 * x:5.1f} %"
-    log(f"\n=== {nm} : {nseq} suivis d'objet, {nfr} images")
-    log(f"  OBJET, d'une image à la suivante : bouge (> 0.05 px) {pc(np.mean(D > 0.05))} | > 0.5 px {pc(np.mean(D > 0.5))} | > 1 px {pc(np.mean(D > 1))} | > 2 px {pc(np.mean(D > 2))} | déplacement moyen {D.mean():.3f} px par image"
-        f" | part du mouvement due à SA main {pc(D[M].sum() / max(D.sum(), 1e-9))}")
-    log(f"  MAIN, d'une image à la suivante  : bouge (> 0.05 px) {pc(np.mean(Dh > 0.05))} | > 0.5 px {pc(np.mean(Dh > 0.5))} | > 1 px {pc(np.mean(Dh > 1))} | > 2 px {pc(np.mean(Dh > 2))} | déplacement moyen {Dh.mean():.3f} px par image")
-    log(f"  OBJET sur 8 images : immobile (< 0.1 px) {pc(np.mean(W < 0.1))} | 0.1–1 px {pc(np.mean((W >= 0.1) & (W < 1)))} | 1–2 px {pc(np.mean((W >= 1) & (W < 2)))} | 2–4 px {pc(np.mean((W >= 2) & (W < 4)))} | 4–8 px {pc(np.mean((W >= 4) & (W < 8)))} | > 8 px {pc(np.mean(W >= 8))}"
-        f" || MAIN sur 8 images : < 1 px {pc(np.mean(Wh < 1))} | 1–4 px {pc(np.mean((Wh >= 1) & (Wh < 4)))} | 4–8 px {pc(np.mean((Wh >= 4) & (Wh < 8)))} | > 8 px {pc(np.mean(Wh >= 8))}")
-    log(f"  DÉPLACEMENTS D'AFFILÉE de l'objet (suites d'images où il avance de > 0.2 px) : {len(R) / max(nfr, 1) * 100:.2f} pour 100 images | durée moyenne {L.mean():.1f} images (≥ 4 images : {pc(np.mean(L >= 4))}, ≥ 8 : {pc(np.mean(L >= 8))})"
-        f" | trajet moyen {A.mean():.2f} px (≥ 2 px : {pc(np.mean(A >= 2))}, ≥ 4 px : {pc(np.mean(A >= 4))}, ≥ 8 px : {pc(np.mean(A >= 8))})")
-    return dict(mv=np.mean(D > 0.5), mean=D.mean(), w48=np.mean(W >= 4))
+    """tracks : [(pos (T,2) px, cause 0 lui / 1 parent / 2 objet lancé, hand (T,2) px, contact (T,) bool)]"""
+    pc = lambda x: f"{100 * x:5.1f} %"; dd = lambda p: np.linalg.norm(np.diff(p, axis=0), axis=1)
+    D = np.concatenate([dd(p) for p, _, _, _ in tracks]); C = np.concatenate([np.full(len(p) - 1, c) for p, c, _, _ in tracks]); Dh = np.concatenate([dd(h) for _, _, h, _ in tracks]); CT = np.concatenate([ct for _, _, _, ct in tracks])
+    tot = max(D.sum(), 1e-9); me = [t_ for t_ in tracks if t_[1] == 0]; Dm = np.concatenate([dd(p) for p, _, _, _ in me]); mvf = Dm[Dm > 0.02]
+    W = np.concatenate([np.linalg.norm(p[8:] - p[:-8], axis=1) for p, _, _, _ in me if len(p) > 8]); Wh = np.concatenate([np.linalg.norm(h[8:] - h[:-8], axis=1) for _, _, h, _ in tracks if len(h) > 8])
+    ep = []                                     # épisodes de contact (trous de ≤ 2 images comblés) : durée, trajet de l'objet pendant l'épisode + 3 images
+    for p, c, _, ct in me:
+        t = 0; n = len(ct)
+        while t < n:
+            if ct[t]:
+                t1 = t; gap = 0
+                while t1 + 1 < n and (ct[t1 + 1] or gap < 2): gap = 0 if ct[t1 + 1] else gap + 1; t1 += 1
+                while t1 > t and not ct[t1]: t1 -= 1
+                ep.append((t1 - t + 1, float(np.linalg.norm(p[min(t1 + 3, n - 1)] - p[max(t - 1, 0)])))); t = t1 + 1
+            else: t += 1
+    L = np.array([e[0] for e in ep] or [0]); A = np.array([e[1] for e in ep] or [0.0]); ncs = np.mean([bool(ct.any()) for _, _, _, ct in tracks])
+    log(f"\n=== {nm} : {len(tracks)} suivis d'objet, {len(D)} images")
+    log(f"  D'OÙ VIENT LE MOUVEMENT DES OBJETS (part du trajet total) : de LUI {pc(D[C == 0].sum() / tot)} | main du parent {pc(D[C == 1].sum() / tot)} | objets lancés seuls {pc(D[C == 2].sum() / tot)}")
+    log(f"  CONTACT : images où sa main touche un objet {pc(CT.mean())} | suivis avec au moins un contact {pc(ncs)} | épisodes de contact : {len(ep) / max(len(me), 1):.2f} par suivi, durée moyenne {L.mean():.1f} images "
+        f"(1–2 images {pc(np.mean(L <= 2))}, 3–7 {pc(np.mean((L >= 3) & (L < 8)))}, ≥ 8 {pc(np.mean(L >= 8))}) | trajet de l'objet par épisode : < 0.5 px {pc(np.mean(A < 0.5))}, 0.5–2 px {pc(np.mean((A >= 0.5) & (A < 2)))}, 2–6 px {pc(np.mean((A >= 2) & (A < 6)))}, > 6 px {pc(np.mean(A >= 6))}")
+    log(f"  OBJET qu'il fait bouger, par image : bouge (> 0.02 px) {pc(np.mean(Dm > 0.02))} des images | quand il bouge : lent (< 0.3 px) {pc(np.mean(mvf < 0.3))}, moyen (0.3–1 px) {pc(np.mean((mvf >= 0.3) & (mvf < 1)))}, rapide (> 1 px) {pc(np.mean(mvf >= 1))}"
+        f" || sur 8 images : immobile (< 0.1 px) {pc(np.mean(W < 0.1))} | 0.1–1 px {pc(np.mean((W >= 0.1) & (W < 1)))} | 1–4 px {pc(np.mean((W >= 1) & (W < 4)))} | > 4 px {pc(np.mean(W >= 4))}")
+    log(f"  MAIN, par image : < 0.3 px {pc(np.mean(Dh < 0.3))} | 0.3–1 px {pc(np.mean((Dh >= 0.3) & (Dh < 1)))} | 1–2 px {pc(np.mean((Dh >= 1) & (Dh < 2)))} | > 2 px {pc(np.mean(Dh >= 2))} | moyenne {Dh.mean():.2f} px")
+    return dict(lui=D[C == 0].sum() / tot, ct=CT.mean(), l8=np.mean(L >= 8), ncs=ncs)
 
 
 def main():
@@ -56,21 +66,21 @@ def main():
             fr[0].save(a.gif, save_all=True, append_images=fr[1:], duration=300, loop=0); act = (w["TSRC"] == 1) if "TSRC" in w else (np.abs(w["TOUCH"]).sum(-1) > 0)
         ncon += int((np.abs(w["TOUCH"]).sum(-1) > 0).any(1).sum()); nobj += list(w["NOBJ"])
         for i in range(n):
-            hd = w["HAND"][i] * H
+            hd = w["HAND"][i] * H; ct = w["TSRC"][i] > 0; par = bool(np.isfinite(w["PAR"][i]).any()) if "PAR" in w else False; t1 = int(np.argmax(ct)) if ct.any() else T
             for j in range(int(w["NOBJ"][i])):
                 ps = w["POS"][i, :, j] * H
                 if np.isnan(ps).any(): continue
-                near = np.linalg.norm(ps - hd, axis=1) < 9; mine = (act[i, :-1] | act[i, 1:]) & (near[:-1] | near[1:]); tr.append((ps, mine, hd))
+                auto = t1 >= 2 and float(np.linalg.norm(np.diff(ps[:t1], axis=0), axis=1).max()) > 0.05      # il bougeait AVANT tout contact : lancé seul
+                near = np.linalg.norm(ps - hd, axis=1) < 10; tr.append((ps, 1 if par else (2 if auto else 0), hd, ct & near))
     log(f"{a.n} séquences de {T} images | avec au moins un contact senti {ncon / a.n:.0%} | objets par séquence {np.mean(nobj):.2f} | {time.time() - t0:.0f}s")
-    s1 = stats("JEU LIBRE DU BÉBÉ (monde de son entraînement)", tr, log)
+    stats("JEU LIBRE DU BÉBÉ", tr, log)
     av_plan0.T = T; tr2 = []
     for f in sorted(glob.glob(a.rec + "/*.json")):
         r = json.load(open(f)); env = Push0(r["ep"], task="pusht", damp=wkw.get("damp", 0.0), echo=wkw.get("echo", 0.0), shape_phys=bool(wkw.get("shape_phys", False)), L=r["n"] + 2, obj_scale=wkw.get("obj_scale", 1.0))
         for c in r["cmd"]: env.step(np.array(c, np.float32), render=False)
-        n = r["n"]; tc = np.abs(env.TOUCH[:n + 1]).sum(-1) > 0; tr2.append((env.POS[:n + 1] * H, tc[:-1] | tc[1:], env.HAND[:n + 1] * H))
-    if tr2:
-        s2 = stats("PARTIES PUSH-T JOUÉES PAR L'UTILISATEUR", tr2, log)
-        log(f"\nRÉSUMÉ : images où l'objet avance de > 0.5 px — jeu libre {s1['mv']:.1%}, utilisateur {s2['mv']:.1%} (× {s2['mv'] / max(s1['mv'], 1e-9):.1f}) | déplacement moyen par image — {s1['mean']:.3f} px contre {s2['mean']:.3f} px")
+        n = r["n"]; mvd = np.linalg.norm(np.diff(env.POS[:n + 1], axis=0), axis=1) > 0.005; tc = np.concatenate([[False], mvd]) | np.concatenate([mvd, [False]])   # contact ≈ le T avance (il ne bouge que poussé)
+        tr2.append((env.POS[:n + 1] * H, 0, env.HAND[:n + 1] * H, tc))
+    if tr2: stats("PARTIES PUSH-T JOUÉES PAR L'UTILISATEUR", tr2, log)
     log(f"total {time.time() - t0:.0f}s")
 
 
