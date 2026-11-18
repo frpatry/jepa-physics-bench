@@ -122,6 +122,7 @@ def gen_world0(n, stage="0a", T=16, H=32, seed=0, a_sub=2, hum=0.15, vmax=0.1, m
     main démarre CONTRE un objet. v2 (accord user) : avec blind=False, 4 gestes sur 10 sont des TRAITS lents et longs VERS un objet qu'il voit ; les MÊMES traits à vide
     1 fois sur 4 (sinon « geste lent et long » voudrait dire « l'objet avance »). push = 0 : monde inchangé (mêmes tirages)."""
     cf = STAGES[stage]; rng = np.random.default_rng(seed); K = 3
+    if cf["nobj"][1] == 0 and nobj is None: push = 0.0             # étapes sans objet (bras, mains, mobile) : babillage inchangé
     yy, xx = (np.mgrid[0:H, 0:H].astype(np.float32) + 0.5) / H
     X = np.zeros((n, T, H, H, 3), np.float32); A = np.zeros((n, T, a_sub * 2, NB), np.float32)
     XNH = np.zeros((n, T, H, H, 3), np.float32) if nohand else None    # nohand : la même image SANS sa main (but « objet seulement »)
