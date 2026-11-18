@@ -44,12 +44,16 @@ def stats(nm, tracks, log):
 
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--ckpt", required=True); p.add_argument("--rec", default="recordings"); p.add_argument("--n", type=int, default=4000)
+    p = argparse.ArgumentParser(); p.add_argument("--ckpt", required=True); p.add_argument("--rec", default="recordings"); p.add_argument("--n", type=int, default=4000); p.add_argument("--set", type=str, default="", help="réglages du monde à changer, ex. push=1,p_parent=0.1"); p.add_argument("--gif", type=str, default="", help="GIF de 12 séquences de ce jeu libre")
     a = p.parse_args(); t0 = time.time(); log = lambda s_: print(s_, flush=True)
-    cfg = torch.load(a.ckpt, map_location="cpu", weights_only=False)["cfg"]; wkw = dict(cfg.get("wkw", {})); T = int(cfg.get("T", 16)); log(f"monde du jeu libre (étape 0e), réglages de la sauvegarde : {wkw}")
+    cfg = torch.load(a.ckpt, map_location="cpu", weights_only=False)["cfg"]; wkw = dict(cfg.get("wkw", {})); T = int(cfg.get("T", 16)); wkw.update({k_: float(v_) for k_, v_ in (x.split("=") for x in a.set.split(",") if x)}); log(f"monde du jeu libre (étape 0e), réglages : {wkw}")
     tr = []; ncon = 0; nobj = []
     for c0 in range(0, a.n, 500):
-        w = gen_world0(min(500, a.n - c0), "0e", T, H, seed=31_000 + c0 // 500, **wkw); n = len(w["X"]); act = (w["TSRC"] == 1) if "TSRC" in w else (np.abs(w["TOUCH"]).sum(-1) > 0)
+        w = gen_world0(min(500, a.n - c0), "0e", T, H, seed=31_000 + c0 // 500, **wkw); n = len(w["X"])
+        if a.gif and c0 == 0:
+            from PIL import Image
+            S_ = 6; fr = [Image.fromarray((np.concatenate([np.concatenate([np.pad(w["X"][r * 6 + c, t], ((1, 1), (1, 1), (0, 0)), constant_values=0.25) for c in range(6)], 1) for r in range(2)], 0) * 255).astype(np.uint8)).resize((6 * 34 * S_, 2 * 34 * S_), Image.NEAREST) for t in range(T)]
+            fr[0].save(a.gif, save_all=True, append_images=fr[1:], duration=300, loop=0); act = (w["TSRC"] == 1) if "TSRC" in w else (np.abs(w["TOUCH"]).sum(-1) > 0)
         ncon += int((np.abs(w["TOUCH"]).sum(-1) > 0).any(1).sum()); nobj += list(w["NOBJ"])
         for i in range(n):
             hd = w["HAND"][i] * H

@@ -603,7 +603,7 @@ def main():
     p.add_argument("--oi_from", type=int, default=0, help="pas où elle commence"); p.add_argument("--oi_warm", type=int, default=6000, help="échauffement SANS déplacement (sinon faux décalage global)")
     p.add_argument("--oi_grow", type=int, default=14000, help="puis l'horizon grandit de 1 à --oi_kmax pas sur ce nombre de pas"); p.add_argument("--oi_kmax", type=int, default=12)
     p.add_argument("--oi_lr", type=float, default=2e-4); p.add_argument("--oi_still", type=float, default=0.005); p.add_argument("--oi_sens_from", type=int, default=0, help="pas où les SENS imaginés commencent à apprendre (étape 6)")
-    p.add_argument("--oi_sens_ramp", type=int, default=0, help="montée douce du poids des sens imaginés sur ce nombre de pas (15 nov. 2026 : lancés d'un coup à 80k, l'objet poussé imaginé est retombé de 32 % à 12 % en 5000 pas)")
+    p.add_argument("--push_play", type=float, default=0.0, help="JEU DE POUSSÉE (17 nov. 2026, av_world0 push) : presque rien ne bouge sans lui ; quand il SENT un contact il pousse 8–16 images ; vitesses lentes comme rapides ; main qui démarre parfois contre un objet"); p.add_argument("--oi_sens_ramp", type=int, default=0, help="montée douce du poids des sens imaginés sur ce nombre de pas (15 nov. 2026 : lancés d'un coup à 80k, l'objet poussé imaginé est retombé de 32 % à 12 % en 5000 pas)")
     p.add_argument("--oi_sens_w", type=float, default=1.0); p.add_argument("--oi_nce", type=float, default=0.5, help="perte de contraste latente sur les sens imaginés (pilote 2 : 0.83 → 0.97)")
     p.add_argument("--oi_eye", type=int, default=0, help="0 = l'imagination lit l'œil-CIBLE (aucun gradient vers l'œil, comme les pilotes) ; 1 = elle lit l'œil EN LIGNE (l'œil apprend aussi à être imaginable)")
     p.add_argument("--oi_eval", type=int, default=1000, help="scènes de l'examen de l'imagination par objet")
@@ -660,7 +660,7 @@ def main():
     def stage_of(it):
         j = min(int(np.searchsorted(starts, it - 1, side="right")) - 1, 4)          # pas 1..budget -> 0a, etc.
         f = (it - 1 - starts[j]) / bud[j] if j < 4 else 0.0; return ORDER[j], min(f, 1.0)
-    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"obj_scale": a.obj_scale} if a.obj_scale != 1.0 else {}), **({"nohand": True} if (a.goal_w > 0 and a.goal_nohand) or a.hand_hidden > 0 else {}))
+    wkw = dict(p_obj=a.p_obj, mob_size=a.mob_size, p_parent=a.parent, **({"blind": True} if a.blind else {}), **({"circ": a.circ} if a.circ > 0 else {}), **({"pause": False} if a.no_pause else {}), **({"echo": a.echo} if a.echo > 0 else {}), **({"damp": a.damp} if a.damp > 0 else {}), **({"shape_phys": True} if a.shape_phys else {}), **({"obj_scale": a.obj_scale} if a.obj_scale != 1.0 else {}), **({"push": a.push_play} if a.push_play > 0 else {}), **({"nohand": True} if (a.goal_w > 0 and a.goal_nohand) or a.hand_hidden > 0 else {}))
     if a.p_auto >= 0: wkw["p_auto"] = a.p_auto
     ws = to_np([gen_world0(300, s_, T, H, seed=99 + j, **wkw) for j, s_ in enumerate(ORDER)])          # normalisation des sens
     A0 = stereo(torch.from_numpy(ws["A"]).float()).reshape(-1, T, 4 * NB)
