@@ -79,6 +79,12 @@ def read_lames(patterns, ids):
 
 
 # ---------- liste des entraînements avec étiquettes ----------
+def fractions_du_bras(ft, bras):
+    """→ [(fraction, nombre de graines, pas)] pour ce bras ; ft["fractions_<bras>"] (facultatif) restreint ses fractions."""
+    permis = ft.get("fractions_" + bras, ft["fractions"])
+    return [(f, g, p) for f, g, p in zip(ft["fractions"], ft["graines"], ft["pas"]) if f in permis]
+
+
 def job_id(j):
     return "{}_f{:g}_g{}_lr{:g}".format(j["bras"], j["frac"], j["graine"], j["lr"])
 
@@ -97,8 +103,11 @@ def plan_jobs(cfg, D):
     Phase 1 : graine 0 avec chaque taux d'apprentissage. Phase 2, quand la phase 1 du couple (bras, fraction) est finie :
     les autres graines avec le meilleur taux, choisi sur la VALIDATION (jamais sur le test)."""
     R = read_results(D); ft = cfg["ft"]; todo = []; fini = True
-    for frac, ng in zip(ft["fractions"], ft["graines"]):
+    for frac in ft["fractions"]:                     # les petites fractions d'abord, pour tous les bras
         for bras in ft["bras"]:
+            ng = next((g for f, g, _ in fractions_du_bras(ft, bras) if f == frac), None)
+            if ng is None:
+                continue
             p1 = [dict(bras=bras, frac=frac, graine=0, lr=lr) for lr in ft["lr_" + bras]]
             manque = [j for j in p1 if job_id(j) not in R]
             if not manque:
@@ -115,7 +124,7 @@ def report(cfg, D, meta=None, test_ids=None):
     Écrit resultats.csv, resultats.md, courbe.png et submission.csv (prédictions du test Kaggle ; jamais envoyé par le code)."""
     R = read_results(D); ft = cfg["ft"]; rows = []; soumission = None
     for bras in ft["bras"]:
-        for frac, ng in zip(ft["fractions"], ft["graines"]):
+        for frac, ng, _ in fractions_du_bras(ft, bras):
             p1 = [R.get(job_id(dict(bras=bras, frac=frac, graine=0, lr=lr))) for lr in ft["lr_" + bras]]
             faits = [r for r in p1 if r]
             if not faits:
@@ -146,8 +155,10 @@ def report(cfg, D, meta=None, test_ids=None):
         L.append("| {} | {:g} % | {:g} | {} | {:.4f} | {:.4f} ± {:.4f} | {:.4f} ± {:.4f} | {:.4f} | {} |".format(
             r["bras"], 100 * r["fraction"], r["lr"], r["n_graines"], r["val_auc"], r["test_auc"], r["test_auc_ecart"],
             r["test_auc_8vues"], r["test_auc_8vues_ecart"], r["test_auc_ensemble"], "oui" if r["complet"] else "NON"))
-    L += ["", "Limites : notre test est pris dans le « train » Kaggle — le test Kaggle vient d'autres lames et son score sera sans doute plus bas ;",
-          "pas de bras « de zéro » : on mesure si le score est bon, pas ce que le pré-entraînement apporte ; le calcul sur GPU n'est pas reproductible au chiffre près."]
+    L += ["", "Bras : jepa_ft = pré-entraîné puis ajusté en entier ; jepa_gel = encodeur pré-entraîné gelé + petite tête ; zero = le même modèle sans pré-entraînement (repère).",
+          "", "Limites : notre test est pris dans le « train » Kaggle — le test Kaggle vient d'autres lames et son score sera sans doute plus bas ;",
+          "le repère « zero » est un ViT appris de zéro, faible quand les étiquettes sont rares : un écart dit « le pré-entraînement aide ce modèle », pas « il bat tout » ;",
+          "le calcul sur GPU n'est pas reproductible au chiffre près."]
     with open(os.path.join(D, "resultats.md"), "w") as h:
         h.write("\n".join(L) + "\n")
     print("\n".join(L), flush=True)

@@ -302,7 +302,8 @@ def run_job(job, cfg, D, cache, dev, fin, chrono=0):
     if job["bras"] != "zero" and not (chrono and not os.path.exists(f_pre)):
         s = torch.load(f_pre, map_location="cpu", weights_only=False); pas_pre = s["pas"]
         enc.load_state_dict({k[4:]: v for k, v in s["modele"].items() if k.startswith("tgt.")})          # on part de l'encodeur-cible (le plus stable)
-    tete = Tete(mo["largeur"], mo["tetes"]).to(dev); L = len(enc.blocks) + 1; dc = ft["decroissance_couches"]
+    tete = Tete(mo["largeur"], mo["tetes"]).to(dev); L = len(enc.blocks) + 1
+    dc = 1.0 if job["bras"] == "zero" else ft["decroissance_couches"]      # de zéro : toutes les couches au même taux (les freiner n'a de sens que si elles sont déjà apprises)
     if gel: enc.requires_grad_(False); blocs = [(list(tete.parameters()), 1.0)]
     else: blocs = [(list(enc.embed.parameters()), dc ** L)] + [(list(b.parameters()), dc ** (L - 1 - i)) for i, b in enumerate(enc.blocks)] + [(list(enc.norm.parameters()) + list(tete.parameters()), 1.0)]
     opt = torch.optim.AdamW(groupes(blocs, job["lr"], ft["wd"])); scaler = echelle_grad(dev); params = [p for g in opt.param_groups for p in g["params"]]
@@ -394,7 +395,7 @@ def chrono(cfg, D, cache, n=60):
     nv, nt = int((part == 1).sum()), int((part == 2).sum()); h_ft = 0.0
     for bras in ft["bras"]:
         s = run_job(dict(bras=bras, frac=1.0, graine=0, lr=1e-4), cfg, D, cache, dev, loin, chrono=n)
-        for frac, g, pas in zip(ft["fractions"], ft["graines"], ft["pas"]):
+        for frac, g, pas in U.fractions_du_bras(ft, bras):
             runs = len(ft["lr_" + bras]) + g - 1; kag = 8 * len(Xt) if (bras == ft["bras_soumission"] and frac >= 1.0) else 0
             h = runs * (pas * s + (ft["n_eval"] * nv + nv + 9 * nt + kag) / v) / 3600; h_ft += h
             dit(f"CHRONO {bras} à {100 * frac:g} % : {s:.3f} s/pas × {pas} pas × {runs} entraînements ≈ {h:.1f} h de GPU (au plus : l'arrêt anticipé raccourcit)")

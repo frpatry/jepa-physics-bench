@@ -36,16 +36,17 @@ couleur = 0.1                    # léger changement de couleur (± 10 %) ; les 
 sauv_min = 15                    # sauvegarde toutes les 15 minutes
 
 [ft]                             # après le pré-entraînement, avec les étiquettes
-bras = ["jepa_ft", "jepa_gel"]   # jepa_ft = ajustement complet ; jepa_gel = encodeur gelé + petite tête (qualité brute des latents) ; « zero » = sans pré-entraînement
+bras = ["jepa_ft", "jepa_gel", "zero"]   # jepa_ft = ajustement complet ; jepa_gel = encodeur gelé + petite tête (qualité brute des latents) ; zero = le même modèle SANS pré-entraînement (repère)
 bras_soumission = "jepa_ft"      # le bras dont on prédit le test Kaggle (fichier submission.csv, jamais envoyé par le code)
 fractions = [0.01, 0.1, 1.0]     # part des étiquettes d'entraînement utilisée (sous-ensembles emboîtés)
+fractions_zero = [0.01, 0.1]     # le repère « de zéro » seulement là où les étiquettes sont rares : c'est là que se voit ce qu'apporte le pré-entraînement (fractions_<bras> = facultatif)
 graines = [5, 3, 3]              # nombre de graines par fraction
 pas = [1500, 4000, 12000]        # pas d'entraînement par fraction (arrêt anticipé sur la validation)
 lot = 256
 lr_jepa_ft = [1e-4, 3e-4, 1e-3]  # taux essayés (graine 0) ; le meilleur SUR LA VALIDATION sert aux autres graines
 lr_jepa_gel = [3e-4, 1e-3, 3e-3]
 lr_zero = [1e-4, 3e-4, 1e-3]
-decroissance_couches = 0.75      # les couches basses bougent moins que les hautes
+decroissance_couches = 0.75      # les couches basses bougent moins que les hautes (bras pré-entraînés seulement ; « zero » apprend toutes ses couches au même taux)
 wd = 0.05
 drop_path = 0.1
 echauffement = 0.1               # part des pas en montée linéaire
