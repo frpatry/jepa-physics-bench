@@ -138,6 +138,7 @@ routage gelé, puis sur des JEPA.
 |---|---|
 | `README.md` | présentation et état actuel |
 | `docs/` | cette documentation |
+| `etudes/histo_jepa/` | étude à part (nov. 2026) : un JEPA pré-entraîné sans étiquettes sur les images de cancer de Kaggle ; voir son `README.md` |
 | `session_handoff.md` | ancienne note de reprise (juillet 2026, époque slots) ; conservée pour l'histoire, **ne reflète plus l'état actuel** |
 | `.gitignore` | ignore les sorties générées (journaux, poids, caches, `runs_*/`, `*.json`) |
 

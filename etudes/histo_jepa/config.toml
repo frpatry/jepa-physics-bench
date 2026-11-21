@@ -1,0 +1,54 @@
+# ÉTUDE histo_jepa — JEPA pré-entraîné sans étiquettes sur « Histopathologic Cancer Detection » (Kaggle).
+# But : le meilleur score (AUC) avec NOTRE JEPA, appris sur ces images seulement (aucun poids venu d'ailleurs).
+# Tous les réglages sont ici ; histo_jepa.py n'en contient aucun. Une copie est enregistrée avec les résultats.
+
+graine = 0                       # graine de la séparation des données et du pré-entraînement
+
+[donnees]
+parts = [0.70, 0.15, 0.15]       # entraînement / validation / test (le NÔTRE : pris dans le « train » Kaggle, qui a des étiquettes)
+# Fichier public « image → lame » (s'il est ajouté au kernel) : une lame entière va alors d'un seul côté. Sinon : tirage au hasard par classe.
+lames_csv = ["/kaggle/input/*/patch_id_wsi*.csv", "/kaggle/input/*/*/patch_id_wsi*.csv", "/kaggle/input/*/*/*/patch_id_wsi*.csv"]
+test_kaggle_dans_pre = true      # les images de test Kaggle (sans étiquettes) servent aussi au pré-entraînement
+
+[modele]                         # petit ViT : 96×96 px, patchs de 8 px → 12×12 = 144 jetons
+patch = 8
+largeur = 384
+profondeur = 12
+tetes = 6
+
+[pre]                            # pré-entraînement de type I-JEPA : blocs masqués, cibles = latents d'un encodeur-cible (moyenne glissante), aucune perte en pixels
+pas_total = 40000                # À FIXER après le chronométrage (étape « chrono »)
+lot = 512
+lr = 6e-4
+lr_fin = 0.02                    # fraction du taux d'apprentissage gardée à la fin (descente en cosinus)
+echauffement = 2000              # pas de montée linéaire du taux d'apprentissage
+wd = 0.05
+ema = 0.996                      # encodeur-cible : moyenne glissante, de 0.996 à 1.0 sur tout l'entraînement
+n_cibles = 4                     # blocs à prédire par image, tirés au hasard PARTOUT dans l'image (aucune zone privilégiée)
+cible_echelle = [0.15, 0.20]     # part de l'image couverte par un bloc-cible
+cible_ratio = [0.75, 1.5]        # hauteur / largeur d'un bloc-cible
+ctx_echelle = [0.85, 1.0]        # bloc de contexte (dont on retire les cibles)
+ctx_min = 12                     # nombre minimal de jetons de contexte
+pred_largeur = 192               # prédicteur : petit ViT étroit
+pred_profondeur = 6
+pred_tetes = 6
+couleur = 0.1                    # léger changement de couleur (± 10 %) ; les seules autres augmentations : retournements et rotations de 90°
+sauv_min = 15                    # sauvegarde toutes les 15 minutes
+
+[ft]                             # après le pré-entraînement, avec les étiquettes
+bras = ["jepa_ft", "jepa_gel"]   # jepa_ft = ajustement complet ; jepa_gel = encodeur gelé + petite tête (qualité brute des latents) ; « zero » = sans pré-entraînement
+bras_soumission = "jepa_ft"      # le bras dont on prédit le test Kaggle (fichier submission.csv, jamais envoyé par le code)
+fractions = [0.01, 0.1, 1.0]     # part des étiquettes d'entraînement utilisée (sous-ensembles emboîtés)
+graines = [5, 3, 3]              # nombre de graines par fraction
+pas = [1500, 4000, 12000]        # pas d'entraînement par fraction (arrêt anticipé sur la validation)
+lot = 256
+lr_jepa_ft = [1e-4, 3e-4, 1e-3]  # taux essayés (graine 0) ; le meilleur SUR LA VALIDATION sert aux autres graines
+lr_jepa_gel = [3e-4, 1e-3, 3e-3]
+lr_zero = [1e-4, 3e-4, 1e-3]
+decroissance_couches = 0.75      # les couches basses bougent moins que les hautes
+wd = 0.05
+drop_path = 0.1
+echauffement = 0.1               # part des pas en montée linéaire
+n_eval = 10                      # nombre de mesures sur la validation pendant un entraînement
+patience = 4                     # arrêt après 4 mesures sans progrès
+couleur = 0.1
