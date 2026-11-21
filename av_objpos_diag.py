@@ -55,7 +55,7 @@ def samples(W, FR):
     si, fi, ki = np.where(ok); am = amax[si, 0, ki]; kind = W["SHAPE"][si, ki]; big = np.zeros(len(si), bool)
     for q in (kind == 3, kind != 3):
         if q.any(): big[q] = am[q] >= np.median(am[q])
-    return dict(si=si, fi=fi, y=pos[si, fi, ki].astype(np.float32), col=W["COL"][si, ki].astype(np.float32), nobj=W["NOBJ"][si], kind=kind, big=big,
+    return dict(si=si, fi=fi, yall=pos[si, fi].astype(np.float32), y=pos[si, fi, ki].astype(np.float32), col=W["COL"][si, ki].astype(np.float32), nobj=W["NOBJ"][si], kind=kind, big=big,
                 vis=vis[si, fi, ki], mot=mot[si, fi, ki], dist=dist[si, fi, ki], frac=frac[si, fi, ki], speed=speed[si, fi, ki])
 
 
@@ -80,7 +80,8 @@ class Local(nn.Module):
 
 
 def fit_local(Zf, S, tr, te, dev, steps, bs, seed):
-    """Zf (n, F, npf, din) float16 ; apprend sur tr (indices d'échantillons), -> erreur (px) sur te."""
+    """Zf (n, F, npf, din) float16 ; apprend sur tr (indices d'échantillons), -> sur te : erreur (px) vers l'objet demandé, et vers l'objet LE PLUS PROCHE de sa réponse
+    (petite alors que la première est grande = il situe bien DES objets mais se trompe d'objet)."""
     torch.manual_seed(seed); g = torch.Generator().manual_seed(seed); si, fi = torch.from_numpy(S["si"]), torch.from_numpy(S["fi"])
     y, col = torch.from_numpy(S["y"]), (torch.from_numpy(S["col"]) - 0.5) * 2; tr = torch.from_numpy(tr); sub = tr[torch.randperm(len(tr), generator=g)[:2000]]
     x0 = Zf[si[sub], fi[sub]].float().reshape(-1, Zf.size(-1)); mu, sd = x0.mean(0), x0.std(0).clamp_min(1e-3)
@@ -92,8 +93,10 @@ def fit_local(Zf, S, tr, te, dev, steps, bs, seed):
     net.eval(); out = []; te = torch.from_numpy(te)
     with torch.no_grad():
         for i in range(0, len(te), 512):
-            x, c, t = get(te[i:i + 512]); out.append(((net(x, c) - t).norm(dim=-1) * H).cpu())
-    return torch.cat(out).numpy()
+            x, c, t = get(te[i:i + 512]); out.append(net(x, c).cpu())
+    pr = torch.cat(out).numpy(); te = te.numpy()
+    with np.errstate(invalid="ignore"): dn = np.linalg.norm(pr[:, None] - S["yall"][te], axis=-1) * H
+    return np.linalg.norm(pr - S["y"][te], axis=-1) * H, np.nanmin(dn, 1)
 
 
 def ridge(X, Y, itr, iva, ite, dev):
@@ -156,10 +159,11 @@ def main():
             Z, PX = feats(tgt, W, st, cfg["P"], dev, T, FR); tag = f"{f.split('/')[-1]} pas {ck['state']['it']}"; log(f"\n   ---- {tag} | latents {tuple(Z.shape)} | {time.time() - t0:.0f}s")
             flat = lambda A_, idx: A_[torch.from_numpy(S["si"][idx]), torch.from_numpy(S["fi"][idx])].reshape(len(idx), -1)
             if px_cols is None:                                      # pixels : une seule fois (mêmes scènes pour toutes les sauvegardes ; vue 0e = image nette)
-                px_cols = (fit_local(PX, S, tr, te, dev, a.steps, a.bs, 0), ridge(torch.cat([flat(PX, r_tr), flat(PX, r_va), flat(PX, r_te)]), torch.cat([Y[r_tr], Y[r_va], Y[r_te]]),
+                px_cols = (fit_local(PX, S, tr, te, dev, a.steps, a.bs, 0)[0], ridge(torch.cat([flat(PX, r_tr), flat(PX, r_va), flat(PX, r_te)]), torch.cat([Y[r_tr], Y[r_va], Y[r_te]]),
                            np.arange(len(r_tr)), len(r_tr) + np.arange(len(r_va)), len(r_tr) + len(r_va) + np.arange(len(r_te)), dev))
-            e_loc = fit_local(Z, S, tr, te, dev, a.steps, a.bs, 0); log(f"   LECTEUR LOCAL guidé par la couleur ({len(tr)} exemples d'apprentissage, lu sur {len(te)} d'autres séquences) | {time.time() - t0:.0f}s")
-            table(log, R, [("« au milieu »", base), ("pixels", px_cols[0]), ("LATENTS", e_loc)])
+            e_loc, e_near = fit_local(Z, S, tr, te, dev, a.steps, a.bs, 0); log(f"   LECTEUR LOCAL guidé par la couleur ({len(tr)} exemples d'apprentissage, lu sur {len(te)} d'autres séquences) | {time.time() - t0:.0f}s")
+            table(log, R, [("« au milieu »", base), ("pixels", px_cols[0]), ("lat. + proche", e_near), ("LATENTS", e_loc)])
+            log("      (« lat. + proche » = distance de sa réponse à l'objet le plus proche, quel qu'il soit : petite quand LATENTS est grande = il se trompe d'objet)")
             e_lin = ridge(torch.cat([flat(Z, r_tr), flat(Z, r_va), flat(Z, r_te)]), torch.cat([Y[r_tr], Y[r_va], Y[r_te]]), np.arange(len(r_tr)), len(r_tr) + np.arange(len(r_va)), len(r_tr) + len(r_va) + np.arange(len(r_te)), dev)
             log(f"   SONDE LINÉAIRE de l'examen, scènes à UN objet ({len(r_tr)} exemples, lu sur {len(r_te)}) : {e_lin.mean() / H:.1%} de la largeur (pixels {px_cols[1].mean() / H:.1%}) | {time.time() - t0:.0f}s")
             table(log, [r_ for r_ in R1 if not r_[0].startswith("scènes à")], [("« au milieu »", base1), ("pixels", px_cols[1]), ("LATENTS", e_lin)])
